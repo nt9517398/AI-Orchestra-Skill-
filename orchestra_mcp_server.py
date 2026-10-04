@@ -1,6 +1,32 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v17 — RESEARCH ALIGNMENT: WORKFLOWS, OUTCOME ROUTING, MEMORY  (2026-10-04)
+-------------------------------------------------------------------------
+A review against the four papers this skill cites (TRINITY 2512.04695, Conductor
+2512.04388, Proactive Memory 2607.08716, Fugu 2606.21228) — see the skill's
+references/research-alignment.md. Changes:
+
+  1. GLM REVERT. GLM-5.3-Prime is listed only under OpenRouter's z-ai/ namespace;
+     Zhipu's own docs have no Prime id. Operator rule: if Prime is OpenRouter-only,
+     leave GLM as it was. glm-5.3 is back on the direct Zhipu API with its own branch
+     in _call (thinking always on, reasoning_effort passthrough).
+  2. WORKFLOWS (Conductor). workflow_start executes a whole plan — steps of {id, model,
+     brief} whose access lists name earlier steps — with the access lists ENFORCED by
+     the server, concurrent waves, a fault barrier, and a per-task dispatch ceiling that
+     continuation plans (the Conductor's recursion) share.
+  3. TRINITY ROLES. A "thinker" role with plan_v1, and gate_v1 (ACCEPT|REVISE +
+     diagnosis) as the verifier's halting signal. Contracts can now carry enums, which
+     the server checks.
+  4. OUTCOME ROUTING. Both Sakana papers found untrained frontier coordinators route by
+     reputation. Briefs carry a work_type; log_outcome records the verdict's basis
+     (L1|L2|JUDGED); route_evidence compares the routing prior with measured per-model
+     correctness on that work type and recommends the measured leader only on evidence.
+  5. MEMORY (Proactive Memory). A persistent bank (status / knowledge / procedural) with
+     a verbatim-evidence grounding check, BM25 prefilter above 50 entries, and
+     memory_review: a fleet model as the paper's separate two-phase memory agent, whose
+     inject-or-silent note must cite bank entries or is suppressed.
+
 v16 — FLEET RESEAT + DECISION BENCH + STRUCTURED BRIEFS  (2026-10-04)
 ---------------------------------------------------------------------
 Operator-directed. Four changes:
@@ -61,9 +87,9 @@ Every function RETURNS its result.
 Setup:
     pip install "mcp[cli]" python-dotenv requests
     # API keys in a .env next to this script (see .env.example). Never hardcode.
-    # OPENROUTER_API_KEY is required; missing it removes GLM-5.3-Prime, GPT Astra, the
-    # whole decision bench, and the only non-CN-OW generator class, US-CLOSED.
-    # DEEPSEEK_API_KEY covers the two DeepSeek models.
+    # OPENROUTER_API_KEY is required; missing it removes GPT Astra, the whole decision
+    # bench, and the only non-CN-OW generator class, US-CLOSED.
+    # DEEPSEEK_API_KEY covers the two DeepSeek models; ZHIPU_API_KEY covers GLM-5.3.
 
 Tests:  python test_orchestra.py     (offline; no keys needed)
 
@@ -154,7 +180,8 @@ import time
 import threading
 import uuid
 import itertools
-from collections import defaultdict
+import math
+from collections import Counter, defaultdict
 from typing import Optional, Union
 
 import requests
@@ -178,6 +205,10 @@ _CONFIGS = {
     "deepseek": {
         "url": "https://api.deepseek.com/v1/chat/completions",
         "key_env": "DEEPSEEK_API_KEY",
+    },
+    "glm": {
+        "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "key_env": "ZHIPU_API_KEY",
     },
     "openrouter": {                                              # v14
         "url": "https://openrouter.ai/api/v1/chat/completions",
@@ -222,15 +253,15 @@ _MODELS = {
         # host) — re-verify. ⚠ Reported AA-Omniscience hallucination rate 96.5% (V4 was
         # 84%) and AA Index 39 (max): single search-summary source, unconfirmed. If it
         # holds, this swap is a regression on everything except price and image input.
-    "z-ai/glm-5.3-prime": dict(
-        provider="openrouter", klass="CN-OW", max_out=131072, pin=None),
-        # Released 2026-09-23. Same 5.3 family, 1.5-2x output throughput (vendor claim);
-        # 131,072 max output and 1M context per OpenRouter listing via third parties.
-        # Moved OFF the direct Zhipu API: no "glm-5.3-prime" id appears in Zhipu's docs,
-        # while the OpenRouter slug is confirmed by three independent listings.
-        # UNPINNED on purpose: the host name has not been read from /endpoints yet, and a
-        # guessed pin with allow_fallbacks=False would 400 every call. Run
-        # test_registry_matches_live_endpoints with a key, then pin.
+    "glm-5.3": dict(
+        provider="glm", klass="CN-OW", max_out=131072, pin=None),
+        # thinking is MANDATORY on 5.3 (docs.bigmodel.cn, verified 2026-08-25) — see
+        # the glm branch in _call. If a SECOND glm model is ever added, that branch
+        # must become version-aware rather than keyed on provider=="glm".
+        # v17: kept as-is by operator rule. GLM-5.3-Prime is listed only under
+        # OpenRouter's z-ai/ namespace (OpenRouter and resellers of it); Zhipu's own
+        # docs list GLM-5.3 and GLM-5.3-Flash but no Prime, so there is no direct-API
+        # id to swap to.
     "openai/gpt-astra-latest": dict(
         provider="openrouter", klass="US-CLOSED", max_out=128000, pin="OpenAI",
         api_id="~openai/gpt-astra-latest", served_as=("astra",)),
@@ -563,6 +594,14 @@ _MIN_PAIRS = 20                   # ponytail: judgment call, not a measured opti
 _CORRECTNESS = ("CORRECT", "WRONG", "UNVERIFIED", "OVERTURNED_BY_L1")
 _DISPOSITION = ("", "USED", "DISCARDED", "NA")
 _ERROR_SET = frozenset({"WRONG", "OVERTURNED_BY_L1"})   # counts as a co-failure event
+# v17: HOW a verdict was reached. L1 = a deterministic check decided it (the analog of
+# the verifiable reward TRINITY and the Conductor were trained on); L2 = confirmed by an
+# independent cross-class source; JUDGED = the adjudicator's judgment alone.
+_BASIS = ("L1", "L2", "JUDGED")
+_MIN_ROUTE_SAMPLES = 10           # ponytail: judgment call. Below this many verdicts for a
+                                  # (work type, model) pair, route_evidence reports counts
+                                  # but no rate, and the routing prior stands.
+_ROUTE_MARGIN = 0.10              # a measured leader must beat the prior primary by this much
 
 
 def _now() -> str:
@@ -655,8 +694,8 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
     v15: no `timeout`, `max_tokens`, `_retry` or `_no_reasoning` parameters. The
     silence rule is global, the budget is the registry's max_out, and there are no
     recursive call sites left — the 429/5xx retries are a two-pass loop.
-    v16: the direct-GLM branch is gone with the provider; `meta` collects the served
-    model/provider for the log; the wire id comes from api_id when the registry sets it.
+    v16: `meta` collects the served model/provider for the log; the wire id comes from
+    api_id when the registry sets it. (v17 restored the direct-GLM branch.)
     """
     try:
         cfg = _resolve(model)
@@ -669,7 +708,16 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
     payload = {"model": cfg.get("api_id") or model, "messages": messages,
                "max_tokens": cfg["max_out"], "stream": True}
     payload.update(_provider_block(cfg))     # OpenRouter pin; no-op for direct APIs
-    if provider == "openrouter":
+    if provider == "glm":
+        # GLM-5.3 cannot disable thinking; thinking.type="disabled" hard-FAILS.
+        payload["thinking"] = {"type": "enabled"}
+        # GLM's reasoning_effort scale is its own: passthrough "max", "high", "medium",
+        # "low", with only "none" remapped to "low" (since thinking cannot be disabled).
+        # _effort() collapses "max" to "high" because OPENROUTER has no deeper tier;
+        # applying that collapse here would silently downgrade every GLM call from the
+        # server's default effort="max" to effort="high".
+        payload["reasoning_effort"] = "low" if reasoning_effort == "none" else reasoning_effort
+    elif provider == "openrouter":
         # Bounds CoT depth. Without it a reasoning model defaults to max depth and can
         # spend the entire budget on an invisible trace, returning [EMPTY].
         payload["reasoning"] = {"effort": _effort(reasoning_effort)}
@@ -722,7 +770,7 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
 
 
 def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=None,
-                 **call_kwargs):
+                 work_type="", **call_kwargs):
     """Wrap the pure _call() so every user-facing dispatch appends EXACTLY ONE log row.
     Placed only at LEAF call sites — never around a path that itself calls _logged_call
     — so _call's internal timeout/429/5xx retries stay invisible and one logical
@@ -749,6 +797,7 @@ def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=Non
                     "model": model, "klass": _MODELS.get(model, {}).get("klass", "?"),
                     "provider": _MODELS.get(model, {}).get("provider", "?"),
                     "mode": mode, "role": role, "outcome": tag,
+                    "work_type": work_type,
                     "out_chars": len(out) if isinstance(out, str) else 0,
                     "served_model": meta.get("model", ""),
                     "served_provider": meta.get("provider", ""),
@@ -769,8 +818,34 @@ def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=Non
 # fenced as CDATA, so a document that happens to contain instructions stays data. JSON
 # for the reply because it can be checked mechanically (_check_contract).
 # ---------------------------------------------------------------------------
-_ROLES = ("generator", "critic", "extractor", "verifier", "synthesizer")
+_ROLES = ("generator", "critic", "extractor", "verifier", "synthesizer",
+          "thinker", "memory_keeper")
+# v17: "thinker" is TRINITY's planning role (strategy, decomposition, critique of a
+# partial solution) so decomposition is no longer Claude's monopoly; "memory_keeper" is
+# the Proactive-Memory agent's role (memory_review).
 _FORMATS = ("json", "xml", "code", "markdown", "text")
+
+# v17: work types tag every brief so outcomes can be aggregated per (work type, model)
+# — the measured signal that replaces routing by reputation (route_evidence).
+_WORK_TYPES = ("swe", "agentic", "algorithmic", "bulk", "drafting", "extraction",
+               "reasoning", "factual", "image", "review", "memory", "other")
+
+# The fleet card's routing table as data: (primary, cross-class partner or None).
+# A PRIOR from benchmarks — route_evidence() overrides it once outcomes are measured.
+_ROUTING_PRIOR = {
+    "swe": ("glm-5.3", "openai/gpt-astra-latest"),
+    "agentic": ("openai/gpt-astra-latest", "glm-5.3"),
+    "algorithmic": ("deepseek-v4-pro", "openai/gpt-astra-latest"),
+    "bulk": ("glm-5.3", None),
+    "drafting": ("deepseek-v4.1-flash", None),
+    "extraction": ("glm-5.3", "openai/gpt-astra-latest"),
+    "reasoning": ("openai/gpt-astra-latest", "glm-5.3"),
+    "factual": ("openai/gpt-astra-latest", "glm-5.3"),
+    "image": ("deepseek-v4.1-flash", None),
+    "review": ("openai/gpt-astra-latest", "glm-5.3"),
+    "memory": ("glm-5.3", None),
+    "other": ("openai/gpt-astra-latest", "glm-5.3"),
+}
 
 # Named contracts: {"output_contract": {"name": "critic_v1"}} expands to a fixed shape,
 # so two critics' defects (or two verifiers' claims) line up key-for-key and can be
@@ -778,6 +853,7 @@ _FORMATS = ("json", "xml", "code", "markdown", "text")
 _CONTRACTS = {
     "critic_v1": {
         "format": "json", "required_keys": ["verdict", "defects"],
+        "enums": {"verdict": ["PASS", "FAIL"]},
         "example": {"verdict": "PASS|FAIL",
                     "defects": [{"id": "D1", "severity": "HIGH|MED|LOW",
                                  "location": "where in the artifact",
@@ -803,6 +879,32 @@ _CONTRACTS = {
                                         "disposition": "KEPT|DISCARDED|UNRESOLVED",
                                         "reason": "..."}],
                     "unverified": ["claims no check could reach"]}},
+    # v17 — TRINITY's thinker and verifier roles.
+    "plan_v1": {
+        "format": "json", "required_keys": ["approach", "steps", "risks", "falsifier"],
+        "example": {"approach": "the strategy, one paragraph",
+                    "steps": [{"id": "s1", "does": "one concrete subtask",
+                               "needs": ["ids of steps whose output it uses"],
+                               "check": "how to tell this step's output is right"}],
+                    "risks": ["where this plan is most likely to fail"],
+                    "falsifier": "an observation that would show the approach is wrong"}},
+    "gate_v1": {
+        "format": "json", "required_keys": ["verdict", "diagnosis"],
+        "enums": {"verdict": ["ACCEPT", "REVISE"]},
+        "example": {"verdict": "ACCEPT|REVISE",
+                    "diagnosis": "what is wrong and where; empty string if ACCEPT",
+                    "failing_checks": ["each unmet requirement, verbatim"]}},
+    # v17 — Proactive Memory's two phases (memory_review).
+    "memory_ops_v1": {
+        "format": "json", "required_keys": ["ops"],
+        "example": {"ops": [{"op": "save_knowledge|save_procedural|update_status|delete",
+                             "content": "one fact or one experience",
+                             "evidence": "verbatim quote from `trajectory`",
+                             "id": "entry id, for delete only"}]}},
+    "memory_gate_v1": {
+        "format": "json", "required_keys": ["intervene", "note", "basis_ids"],
+        "example": {"intervene": False, "note": "",
+                    "basis_ids": ["ids of the bank entries the note rests on"]}},
 }
 
 _FORMAT_RULES = {
@@ -835,7 +937,12 @@ def _resolve_contract(oc) -> tuple:
         return None, "output_contract.required_keys must be a list of strings"
     if keys and fmt != "json":
         return None, "required_keys only applies to format 'json'"
+    enums = oc.get("enums", {})
+    if not (isinstance(enums, dict) and all(isinstance(v, list) for v in enums.values())):
+        return None, "output_contract.enums must map keys to lists of allowed values"
     c = {"format": fmt, "required_keys": keys}
+    if enums:
+        c["enums"] = enums
     for k in ("example", "notes"):
         if k in oc:
             c[k] = oc[k]
@@ -857,7 +964,7 @@ def _validate_brief(brief, model: Optional[str] = None) -> tuple:
     if not isinstance(brief, dict):
         return None, "brief must be a JSON object"
     unknown = set(brief) - {"role", "objective", "instruction", "context", "access",
-                            "constraints", "output_contract"}
+                            "constraints", "output_contract", "work_type"}
     if unknown:
         return None, f"unknown brief fields {sorted(unknown)}"
     role = brief.get("role")
@@ -881,6 +988,9 @@ def _validate_brief(brief, model: Optional[str] = None) -> tuple:
     contract, err = _resolve_contract(brief.get("output_contract"))
     if err:
         return None, err
+    wt = brief.get("work_type", "")
+    if wt and wt not in _WORK_TYPES:
+        return None, f"work_type must be one of {list(_WORK_TYPES)}, got {wt!r}"
     if role == "verifier" and model in _NO_VERIFY:
         return None, (f"{model} may not act as a verifier (fleet-card 'Verification "
                       f"eligibility') — route the verifier brief to another model")
@@ -889,6 +999,8 @@ def _validate_brief(brief, model: Optional[str] = None) -> tuple:
            "output_contract": contract}
     if str(brief.get("objective", "")).strip():
         out["objective"] = str(brief["objective"]).strip()
+    if wt:
+        out["work_type"] = wt          # metadata for the outcome log; never rendered
     return out, None
 
 
@@ -928,6 +1040,8 @@ def _render_brief(brief: dict, task_id: str = "") -> list:
     lines.append(f"  <output_contract {attrs}>")
     if c.get("required_keys"):
         lines.append(f"    <required_keys>{', '.join(c['required_keys'])}</required_keys>")
+    for key, allowed in (c.get("enums") or {}).items():
+        lines.append(f"    <allowed key={quoteattr(key)}>{' | '.join(map(str, allowed))}</allowed>")
     if "example" in c:
         ex = c["example"] if isinstance(c["example"], str) else json.dumps(c["example"], indent=2)
         lines.append(f"    <example>{_cdata(ex)}</example>")
@@ -977,6 +1091,10 @@ def _check_contract(out: str, contract: dict) -> dict:
             if missing:
                 return {"format": fmt, "valid": False,
                         "errors": errors + [f"missing required keys {missing}"]}
+        for key, allowed in (contract.get("enums") or {}).items():
+            if isinstance(value, dict) and key in value and value[key] not in allowed:
+                return {"format": fmt, "valid": False,
+                        "errors": errors + [f"{key}={value[key]!r} is not one of {allowed}"]}
         return {"format": fmt, "valid": True, "errors": errors}
     if fmt == "code" and "```" not in out:
         return {"format": fmt, "valid": False, "errors": ["no fenced code block"]}
@@ -1229,7 +1347,7 @@ def _compare_one(model: str, instructions: str, cand_a: str, cand_b: str,
 # Shared mode logic — used by BOTH the sync tools and the job workers, so the
 # two paths can't drift apart (the v9 "hand-synced copies" complaint, fixed).
 # ---------------------------------------------------------------------------
-_DEFAULT_PAIR = ("z-ai/glm-5.3-prime", "openai/gpt-astra-latest")   # CN-OW x US-CLOSED
+_DEFAULT_PAIR = ("glm-5.3", "openai/gpt-astra-latest")   # CN-OW x US-CLOSED
 
 
 def _run_parallel(models=_DEFAULT_PAIR, brief: Optional[dict] = None,
@@ -1259,6 +1377,7 @@ def _run_parallel(models=_DEFAULT_PAIR, brief: Optional[dict] = None,
     res = _run_threads({m: (lambda m=m: _logged_call(m, messages, task_id=task_id,
                                                      role=b["role"], mode="parallel",
                                                      contract=b["output_contract"],
+                                                     work_type=b.get("work_type", ""),
                                                      reasoning_effort=reasoning_effort,
                                                      progress=progress))
                         for m in models})
@@ -1303,6 +1422,7 @@ def _run_adversarial(brief: Optional[dict] = None, model_a: str = _DEFAULT_PAIR[
     round1 = _run_threads({m: (lambda m=m: _logged_call(m, messages, task_id=task_id,
                                                         role="candidate", mode="adversarial",
                                                         contract=b["output_contract"],
+                                                     work_type=b.get("work_type", ""),
                                                         reasoning_effort=reasoning_effort,
                                                         progress=progress))
                            for m in (model_a, model_b)})
@@ -1367,6 +1487,188 @@ def _run_adversarial(brief: Optional[dict] = None, model_a: str = _DEFAULT_PAIR[
 
 
 # ---------------------------------------------------------------------------
+# v17 WORKFLOWS — the Conductor's output format, executed by code.
+#
+# The Conductor (arXiv:2512.04388) emits a whole workflow up front: per step, a focused
+# subtask, the worker that runs it, and an access list naming which earlier steps'
+# outputs that worker may see. Here the plan is JSON and the SERVER executes it, so the
+# access list is enforced rather than remembered: a step's brief receives exactly the
+# outputs its access list names, as anonymised prior_output items (step ids, never
+# model names), and nothing else. Recursion — the Conductor calling itself to revise
+# the strategy after seeing results — is a second plan submitted under the same
+# task_id, held to the same per-task dispatch ceiling.
+# ---------------------------------------------------------------------------
+_MAX_DISPATCHES = 6          # SKILL.md 'Effort scaling': generator dispatches per task
+_STEP_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+_WF_OUTPUTS: dict = {}       # task_id -> {"ts", "outputs": {step_id: text}} for continuations
+_WF_LOCK = threading.Lock()
+_WF_RETENTION_SECONDS = 3600
+
+
+def _prior_outputs(task_id: str) -> dict:
+    """Step outputs of earlier plans under task_id (pruned after an hour, like jobs)."""
+    now = time.time()
+    with _WF_LOCK:
+        for tid in [t for t, v in _WF_OUTPUTS.items()
+                    if now - v["ts"] > _WF_RETENTION_SECONDS]:
+            del _WF_OUTPUTS[tid]
+        return dict(_WF_OUTPUTS.get(task_id, {}).get("outputs", {}))
+
+
+def _validate_workflow(plan, prior_ids=frozenset()) -> tuple:
+    """(normalised plan, error). A plan is {"goal"?, "steps": [{"id", "model", "brief"}]}.
+
+    Each step's brief `access` list IS its access list, and may name only EARLIER step
+    ids — so every plan is a DAG by construction and executes in the order written. In a
+    continuation plan, `prior_ids` (the earlier plans' step ids under the same task) count
+    as earlier steps too, and may not be reused."""
+    if isinstance(plan, str):
+        try:
+            plan = json.loads(plan)
+        except ValueError as e:
+            return None, f"plan is not valid JSON ({e})"
+    if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list) \
+            or not plan["steps"]:
+        return None, 'plan must be {"steps": [{"id", "model", "brief"}, ...]}'
+    unknown = set(plan) - {"steps", "goal"}
+    if unknown:
+        return None, f"unknown plan fields {sorted(unknown)}"
+    steps, seen = [], set(prior_ids)
+    for i, st in enumerate(plan["steps"]):
+        if not isinstance(st, dict):
+            return None, f"steps[{i}] must be an object"
+        extra = set(st) - {"id", "model", "brief"}
+        if extra:
+            return None, f"steps[{i}] has unknown fields {sorted(extra)}"
+        sid = st.get("id")
+        if not isinstance(sid, str) or not _STEP_ID.match(sid):
+            return None, f"steps[{i}].id must match {_STEP_ID.pattern}"
+        if sid in seen:
+            return None, (f"duplicate step id {sid!r}" + (" — step ids must stay unique "
+                          "across every plan of a task" if sid in prior_ids else ""))
+        model = st.get("model")
+        if model not in _MODELS:
+            return None, f"step {sid}: unknown model {model!r} — known: {sorted(_MODELS)}"
+        b, err = _validate_brief(st.get("brief"), model)
+        if err:
+            return None, f"step {sid}: {err}"
+        ahead = [a for a in b["access"] if a not in seen]
+        if ahead:
+            return None, (f"step {sid}: access list names {ahead}, which are not earlier "
+                          f"steps — a step may only see steps written before it (or, in "
+                          f"a continuation, earlier plans' steps whose outputs are kept "
+                          f"for an hour)")
+        clash = {c["id"] for c in b["context"]} & set(b["access"])
+        if clash:
+            return None, (f"step {sid}: context item ids {sorted(clash)} collide with "
+                          f"access-list step ids")
+        seen.add(sid)
+        steps.append({"id": sid, "model": model, "brief": b})
+    out = {"steps": steps}
+    if str(plan.get("goal", "")).strip():
+        out["goal"] = str(plan["goal"]).strip()
+    return out, None
+
+
+def _waves(steps: list) -> list:
+    """Group steps into waves: a step runs once every step on its access list has run.
+    Steps in one wave share no dependency, so they run concurrently."""
+    level = {}
+    for st in steps:          # a dependency on an earlier PLAN's step counts as done (-1)
+        level[st["id"]] = 1 + max((level.get(a, -1) for a in st["brief"]["access"]),
+                                  default=-1)
+    waves = defaultdict(list)
+    for st in steps:
+        waves[level[st["id"]]].append(st)
+    return [waves[k] for k in sorted(waves)]
+
+
+def _dispatches_logged(task_id: str) -> int:
+    """Generator dispatches already logged under task_id. This is how a continuation
+    plan (the Conductor's recursion) is held to the same per-task ceiling as the first."""
+    n = 0
+    try:
+        with _LOG_LOCK:
+            if _LOG_PATH.exists():
+                with open(_LOG_PATH, encoding="utf-8") as f:
+                    for ln in f:
+                        if task_id not in ln:
+                            continue
+                        try:
+                            rec = json.loads(ln)
+                        except ValueError:
+                            continue
+                        if (rec.get("type") == "dispatch" and rec.get("task_id") == task_id
+                                and rec.get("model") in _MODELS):
+                            n += 1
+    except OSError:
+        pass
+    return n
+
+
+def _run_workflow(plan: dict, task_id: str, reasoning_effort: str = "max",
+                  progress=None, ceiling: int = _MAX_DISPATCHES) -> str:
+    """Execute a validated plan wave by wave. Returns a JSON string.
+
+    Fault barrier, as in adversarial mode: a step whose access list names a step that
+    failed or was skipped is NOT dispatched — it would be working from an error string.
+    The skip propagates to everything downstream of it."""
+    used = _dispatches_logged(task_id)
+    need = len(plan["steps"])
+    if used + need > ceiling:
+        return json.dumps({"task_id": task_id, "mode": "workflow",
+                           "error": f"[ERROR] plan needs {need} dispatches but task "
+                                    f"{task_id} has already used {used} of its {ceiling} — "
+                                    f"cut the plan or stop (SKILL.md 'Stopping rules')"})
+    waves = _waves(plan["steps"])
+    outputs, results, dispatched = _prior_outputs(task_id), {}, 0
+    for w, wave in enumerate(waves, 1):
+        if progress:
+            progress(f"wave {w}/{len(waves)}: {', '.join(st['id'] for st in wave)}")
+        runnable = {}
+        for st in wave:
+            failed = [a for a in st["brief"]["access"]
+                      if outputs[a].lstrip().startswith(_FAILURE_TAGS)]
+            if failed:
+                out = (f"[SKIPPED] upstream step(s) {failed} failed or were skipped — "
+                       f"{st['id']} was not dispatched")
+                outputs[st["id"]] = out
+                results[st["id"]] = {"step": st["id"], "model": st["model"],
+                                     "outcome": "SKIPPED", "content": out}
+                continue
+            b = dict(st["brief"])
+            b["context"] = list(b["context"]) + [
+                {"id": a, "kind": "prior_output", "content": outputs[a]} for a in b["access"]]
+            runnable[st["id"]] = (st, b)
+        res = _run_threads({
+            sid: (lambda st=st, b=b: _logged_call(
+                st["model"], _render_brief(b, task_id), task_id=task_id, role=b["role"],
+                mode="workflow", contract=b["output_contract"],
+                work_type=b.get("work_type", ""), reasoning_effort=reasoning_effort,
+                progress=progress))
+            for sid, (st, b) in runnable.items()})
+        for sid, (st, b) in runnable.items():
+            dispatched += 1
+            out = res.get(sid, "[ERROR] no result")
+            outputs[sid] = out
+            results[sid] = {"step": sid, "role": b["role"],
+                            **_package(st["model"], out, b["output_contract"])}
+    with _WF_LOCK:            # keep every output so a continuation plan can name it
+        _WF_OUTPUTS[task_id] = {"ts": time.time(), "outputs": outputs}
+    return json.dumps({
+        "task_id": task_id, "mode": "workflow", "goal": plan.get("goal", ""),
+        "waves": [[st["id"] for st in wave] for wave in waves],
+        "steps": [results[st["id"]] for st in plan["steps"]],
+        "dispatches": {"this_plan": dispatched, "task_total": used + dispatched,
+                       "ceiling": ceiling},
+        "next": "Read every step's contract and outcome. To revise the strategy after "
+                "seeing these results (the Conductor's recursion), submit a second plan "
+                f"with task_id='{task_id}' — it shares this task's ceiling. "
+                + _next_step(task_id),
+    }, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # v11 job layer — atomic task decomposition (start fast, poll fast)
 # ---------------------------------------------------------------------------
 
@@ -1396,67 +1698,10 @@ def _job_progress(job_id: str):
 
 
 
-@mcp.tool()
-def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v4-pro",
-                    reasoning_effort: str = "max",
-                    model_a: Optional[str] = None,
-                    model_b: Optional[str] = None) -> str:
-    """START a generator task as a background job and return IMMEDIATELY with a job_id —
-    the required path for anything that may take more than ~30 seconds. Claude Desktop
-    silently drops MCP tool results that take too long; jobs never block on the work.
-
-    brief: a JSON object (or JSON string) — the v16 briefing contract. Free-text prompts
-      are rejected. Shape:
-        {"role": "generator|critic|extractor|verifier|synthesizer",
-         "objective": "why this step exists (optional)",
-         "instruction": "one focused subtask",
-         "context": [{"id": "spec", "kind": "spec|source|artifact|prior_output",
-                      "content": "..."}],          # default [] = sees nothing
-         "access": ["step_1"],                      # what prior steps it may see
-         "constraints": ["..."],
-         "output_contract": {"name": "critic_v1"}   # or {"format": "json",
-                                                    #     "required_keys": [...],
-                                                    #     "example": {...}}}
-      Named contracts: critic_v1, verifier_v1, extractor_v1, synthesis_v1.
-      The brief is rendered to an XML <orchestra_brief> envelope for the model, and a
-      JSON reply is checked against required_keys on return.
-
-    mode: "model"       — one call to any generator; set `model` (see list_fleet()).
-          "parallel"    — the same brief to two models (`model_a`/`model_b`, default
-                          z-ai/glm-5.3-prime [CN-OW] + openai/gpt-astra-latest
-                          [US-CLOSED]). Capped at 2 by design.
-          "adversarial" — 2 rounds, 4 dispatches; `model_a`/`model_b` MUST be from
-                          different correlation classes. Same-class pairs are REJECTED.
-
-    A job never times out on its own: it stops only when the provider goes silent for
-    _SILENCE_SECONDS between chunks, and partial text comes back under [TIMEOUT].
-
-    Returns JSON: {"job_id": "...", "status": "running"}.
-    NEXT STEP (mandatory): call check_job(job_id) until status is "complete" or "failed".
-    """
+def _start_job(mode: str, work) -> str:
+    """Run work(job_id, progress) -> str on a daemon thread; return the job envelope at
+    once. Shared by every async tool, so job semantics cannot drift between them."""
     _prune_jobs()
-    mode = mode.strip().lower()
-    if mode not in ("model", "parallel", "adversarial"):
-        return json.dumps({"status": "failed",
-                           "error": f"unknown mode '{mode}' — use model | parallel | "
-                                    f"adversarial (the 'deepseek' and 'glm' aliases "
-                                    f"were removed in v15; use mode='model' with a "
-                                    f"registry id)"})
-    if mode == "model":
-        if model not in _MODELS:
-            return json.dumps({"status": "failed",
-                               "error": f"unknown model '{model}' — known: {sorted(_MODELS)}"})
-        targets = [model]
-    else:
-        targets = [model_a or _DEFAULT_PAIR[0], model_b or _DEFAULT_PAIR[1]]
-    for t in targets:          # fail fast, before a job exists
-        if t not in _MODELS:
-            return json.dumps({"status": "failed",
-                               "error": f"unknown model '{t}' — known: {sorted(_MODELS)}"})
-        b, err = _validate_brief(brief, t)
-        if err:
-            return json.dumps({"status": "failed", "error": f"invalid brief: {err}"})
-
     job_id = str(uuid.uuid4())[:8]
     with _JOBS_LOCK:
         _JOBS[job_id] = {"status": "running", "mode": mode,
@@ -1465,24 +1710,7 @@ def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v
 
     def worker():
         try:
-            # The job_id IS the task_id for the outcome log.
-            if mode == "model":
-                progress(f"calling {model}")
-                out = _logged_call(model, _render_brief(b, job_id), task_id=job_id,
-                                   role=b["role"], mode="job", contract=b["output_contract"],
-                                   reasoning_effort=reasoning_effort, progress=progress)
-                result = json.dumps({"task_id": job_id, "mode": "model",
-                                     **_package(model, out, b["output_contract"]),
-                                     "next": _next_step(job_id)},
-                                    indent=2, ensure_ascii=False)
-            elif mode == "parallel":
-                result = _run_parallel(models=tuple(targets), brief=b,
-                                       reasoning_effort=reasoning_effort,
-                                       progress=progress, task_id=job_id)
-            else:
-                result = _run_adversarial(b, model_a=targets[0], model_b=targets[1],
-                                          reasoning_effort=reasoning_effort,
-                                          progress=progress, task_id=job_id)
+            result = work(job_id, progress)
             with _JOBS_LOCK:
                 j = _JOBS.get(job_id)
                 if j is not None and j["status"] == "running":
@@ -1498,6 +1726,126 @@ def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v
     threading.Thread(target=worker, daemon=True).start()
     return json.dumps({"job_id": job_id, "status": "running",
                        "next": "call check_job with this job_id; keep polling until complete/failed"})
+
+
+@mcp.tool()
+def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v4-pro",
+                    reasoning_effort: str = "max",
+                    model_a: Optional[str] = None,
+                    model_b: Optional[str] = None) -> str:
+    """START a generator task as a background job and return IMMEDIATELY with a job_id —
+    the required path for anything that may take more than ~30 seconds. Claude Desktop
+    silently drops MCP tool results that take too long; jobs never block on the work.
+    For a multi-step plan (Conductor-style workflow), use workflow_start instead.
+
+    brief: a JSON object (or JSON string) — the briefing contract. Free-text prompts are
+      rejected. Shape:
+        {"role": "generator|critic|extractor|verifier|synthesizer|thinker|memory_keeper",
+         "objective": "why this step exists (optional)",
+         "instruction": "one focused subtask",
+         "context": [{"id": "spec", "kind": "spec|source|artifact|prior_output|memory",
+                      "content": "..."}],          # default [] = sees nothing
+         "access": [],                              # step ids (workflows only)
+         "constraints": ["..."],
+         "work_type": "swe|agentic|algorithmic|...", # metadata for route_evidence
+         "output_contract": {"name": "critic_v1"}   # or {"format": "json",
+                                                    #     "required_keys": [...],
+                                                    #     "enums": {...}, "example": {...}}}
+      Named contracts: critic_v1, verifier_v1, extractor_v1, synthesis_v1, plan_v1,
+      gate_v1, memory_ops_v1, memory_gate_v1.
+      The brief is rendered to an XML <orchestra_brief> envelope for the model, and a
+      JSON reply is checked against required_keys and enums on return.
+
+    mode: "model"       — one call to any generator; set `model` (see list_fleet()).
+          "parallel"    — the same brief to two models (`model_a`/`model_b`, default
+                          glm-5.3 [CN-OW] + openai/gpt-astra-latest
+                          [US-CLOSED]). Capped at 2 by design.
+          "adversarial" — 2 rounds, 4 dispatches; `model_a`/`model_b` MUST be from
+                          different correlation classes. Same-class pairs are REJECTED.
+
+    A job never times out on its own: it stops only when the provider goes silent for
+    _SILENCE_SECONDS between chunks, and partial text comes back under [TIMEOUT].
+
+    Returns JSON: {"job_id": "...", "status": "running"}.
+    NEXT STEP (mandatory): call check_job(job_id) until status is "complete" or "failed".
+    """
+    mode = mode.strip().lower()
+    if mode not in ("model", "parallel", "adversarial"):
+        return json.dumps({"status": "failed",
+                           "error": f"unknown mode '{mode}' — use model | parallel | "
+                                    f"adversarial (the 'deepseek' and 'glm' aliases "
+                                    f"were removed in v15; use mode='model' with a "
+                                    f"registry id; multi-step plans go to workflow_start)"})
+    targets = [model] if mode == "model" else [model_a or _DEFAULT_PAIR[0],
+                                               model_b or _DEFAULT_PAIR[1]]
+    b = None
+    for t in targets:          # fail fast, before a job exists
+        if t not in _MODELS:
+            return json.dumps({"status": "failed",
+                               "error": f"unknown model '{t}' — known: {sorted(_MODELS)}"})
+        b, err = _validate_brief(brief, t)
+        if err:
+            return json.dumps({"status": "failed", "error": f"invalid brief: {err}"})
+
+    def work(job_id, progress):
+        # The job_id IS the task_id for the outcome log.
+        if mode == "model":
+            progress(f"calling {model}")
+            out = _logged_call(model, _render_brief(b, job_id), task_id=job_id,
+                               role=b["role"], mode="job", contract=b["output_contract"],
+                               work_type=b.get("work_type", ""),
+                               reasoning_effort=reasoning_effort, progress=progress)
+            return json.dumps({"task_id": job_id, "mode": "model",
+                               **_package(model, out, b["output_contract"]),
+                               "next": _next_step(job_id)}, indent=2, ensure_ascii=False)
+        if mode == "parallel":
+            return _run_parallel(models=tuple(targets), brief=b,
+                                 reasoning_effort=reasoning_effort,
+                                 progress=progress, task_id=job_id)
+        return _run_adversarial(b, model_a=targets[0], model_b=targets[1],
+                                reasoning_effort=reasoning_effort,
+                                progress=progress, task_id=job_id)
+
+    return _start_job(mode, work)
+
+
+@mcp.tool()
+def workflow_start(plan: Union[dict, str], reasoning_effort: str = "max",
+                   task_id: str = "", ceiling: int = _MAX_DISPATCHES) -> str:
+    """START a Conductor-style workflow as a background job: a whole multi-step plan,
+    executed by the server with ENFORCED access lists. Poll with check_job.
+
+    plan: {"goal": "optional one line",
+           "steps": [{"id": "s1", "model": "<fleet id>", "brief": {...brief...}},
+                     {"id": "s2", "model": "...", "brief": {..., "access": ["s1"]}}]}
+      - a step's brief.access names the EARLIER steps whose outputs it may see; those
+        outputs are appended to its context as anonymised prior_output items (step id
+        only — never the model that wrote it). Default [] = sees nothing.
+      - steps with no dependency between them run concurrently (waves).
+      - a step downstream of a failed or skipped step is not dispatched.
+    task_id: pass the task_id of an earlier workflow to CONTINUE it (recursion: revise
+      the strategy after seeing results). The continuation shares that task's ceiling,
+      and its access lists may name the earlier plans' step ids (outputs are kept for an
+      hour); step ids must stay unique across the task.
+    ceiling: generator dispatches allowed per task, default 6 (SKILL.md 'Effort
+      scaling'). Raise it only when the operator has.
+
+    Returns JSON {"job_id", "status": "running"}; the finished result lists every step
+    with outcome, contract check and content, plus dispatch counts against the ceiling.
+    """
+    tid = task_id.strip()
+    p, err = _validate_workflow(plan, frozenset(_prior_outputs(tid)) if tid else frozenset())
+    if err:
+        return json.dumps({"status": "failed", "error": f"invalid plan: {err}"})
+    if len(p["steps"]) > ceiling:
+        return json.dumps({"status": "failed",
+                           "error": f"plan has {len(p['steps'])} steps; ceiling is {ceiling}"})
+
+    def work(job_id, progress):
+        return _run_workflow(p, tid or job_id, reasoning_effort=reasoning_effort,
+                             progress=progress, ceiling=ceiling)
+
+    return _start_job("workflow", work)
 
 
 @mcp.tool()
@@ -1554,7 +1902,7 @@ def call_model(model: str, brief: Union[dict, str], reasoning_effort: str = "max
     """Call ONE generator with a structured brief and WAIT. QUICK tasks only; for deep
     work use orchestra_start(mode="model", model=..., brief=...).
 
-    Fleet ids: deepseek-v4-pro, deepseek-v4.1-flash, z-ai/glm-5.3-prime,
+    Fleet ids: deepseek-v4-pro, deepseek-v4.1-flash, glm-5.3,
     openai/gpt-astra-latest. Call list_fleet() for classes, seats and budgets. The brief
     shape is documented on orchestra_start.
 
@@ -1572,6 +1920,7 @@ def call_model(model: str, brief: Union[dict, str], reasoning_effort: str = "max
     tid = _new_task_id()
     out = _logged_call(model, _render_brief(b, tid), task_id=tid, role=b["role"],
                        mode="sync", contract=b["output_contract"],
+                       work_type=b.get("work_type", ""),
                        reasoning_effort=reasoning_effort)
     return json.dumps({"task_id": tid, **_package(model, out, b["output_contract"]),
                        "next": _next_step(tid)}, indent=2, ensure_ascii=False)
@@ -1584,7 +1933,7 @@ def orchestra_parallel(brief: Union[dict, str], model_a: str = _DEFAULT_PAIR[0],
     """Send ONE structured brief to two generators concurrently and WAIT. QUICK briefs
     only — for anything substantial use orchestra_start(mode="parallel").
 
-    Default pair is cross-class: z-ai/glm-5.3-prime [CN-OW] + openai/gpt-astra-latest
+    Default pair is cross-class: glm-5.3 [CN-OW] + openai/gpt-astra-latest
     [US-CLOSED]. This tool does NOT judge or pick a winner: hand the two candidates to
     decide_compare / decide_panel and adjudicate per SKILL.md 'Ratification'. Both
     dispatches share the returned task_id — log each model's correctness under it.
@@ -1705,9 +2054,9 @@ def list_fleet() -> str:
 
     Use it before choosing a verifier (its class must differ from the worker's) and
     whenever a call returns [SKIPPED] or [ERROR]. A missing OPENROUTER_API_KEY removes
-    GLM-5.3-Prime, GPT Astra, the entire decision bench, and the only non-CN-OW
-    generator class — say so explicitly rather than silently same-class verifying or
-    falling back to Claude-alone rulings.
+    GPT Astra, the entire decision bench, and the only non-CN-OW generator class — say
+    so explicitly rather than silently same-class verifying or falling back to
+    Claude-alone rulings.
     """
     rows = []
     for mid, m in _MODELS.items():
@@ -1739,6 +2088,9 @@ def list_fleet() -> str:
         "classes_reachable_now": reachable,
         "cross_class_verification_available": len(reachable) > 1,
         "bench_available": or_key,
+        "work_types": list(_WORK_TYPES),
+        "routing_prior": {wt: {"primary": a, "partner": b}
+                          for wt, (a, b) in _ROUTING_PRIOR.items()},
         "note": "Verifier.class must differ from Worker.class (SKILL.md 'Verification "
                 "ladder'). Classes are a lab-lineage prior, not a measurement — "
                 "fleet_stats() replaces the guess once it has enough paired verdicts. "
@@ -1748,6 +2100,342 @@ def list_fleet() -> str:
 
 
 _OVERRIDE_DECISIONS = ("gate", "route", "stop", "inject", "ratify", "compare", "other")
+
+
+# ---------------------------------------------------------------------------
+# v17 MEMORY BANK — Proactive Memory (arXiv:2607.08716), adapted.
+#
+# The paper's failure mode is "behavioral state decay": requirements, environment
+# facts, failed attempts and open subgoals get buried or pushed out of the context
+# window and stop influencing decisions. Here the decaying contexts are Claude's own
+# long session (summarised when it fills) and every stateless worker brief. The bank
+# lives in a file next to this server, so it survives both.
+#
+# Kept from the paper (its official code, github.com/yifannnwu/proactive-memory-agent):
+# three stores — status (internal progress, never injected), knowledge (requirements,
+# facts, constraints), procedural (attempts, failures, fixes); "save only what would be
+# lost when the context scrolls"; a two-phase memory agent — phase 1 updates the bank,
+# phase 2 decides inject-or-silent against the UPDATED bank; silence as the default;
+# a BM25 prefilter once the bank exceeds 50 entries, top 20 per store.
+# Added here: an entry saved from a trajectory must quote verbatim evidence from it
+# (checked), and an injected note must cite existing entry ids (checked). A fabricated
+# memory cannot enter the bank, and an ungrounded note fails closed to silence.
+# ---------------------------------------------------------------------------
+_MEM_PATH = Path(__file__).with_name("memory_bank.json")
+_MEM_LOCK = threading.Lock()
+_MEM_MAX_ENTRIES = 200
+_MEM_MAX_CHARS = 600            # one fact or one experience per entry
+_MEM_PREFILTER_OVER = 50        # paper: BM25 prefilter above 50 entries ...
+_MEM_TOP_K = 20                 # ... showing the top 20 per store
+_MEM_AGENT_OPS = ("save_knowledge", "save_procedural", "update_status", "delete")
+_BANK_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _mem_load() -> dict:
+    try:
+        with open(_MEM_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("banks"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"banks": {}}
+
+
+def _mem_save(data: dict) -> None:
+    """Atomic replace, so a crash mid-write cannot leave a torn bank file."""
+    tmp = _MEM_PATH.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _MEM_PATH)
+
+
+def _norm_ws(text) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _apply_memory_ops(name: str, ops, trajectory: Optional[str] = None,
+                      allow_clear: bool = False) -> dict:
+    """Apply bank operations under one lock and one write. Never raises.
+
+    With a trajectory, every save must carry `evidence` that appears verbatim in it
+    (whitespace-normalised, at least 10 characters) — the grounding check. Without one,
+    saves are accepted but flagged grounded=false."""
+    if not _BANK_NAME.match(name or ""):
+        return {"error": f"[ERROR] bank name must match {_BANK_NAME.pattern}"}
+    if not isinstance(ops, list) or not ops:
+        return {"error": "[ERROR] ops must be a non-empty list"}
+    traj = _norm_ws(trajectory) if trajectory is not None else None
+    applied, rejected = [], []
+    with _MEM_LOCK:
+        data = _mem_load()
+        bank = data["banks"].setdefault(name, {"status": "", "entries": [], "next": 1})
+        for i, op in enumerate(ops):
+            kind = op.get("op") if isinstance(op, dict) else None
+            why = None
+            if kind in ("save_knowledge", "save_procedural"):
+                content, evidence = _norm_ws(op.get("content")), _norm_ws(op.get("evidence"))
+                if not content:
+                    why = "empty content"
+                elif len(content) > _MEM_MAX_CHARS:
+                    why = f"content over {_MEM_MAX_CHARS} chars — one fact per entry"
+                elif traj is not None and (len(evidence) < 10 or evidence not in traj):
+                    why = ("evidence is not a verbatim quote (10+ chars) from the trajectory "
+                           "— ungrounded memories are refused")
+                elif any(e["content"] == content for e in bank["entries"]):
+                    why = "duplicate of an existing entry"
+                elif len(bank["entries"]) >= _MEM_MAX_ENTRIES:
+                    why = "bank full — delete superseded entries first"
+                else:
+                    store = "knowledge" if kind == "save_knowledge" else "procedural"
+                    eid = f"{store[0]}{bank['next']}"
+                    bank["next"] += 1
+                    bank["entries"].append({"id": eid, "store": store, "content": content,
+                                            "evidence": evidence, "grounded": traj is not None,
+                                            "ts": _now()})
+                    applied.append({"op": kind, "id": eid})
+            elif kind == "update_status":
+                bank["status"] = _norm_ws(op.get("content"))[:2 * _MEM_MAX_CHARS]
+                applied.append({"op": kind})
+            elif kind == "delete":
+                eid = op.get("id")
+                kept = [e for e in bank["entries"] if e["id"] != eid]
+                if len(kept) == len(bank["entries"]):
+                    why = f"no entry with id {eid!r}"
+                else:
+                    bank["entries"] = kept
+                    applied.append({"op": kind, "id": eid})
+            elif kind == "clear" and allow_clear:
+                data["banks"][name] = bank = {"status": "", "entries": [], "next": 1}
+                applied.append({"op": kind})
+            else:
+                why = f"unknown or disallowed op {kind!r}"
+            if why:
+                rejected.append({"index": i, "op": kind, "why": why})
+        try:
+            _mem_save(data)
+        except OSError as e:
+            return {"error": f"[ERROR] could not write the memory bank: {e}"}
+    return {"bank": name, "applied": applied, "rejected": rejected,
+            "size": len(bank["entries"])}
+
+
+def _bm25_top(entries: list, query: str, k: int) -> list:
+    """Okapi BM25 (k1=1.5, b=0.75) over entry content; the paper's prefilter."""
+    tok = lambda t: re.findall(r"[a-z0-9]+", t.lower())
+    docs = [tok(e["content"]) for e in entries]
+    if not docs:
+        return []
+    q = set(tok(query))
+    n, avg = len(docs), (sum(map(len, docs)) / len(docs)) or 1.0
+    df = Counter(w for d in docs for w in set(d))
+    scored = []
+    for e, d in zip(entries, docs):
+        tf, score = Counter(d), 0.0
+        for w in q & set(tf):
+            idf = math.log(1 + (n - df[w] + 0.5) / (df[w] + 0.5))
+            score += idf * tf[w] * 2.5 / (tf[w] + 1.5 * (0.25 + 0.75 * len(d) / avg))
+        scored.append((score, e))
+    return [e for _, e in sorted(scored, key=lambda x: -x[0])[:k]]
+
+
+def _mem_view(name: str, query: str = "", top_k: int = _MEM_TOP_K) -> dict:
+    with _MEM_LOCK:
+        bank = _mem_load()["banks"].get(name, {"status": "", "entries": []})
+    entries = bank["entries"]
+    view = {"bank": name, "status_internal": bank.get("status", ""), "total": len(entries)}
+    for store in ("knowledge", "procedural"):
+        items = [e for e in entries if e["store"] == store]
+        if query and len(entries) > _MEM_PREFILTER_OVER:
+            shown = _bm25_top(items, query, top_k)
+            view[f"{store}_note"] = f"showing top {len(shown)} of {len(items)} by relevance"
+            items = shown
+        view[store] = [{"id": e["id"], "content": e["content"],
+                        "grounded": e.get("grounded", False)} for e in items]
+    return view
+
+
+def _parse_json_reply(out: str):
+    """The JSON value in a model reply, tolerating a code fence; None if unparseable."""
+    if not isinstance(out, str) or out.lstrip().startswith(_FAILURE_TAGS):
+        return None
+    text = out.strip()
+    m = _FENCE.match(text)
+    if m:
+        text = m.group(1).strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _run_memory_review(trajectory: str, next_step: str, bank: str, model: str,
+                       reasoning_effort: str, task_id: str, progress=None) -> str:
+    """The paper's two phases, with a fleet model as the separate memory agent."""
+    if progress:
+        progress(f"memory phase 1/2: {model} updating bank {bank!r}")
+    before = _mem_view(bank)
+    p1, _ = _validate_brief({
+        "role": "memory_keeper", "work_type": "memory",
+        "objective": "Keep a lean, accurate memory bank for a long multi-model task, so "
+                     "facts and failed approaches that scroll out of context are not lost.",
+        "instruction": "Compare `memory_bank` with `trajectory` and propose operations. "
+                       "save_knowledge: task requirements, environment facts and "
+                       "constraints that would be lost if `trajectory` scrolled away. "
+                       "save_procedural: what was tried and what happened — failures, "
+                       "error patterns, fixes. update_status: a short progress summary "
+                       "for your own tracking. delete: entries that `trajectory` shows are "
+                       "superseded or wrong. Do not save general knowledge, anything "
+                       "already in the bank, or things the trajectory merely mentions.",
+        "context": [{"id": "memory_bank", "kind": "memory",
+                     "content": json.dumps(before, ensure_ascii=False)},
+                    {"id": "trajectory", "kind": "source", "content": trajectory}],
+        "constraints": ["At most 8 operations.",
+                        "Each save's `evidence` is an exact substring of `trajectory`, "
+                        "10-200 characters, that supports the entry.",
+                        "One fact or one experience per entry."],
+        "output_contract": {"name": "memory_ops_v1"}}, model)
+    out1 = _logged_call(model, _render_brief(p1, task_id), task_id=task_id,
+                        role="memory_keeper", mode="memory", contract=p1["output_contract"],
+                        work_type="memory", reasoning_effort=reasoning_effort,
+                        progress=progress)
+    reply1 = _parse_json_reply(out1)
+    ops = [op for op in (reply1 or {}).get("ops", []) if isinstance(op, dict)
+           and op.get("op") in _MEM_AGENT_OPS][:8] if isinstance(reply1, dict) else []
+    # Paper behaviour: a phase-1 failure is logged and phase 2 still runs on the old bank.
+    applied = (_apply_memory_ops(bank, ops, trajectory) if ops
+               else {"bank": bank, "applied": [], "rejected": [], "size": before["total"]})
+
+    if progress:
+        progress(f"memory phase 2/2: {model} deciding inject-or-silent")
+    after = _mem_view(bank, query=next_step)
+    p2, _ = _validate_brief({
+        "role": "memory_keeper", "work_type": "memory",
+        "objective": "Selective attention: restore context only when the next step is "
+                     "about to lose it.",
+        "instruction": "Decide whether `next_step` needs a reminder from `memory_bank`. "
+                       "Intervene ONLY if the next step would (a) drop a requirement or "
+                       "constraint in the bank, (b) repeat a recorded failure, (c) "
+                       "contradict a fact in the bank, or (d) miss a format requirement. "
+                       "Do NOT intervene if the next step is consistent with the bank, if "
+                       "you are not confident, if the information is already in "
+                       "`recent_trajectory` or `next_step`, or if you would only restate "
+                       "what is already known. Your default is no intervention. If you "
+                       "intervene, synthesise a short note written as observations ('The "
+                       "task requires X'), not commands, and cite the ids of the bank "
+                       "entries it rests on.",
+        "context": [{"id": "memory_bank", "kind": "memory",
+                     "content": json.dumps(after, ensure_ascii=False)},
+                    {"id": "next_step", "kind": "spec", "content": next_step},
+                    {"id": "recent_trajectory", "kind": "source",
+                     "content": trajectory[-12000:]}],
+        "constraints": ["note is at most 800 characters.",
+                        "basis_ids lists only ids that appear in `memory_bank`."],
+        "output_contract": {"name": "memory_gate_v1"}}, model)
+    out2 = _logged_call(model, _render_brief(p2, task_id), task_id=task_id,
+                        role="memory_keeper", mode="memory", contract=p2["output_contract"],
+                        work_type="memory", reasoning_effort=reasoning_effort,
+                        progress=progress)
+    reply2 = _parse_json_reply(out2)
+    valid_ids = {e["id"] for store in ("knowledge", "procedural") for e in after[store]}
+    intervene, note, basis, suppressed = False, "", [], None
+    if isinstance(reply2, dict) and reply2.get("intervene") is True:
+        basis = [i for i in (reply2.get("basis_ids") or []) if i in valid_ids]
+        note = _norm_ws(reply2.get("note"))[:800]
+        if basis and note:
+            intervene = True
+        else:
+            suppressed = ("ungrounded note suppressed — it cited no existing bank entry "
+                          "(fail-closed to silence)")
+            note, basis = "", []
+    return json.dumps({
+        "task_id": task_id, "mode": "memory", "bank": bank, "memory_agent": model,
+        "phase1": {"outcome": _outcome_tag(out1),
+                   "contract": _check_contract(out1, p1["output_contract"]),
+                   "applied": applied.get("applied", []),
+                   "rejected": applied.get("rejected", []),
+                   "error": applied.get("error")},
+        "phase2": {"outcome": _outcome_tag(out2),
+                   "contract": _check_contract(out2, p2["output_contract"]),
+                   "intervene": intervene, "note": note, "basis_ids": basis,
+                   "suppressed": suppressed},
+        "bank_size": applied.get("size", before["total"]),
+        "next": ("If intervene is true, put `note` into the next brief's context as a "
+                 "{kind: 'memory'} item (never into instruction). If false, inject nothing."),
+    }, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def memory_update(ops: list, bank: str = "default", trajectory: str = "") -> str:
+    """Write to the persistent memory bank (Proactive Memory's status / knowledge /
+    procedural stores). The bank is a file next to the server, so it survives context
+    compaction and restarts.
+
+    ops: [{"op": "save_knowledge", "content": "...", "evidence": "..."},
+          {"op": "save_procedural", "content": "...", "evidence": "..."},
+          {"op": "update_status", "content": "..."},   # internal; never injected
+          {"op": "delete", "id": "k3"},
+          {"op": "clear"}]                             # start a new episode
+    trajectory: optional verbatim source text (user messages, tool output). When given,
+      every save's `evidence` must be a verbatim quote from it — the grounding check.
+      Prefer passing it: an ungrounded entry is stored with grounded=false.
+
+    Save only what would be LOST if the context scrolled: requirements, constraints,
+    environment facts, failed approaches and why. Not general knowledge.
+    """
+    res = _apply_memory_ops(bank, ops, trajectory if trajectory else None,
+                            allow_clear=True)
+    return json.dumps(res, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def memory_read(bank: str = "default", query: str = "", top_k: int = _MEM_TOP_K) -> str:
+    """Read the memory bank. Above 50 entries, pass `query` (the next step) to get the
+    top-k entries per store by BM25 relevance, as the paper does. `status_internal` is
+    for the conductor's own tracking and must never be injected into a worker brief.
+    """
+    if not _BANK_NAME.match(bank or ""):
+        return json.dumps({"error": f"[ERROR] bank name must match {_BANK_NAME.pattern}"})
+    return json.dumps(_mem_view(bank, query, max(1, min(int(top_k), 50))),
+                      indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def memory_review(trajectory: str, next_step: str, bank: str = "default",
+                  model: str = "glm-5.3", reasoning_effort: str = "low") -> str:
+    """START a Proactive-Memory review as a background job: a fleet model acts as the
+    paper's SEPARATE memory agent, so the agent whose context is decaying (Claude) is not
+    the only one deciding what is worth remembering. Poll with check_job.
+
+    Phase 1 — the memory agent proposes bank operations from `trajectory`; the server
+      applies only those whose evidence is a verbatim quote from it.
+    Phase 2 — against the UPDATED bank, it decides whether `next_step` needs a reminder:
+      intervene only for a forgotten requirement, a repeated failure, a contradiction, or
+      a missed format; default silent. A note that cites no existing entry is suppressed.
+
+    trajectory: verbatim recent material — user messages, tool results, fleet outputs.
+      Paste, don't summarise: grounding is checked against exactly this text.
+    model: any generator except those barred from factual roles; default glm-5.3 (1M
+      context). Costs two generator dispatches, logged under mode "memory".
+    """
+    if model not in _MODELS:
+        return json.dumps({"status": "failed", "error": f"unknown model {model!r}"})
+    if model in _NO_VERIFY:
+        return json.dumps({"status": "failed",
+                           "error": f"{model} may not keep memory — its fabrication rate "
+                                    f"makes it unfit for factual roles"})
+    if not _BANK_NAME.match(bank or ""):
+        return json.dumps({"status": "failed",
+                           "error": f"bank name must match {_BANK_NAME.pattern}"})
+    if not trajectory.strip() or not next_step.strip():
+        return json.dumps({"status": "failed",
+                           "error": "trajectory and next_step are both required"})
+
+    def work(job_id, progress):
+        return _run_memory_review(trajectory, next_step, bank, model, reasoning_effort,
+                                  job_id, progress)
+
+    return _start_job("memory", work)
 
 
 @mcp.tool()
@@ -1780,9 +2468,74 @@ def log_override(task_id: str, decision: str, bench_ruling: str, action_taken: s
     return f"logged override of {d} on task {task_id.strip()}{note}"
 
 
+_EMPTY_CELL = {"verdicts": 0, "correct": 0, "verified": 0, "verified_correct": 0}
+
+
+@mcp.tool()
+def route_evidence(work_type: str, role: str = "generator", last_n: int = 5000) -> str:
+    """Which generator should take this work type: the benchmark PRIOR (the fleet card's
+    routing table) next to what the outcome log has MEASURED on this operator's work.
+
+    Why it exists: TRINITY and the Conductor both report that an untrained frontier LLM
+    acting as coordinator does much worse than a trained one, and the Conductor paper's
+    diagnosis is that it routes by reputation. Claude routing from benchmark priors is
+    exactly that setup. This tool is the substitute for training: the verdicts logged
+    with log_outcome — L1/L2-verified ones first — replace reputation once they exist.
+
+    Rule (policy, mirrored in SKILL.md 'Routing'): recommend a measured leader only when
+    it has >= 10 verdicts on this work type AND beats the prior primary's measured rate by
+    >= 10 points. Otherwise the prior stands, and `explore` names models with no
+    measurement — pair one with the primary on the next L1-verifiable task, or the prior
+    can never be tested (a model nobody routes to never accrues verdicts).
+
+    role: the brief's role; verifier excludes models barred from verifying.
+    """
+    if work_type not in _WORK_TYPES:
+        return json.dumps({"error": f"[ERROR] work_type must be one of {list(_WORK_TYPES)}"})
+    if role not in _ROLES:
+        return json.dumps({"error": f"[ERROR] role must be one of {list(_ROLES)}"})
+    eligible = [m for m in _MODELS if not (role == "verifier" and m in _NO_VERIFY)]
+    primary, partner = _ROUTING_PRIOR[work_type]
+    if primary not in eligible:
+        primary = partner if partner in eligible else "openai/gpt-astra-latest"
+    log = _read_log(last_n)
+    table = _work_type_table(log["dispatches"], log["outcomes"]).get(work_type, {})
+    measured = {}
+    for m in eligible:
+        cell = table.get(m, _EMPTY_CELL)
+        rate, source = _rate(cell)
+        measured[m] = {**cell, "rate": rate, "rate_source": source}
+    p_rate = measured[primary]["rate"]
+    leaders = sorted(((v["rate"], m) for m, v in measured.items()
+                      if m != primary and v["rate"] is not None), reverse=True)
+    pick, source = primary, "prior"
+    if leaders and p_rate is not None and leaders[0][0] >= p_rate + _ROUTE_MARGIN:
+        pick, source = leaders[0][1], "measured"
+        why = (f"{pick} measured {leaders[0][0]:.0%} vs prior primary {primary} "
+               f"{p_rate:.0%} — beats it by at least {_ROUTE_MARGIN:.0%}")
+    elif p_rate is not None:
+        why = (f"prior primary {primary} measured {p_rate:.0%}; no eligible model beats it "
+               f"by {_ROUTE_MARGIN:.0%} or more")
+    elif leaders:
+        why = (f"{primary} has no measurement yet while {leaders[0][1]} does — keep the "
+               f"prior, and pair the two on the next L1-verifiable task to compare")
+    else:
+        why = "no measured verdicts for this work type yet — the prior stands"
+    explore = [m for m in eligible if measured[m]["rate"] is None and m != pick]
+    return json.dumps({
+        "work_type": work_type, "role": role,
+        "prior": {"primary": _ROUTING_PRIOR[work_type][0], "partner": partner},
+        "measured": measured,
+        "recommendation": {"model": pick, "source": source, "why": why},
+        "explore": explore,
+        "note": "Verified (L1/L2) verdicts are preferred over judged ones. Feed the table "
+                "with log_outcome(..., basis=...) after every adjudication.",
+    }, indent=2)
+
+
 @mcp.tool()
 def log_outcome(task_id: str, model: str, correctness: str,
-                note: str = "", disposition: str = "") -> str:
+                note: str = "", disposition: str = "", basis: str = "JUDGED") -> str:
     """Record how ONE model's output on a dispatch actually turned out, AFTER Claude has
     adjudicated it. This is the step that turns the data flywheel: dispatch rows (written
     automatically by the server) say what the fleet produced; outcome rows say whether it
@@ -1803,6 +2556,11 @@ def log_outcome(task_id: str, model: str, correctness: str,
       UNVERIFIED        — no check existed; carried as unverified (L0)
     disposition (optional, orthogonal — what you DID with it): USED | DISCARDED. A
     DISCARDED-but-correct redundant answer is NOT an error and must not be logged WRONG.
+    basis (v17) — how the verdict was reached: L1 (a deterministic check decided it),
+    L2 (an independent cross-class source confirmed it), JUDGED (judgment alone, the
+    default). route_evidence prefers L1/L2 verdicts: they are the closest this skill
+    gets to the verifiable reward the papers' coordinators were trained on.
+    OVERTURNED_BY_L1 is always basis L1.
 
     Re-adjudication is an UPDATE, not a new fact: calling again for the same
     (task_id, model) supersedes the earlier row (fleet_stats keeps last-writer-wins)."""
@@ -1814,10 +2572,88 @@ def log_outcome(task_id: str, model: str, correctness: str,
         return f"[ERROR] disposition must be one of {[x for x in _DISPOSITION if x]} or empty — got {disposition!r}"
     if not task_id.strip() or not model.strip():
         return "[ERROR] task_id and model are both required — per-model verdicts are the whole point"
+    bs = "L1" if c == "OVERTURNED_BY_L1" else basis.strip().upper()
+    if bs not in _BASIS:
+        return f"[ERROR] basis must be one of {list(_BASIS)} — got {basis!r}"
     _log_event({"type": "outcome", "ts": _now(), "task_id": task_id.strip(),
                 "model": model.strip(), "correctness": c, "disposition": d,
-                "note": note.strip()})
-    return f"logged {c} for {model.strip()} on task {task_id.strip()}"
+                "basis": bs, "note": note.strip()})
+    return f"logged {c} ({bs}) for {model.strip()} on task {task_id.strip()}"
+
+
+def _read_log(last_n: int = 1000) -> dict:
+    """Parse the last `last_n` log lines into dispatch / outcome / override rows.
+    Shared by fleet_stats and route_evidence so the two can never disagree."""
+    out = {"lines": 0, "dispatches": [], "outcomes": [], "overrides": [],
+           "malformed": 0, "error": None}
+    lines = []
+    try:
+        with _LOG_LOCK:
+            if _LOG_PATH.exists():
+                with open(_LOG_PATH, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+    except Exception as e:
+        out["error"] = f"could not read log: {e}"
+        return out
+    lines = lines[-max(1, last_n):]
+    out["lines"] = len(lines)
+    bucket = {"dispatch": "dispatches", "outcome": "outcomes", "override": "overrides"}
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)          # skip-and-count a torn tail line rather than crash
+        except Exception:
+            out["malformed"] += 1
+            continue
+        if rec.get("type") in bucket:
+            out[bucket[rec["type"]]].append(rec)
+    return out
+
+
+def _work_type_table(dispatches: list, outcomes: list) -> dict:
+    """{work_type: {model: counts}} over adjudicated generator dispatches.
+
+    The verdict for a (task_id, model) pair is its LAST outcome row; its work type is the
+    first non-empty work_type on that pair's dispatch rows. Adversarial dispatches are
+    excluded — that mode manufactures disagreement, so its verdicts would bias rates."""
+    wt_by, excluded = {}, set()
+    for d in dispatches:
+        key = (d.get("task_id"), d.get("model"))
+        if d.get("model") not in _MODELS:
+            continue
+        if d.get("mode") == "adversarial":
+            excluded.add(key)
+        if d.get("work_type") and key not in wt_by:
+            wt_by[key] = d["work_type"]
+    last = {}
+    for o in outcomes:
+        last[(o.get("task_id"), o.get("model"))] = o
+    table = defaultdict(lambda: defaultdict(lambda: {"verdicts": 0, "correct": 0,
+                                                     "verified": 0, "verified_correct": 0}))
+    for key, o in last.items():
+        if key in excluded or key not in wt_by:
+            continue
+        c = o.get("correctness")
+        if c not in ("CORRECT", "WRONG", "OVERTURNED_BY_L1"):
+            continue                       # UNVERIFIED carries no error signal
+        cell = table[wt_by[key]][key[1]]
+        cell["verdicts"] += 1
+        cell["correct"] += c == "CORRECT"
+        if o.get("basis") in ("L1", "L2") or c == "OVERTURNED_BY_L1":
+            cell["verified"] += 1
+            cell["verified_correct"] += c == "CORRECT"
+    return {wt: dict(models) for wt, models in table.items()}
+
+
+def _rate(cell: dict, min_n: int = _MIN_ROUTE_SAMPLES) -> tuple:
+    """(rate, source) for one cell — verified verdicts preferred; None below min_n."""
+    if cell["verified"] >= min_n:
+        return round(cell["verified_correct"] / cell["verified"], 3), "verified"
+    if cell["verdicts"] >= min_n:
+        return round(cell["correct"] / cell["verdicts"], 3), "judged"
+    return None, f"insufficient (n={cell['verdicts']}, need {min_n})"
 
 
 @mcp.tool()
@@ -1840,39 +2676,22 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
          class-pair rate prints ONLY at n >= _MIN_PAIRS; below that it says so.
       4. worst_recent — the latest non-OK dispatches: 'sort by loss, read the ten'.
       5. log_write_failures — nonzero means the logger itself is failing and every stat
-         above is stale; a silent dead flywheel is the worst case, so it is loud here."""
-    lines = []
-    try:
-        with _LOG_LOCK:
-            if _LOG_PATH.exists():
-                with open(_LOG_PATH, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-    except Exception as e:
-        return json.dumps({"error": f"could not read log: {e}", "log_path": str(_LOG_PATH)})
-    lines = lines[-max(1, last_n):]
-
-    dispatches, outcomes, overrides, malformed = [], [], [], 0
-    for ln in lines:
-        ln = ln.strip()
-        if not ln:
-            continue
-        try:
-            rec = json.loads(ln)          # skip-and-count a torn tail line rather than crash
-        except Exception:
-            malformed += 1
-            continue
-        if rec.get("type") == "dispatch":
-            if mode and rec.get("mode") != mode:
-                continue
-            dispatches.append(rec)
-        elif rec.get("type") == "outcome":
-            outcomes.append(rec)
-        elif rec.get("type") == "override":
-            overrides.append(rec)
+         above is stale; a silent dead flywheel is the worst case, so it is loud here.
+      6. (v16) claude_overrides_of_bench and the builds a floating alias served.
+      7. (v17) by_work_type — per (work type, model) verdict counts and correct rates,
+         verified (L1/L2) verdicts preferred. route_evidence reads the same table."""
+    log = _read_log(last_n)
+    if log["error"]:
+        return json.dumps({"error": log["error"], "log_path": str(_LOG_PATH)})
+    n_lines = log["lines"]
+    malformed = log["malformed"]
+    outcomes, overrides = log["outcomes"], log["overrides"]
+    all_dispatches = log["dispatches"]
+    dispatches = [d for d in all_dispatches if not mode or d.get("mode") == mode]
 
     if not dispatches:
         return json.dumps({"note": "no dispatches in window — nothing measured yet",
-                           "log_path": str(_LOG_PATH), "lines_scanned": len(lines),
+                           "log_path": str(_LOG_PATH), "lines_scanned": n_lines,
                            "malformed_lines_skipped": malformed,
                            "log_write_failures": _LOG_FAILURES}, indent=2)
 
@@ -1948,7 +2767,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
              for d in dispatches if d.get("outcome") not in ("OK", "SKIPPED")][-10:]
 
     return json.dumps({
-        "window": {"lines_scanned": len(lines), "dispatches": len(dispatches),
+        "window": {"lines_scanned": n_lines, "dispatches": len(dispatches),
                    "distinct_outcomes": len(outcome_by), "mode_filter": mode or "all",
                    "malformed_lines_skipped": malformed},
         "per_model": per_model,
@@ -1960,6 +2779,10 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
                              "dominate. The fleet_stats() / SKILL.md 'Outcome log' seed, not the finished result.",
         "worst_recent": worst,
         "claude_overrides_of_bench": override_counts or "none logged",
+        "by_work_type": {wt: {m: {**cell, "rate": _rate(cell)[0], "rate_source": _rate(cell)[1]}
+                              for m, cell in models.items()}
+                         for wt, models in _work_type_table(all_dispatches, outcomes).items()}
+                        or "no adjudicated dispatches carry a work_type yet",
         "log_write_failures": _LOG_FAILURES,
         "log_path": str(_LOG_PATH),
     }, indent=2, ensure_ascii=False)

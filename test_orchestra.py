@@ -15,7 +15,9 @@ import orchestra_mcp_server as o
 # Tests must never append to the operator's real outcome log: every test that reaches
 # _logged_call / _logged_decide writes to a throwaway file instead.
 import tempfile as _tempfile
-o._LOG_PATH = o.Path(_tempfile.mkdtemp(prefix="orchestra-test-")) / "dispatch_log.jsonl"
+_TEST_DIR = o.Path(_tempfile.mkdtemp(prefix="orchestra-test-"))
+o._LOG_PATH = _TEST_DIR / "dispatch_log.jsonl"
+o._MEM_PATH = _TEST_DIR / "memory_bank.json"      # nor to the operator's memory bank
 
 
 def _server_code_without_changelog():
@@ -272,7 +274,7 @@ BRIEF = {"role": "generator", "instruction": "Return the word ok.",
 def test_adversarial_still_rejects_same_class_pairs():
     """The cross-class guard is the reason adversarial mode means anything. It must
     survive a refactor that touched every line around it."""
-    out = o._run_adversarial(BRIEF, model_a="deepseek-v4-pro", model_b="z-ai/glm-5.3-prime")
+    out = o._run_adversarial(BRIEF, model_a="deepseek-v4-pro", model_b="glm-5.3")
     assert out.startswith("[ERROR]"), out
     assert "cross-class" in out.lower(), out
 
@@ -345,10 +347,11 @@ def test_skill_has_no_dangling_reachability_pointer():
 
 def test_removed_models_are_gone():
     """v16 fleet: ox-alpha (delisted), and kimi-k3 / grok-4.6 / gemini-3.7-flash
-    (operator-removed) must be absent; the swapped-out ids must not linger beside
-    their replacements. 4 generators, two classes."""
+    (operator-removed) must be absent; the swapped-out DeepSeek id must not linger
+    beside its replacement. v17: GLM-5.3-Prime is OpenRouter-only, so by operator rule
+    GLM stays glm-5.3 on the direct API. 4 generators, two classes."""
     for dead in ("stealth/ox-alpha", "moonshotai/kimi-k3", "x-ai/grok-4.6",
-                 "google/gemini-3.7-flash", "deepseek-v4-flash", "glm-5.3"):
+                 "google/gemini-3.7-flash", "deepseek-v4-flash", "z-ai/glm-5.3-prime"):
         assert dead not in o._MODELS, f"{dead} should be removed from _MODELS"
     assert len(o._MODELS) == 4, f"_MODELS should have 4 entries, got {len(o._MODELS)}"
     classes = set(m["klass"] for m in o._MODELS.values())
@@ -745,8 +748,19 @@ def test_wire_ids_and_openrouter_payload():
                              "require_parameters": True}
     assert p["reasoning"] == {"effort": "high"}
     assert p["max_tokens"] == 128000 and p["stream"] is True
-    g = _capture_payload("z-ai/glm-5.3-prime", "OPENROUTER_API_KEY")
-    assert "thinking" not in g, "the direct-Zhipu thinking payload must not reach OpenRouter"
+    assert "thinking" not in p, "the direct-Zhipu thinking payload must not reach OpenRouter"
+
+
+def test_glm_reasoning_effort_passthrough():
+    """Regression test (restored in v17 with the direct GLM provider): GLM must receive
+    reasoning_effort verbatim (except 'none' -> 'low'), not collapsed through _effort(),
+    which maps "max" -> "high" — every GLM call would silently lose depth, since "max"
+    is the default on every call path. Thinking must always be enabled on 5.3."""
+    for sent, expected in (("max", "max"), ("none", "low"), ("high", "high")):
+        g = _capture_payload("glm-5.3", "ZHIPU_API_KEY", reasoning_effort=sent)
+        assert g["reasoning_effort"] == expected, (sent, g["reasoning_effort"])
+        assert g["thinking"] == {"type": "enabled"}
+        assert g["model"] == "glm-5.3" and "provider" not in g and "reasoning" not in g
 
 
 def test_default_pairs_are_cross_class():
@@ -927,11 +941,14 @@ def test_skill_names_every_registry_model():
         card = z.read("orchestra/references/fleet-card.md").decode("utf-8")
         skill = z.read("orchestra/SKILL.md").decode("utf-8")
     for ref in ("fleet-card.md", "dispatch-protocol.md", "verification.md",
-                "evidence-base.md", "decision-bench.md", "governance.md"):
+                "evidence-base.md", "decision-bench.md", "governance.md",
+                "research-alignment.md", "memory.md"):
         assert f"orchestra/references/{ref}" in names, ref
         assert f"references/{ref}" in skill, f"SKILL.md does not index {ref}"
     for mid in list(o._MODELS) + list(o._DECIDERS):
-        assert mid in card, f"{mid} is in the server registry but not in fleet-card.md"
+        assert f"`{mid}`" in card, f"`{mid}` is in the server registry but not in fleet-card.md"
+    assert "glm-5.3-prime" not in card.split("## History", 1)[0].lower(), \
+        "GLM-5.3-Prime was reverted in v17; only the history section may mention it"
     routing = card.split("## Routing", 1)[1].split("\n## ", 1)[0]
     for dead in ("Kimi", "Grok", "Gemini"):
         assert dead not in routing, f"{dead} still appears in the routing table"
@@ -986,6 +1003,397 @@ def test_panel_end_to_end_reports_cross_class_agreement():
     bad = json.loads(o.decide_panel({"task": "x"}, Q,
                                     ["typesafe/jev-1.13", "inception/mercury-decide:free"]))
     assert "single-class" in bad["error"]
+
+
+# ---------------------------------------------------------------------------
+# v17 — helpers: a fake generator so workflow / memory paths run offline
+# ---------------------------------------------------------------------------
+
+class _FakeFleet:
+    """Stands in for o._call. `replies` maps model -> reply string, or a callable
+    (messages) -> reply. Records every call's model and rendered brief."""
+    def __init__(self, replies):
+        self.replies, self.calls = replies, []
+
+    def __call__(self, model, messages, reasoning_effort="max", progress=None, meta=None):
+        self.calls.append({"model": model, "brief": messages[-1]["content"]})
+        r = self.replies.get(model, "[ERROR] no fake reply configured")
+        return r(messages) if callable(r) else r
+
+
+def _with_fake_fleet(fleet, fn):
+    original = o._call
+    try:
+        o._call = fleet
+        return fn()
+    finally:
+        o._call = original
+
+
+def _brief(role="generator", access=(), contract=None, **extra):
+    b = {"role": role, "instruction": f"do the {role} step",
+         "access": list(access), "output_contract": contract or {"format": "text"}}
+    b.update(extra)
+    return b
+
+
+# ---------------------------------------------------------------------------
+# v17 — Conductor-style workflows
+# ---------------------------------------------------------------------------
+
+def test_workflow_validation():
+    good = {"steps": [{"id": "s1", "model": "glm-5.3", "brief": _brief()},
+                      {"id": "s2", "model": "openai/gpt-astra-latest",
+                       "brief": _brief("critic", ["s1"], {"name": "critic_v1"})}]}
+    p, err = o._validate_workflow(good)
+    assert err is None and [st["id"] for st in p["steps"]] == ["s1", "s2"], err
+    for bad, why in (
+            ({"steps": []}, "steps"),
+            ({"steps": [{"id": "s1", "model": "glm-5.3", "brief": _brief(access=["s2"])},
+                        {"id": "s2", "model": "glm-5.3", "brief": _brief()}]}, "not earlier"),
+            ({"steps": [{"id": "s1", "model": "glm-5.3", "brief": _brief()},
+                        {"id": "s1", "model": "glm-5.3", "brief": _brief()}]}, "duplicate"),
+            ({"steps": [{"id": "s1", "model": "kimi", "brief": _brief()}]}, "unknown model"),
+            ({"steps": [{"id": "s1", "model": "deepseek-v4.1-flash",
+                         "brief": _brief("verifier", contract={"name": "verifier_v1"})}]},
+             "may not act as a verifier"),
+            ({"steps": [{"id": "s1", "model": "glm-5.3", "brief": _brief()},
+                        {"id": "s2", "model": "glm-5.3",
+                         "brief": _brief(access=["s1"],
+                                         context=[{"id": "s1", "content": "x"}])}]},
+             "collide"),
+            ({"steps": [{"id": "1bad", "model": "glm-5.3", "brief": _brief()}]}, "must match"),
+            ({"steps": [{"id": "s1", "model": "glm-5.3", "brief": _brief(),
+                         "note": "x"}]}, "unknown fields")):
+        _, err = o._validate_workflow(bad)
+        assert err and why in err, (why, err)
+
+
+def test_workflow_waves_group_independent_steps():
+    p, _ = o._validate_workflow({"steps": [
+        {"id": "a", "model": "glm-5.3", "brief": _brief()},
+        {"id": "b", "model": "deepseek-v4-pro", "brief": _brief()},
+        {"id": "c", "model": "openai/gpt-astra-latest", "brief": _brief(access=["a", "b"])},
+        {"id": "d", "model": "glm-5.3", "brief": _brief(access=["a"])}]})
+    assert [[st["id"] for st in w] for w in o._waves(p["steps"])] == [["a", "b"], ["c", "d"]]
+
+
+def test_workflow_enforces_access_lists_and_anonymises():
+    """A step sees exactly the outputs its access list names — tagged by step id, never
+    by the model that wrote them — and nothing else."""
+    fleet = _FakeFleet({"glm-5.3": "GLM_SECRET_DRAFT",
+                        "deepseek-v4-pro": "PRO_UNRELATED",
+                        "openai/gpt-astra-latest": '{"verdict": "PASS", "defects": []}'})
+    plan, _ = o._validate_workflow({"goal": "g", "steps": [
+        {"id": "draft", "model": "glm-5.3", "brief": _brief(work_type="swe")},
+        {"id": "other", "model": "deepseek-v4-pro", "brief": _brief()},
+        {"id": "review", "model": "openai/gpt-astra-latest",
+         "brief": _brief("critic", ["draft"], {"name": "critic_v1"})}]})
+    res = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(plan, "wf-access")))
+    review = [c for c in fleet.calls if c["model"] == "openai/gpt-astra-latest"][0]["brief"]
+    assert "GLM_SECRET_DRAFT" in review and 'id="draft" kind="prior_output"' in review
+    assert "PRO_UNRELATED" not in review, "a step must not see steps outside its access list"
+    assert "glm-5.3" not in review, "prior outputs must not reveal which model wrote them"
+    steps = {st["step"]: st for st in res["steps"]}
+    assert steps["review"]["contract"]["valid"] is True
+    assert res["waves"] == [["draft", "other"], ["review"]]
+    assert res["dispatches"] == {"this_plan": 3, "task_total": 3, "ceiling": 6}
+    rows = [json.loads(x) for x in open(o._LOG_PATH, encoding="utf-8") if "wf-access" in x]
+    assert {r["mode"] for r in rows} == {"workflow"} and len(rows) == 3
+    assert [r for r in rows if r["model"] == "glm-5.3"][0]["work_type"] == "swe"
+
+
+def test_workflow_fault_barrier_skips_downstream():
+    fleet = _FakeFleet({"glm-5.3": "[ERROR] glm/glm-5.3: HTTP 502",
+                        "openai/gpt-astra-latest": "fine"})
+    plan, _ = o._validate_workflow({"steps": [
+        {"id": "a", "model": "glm-5.3", "brief": _brief()},
+        {"id": "b", "model": "openai/gpt-astra-latest", "brief": _brief(access=["a"])},
+        {"id": "c", "model": "openai/gpt-astra-latest", "brief": _brief(access=["b"])}]})
+    res = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(plan, "wf-fault")))
+    steps = {st["step"]: st for st in res["steps"]}
+    assert steps["a"]["outcome"] == "ERROR"
+    assert steps["b"]["outcome"] == steps["c"]["outcome"] == "SKIPPED"
+    assert len(fleet.calls) == 1, "nothing downstream of a failure may be dispatched"
+
+
+def test_workflow_continuation_shares_the_ceiling():
+    """The Conductor's recursion is a second plan under the same task_id; together the
+    plans may not exceed the per-task ceiling."""
+    fleet = _FakeFleet({"glm-5.3": "ok"})
+    four, _ = o._validate_workflow({"steps": [
+        {"id": f"s{i}", "model": "glm-5.3", "brief": _brief()} for i in range(4)]})
+    _with_fake_fleet(fleet, lambda: o._run_workflow(four, "wf-ceiling"))
+    again = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(four, "wf-ceiling")))
+    assert "error" in again and "already used 4 of its 6" in again["error"]
+    assert len(fleet.calls) == 4
+    two, _ = o._validate_workflow({"steps": [
+        {"id": f"t{i}", "model": "glm-5.3", "brief": _brief()} for i in range(2)]})
+    ok = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(two, "wf-ceiling")))
+    assert ok["dispatches"]["task_total"] == 6
+
+
+def test_continuation_plan_can_see_earlier_plan_outputs():
+    """Recursion without hand-carrying: a second plan under the same task_id may name
+    the first plan's steps in its access lists; reusing their ids is refused."""
+    fleet = _FakeFleet({"glm-5.3": "FIRST_DRAFT_OUTPUT",
+                        "openai/gpt-astra-latest": '{"verdict": "REVISE", "diagnosis": "x"}'})
+    first, _ = o._validate_workflow({"steps": [
+        {"id": "work", "model": "glm-5.3", "brief": _brief()},
+        {"id": "gate", "model": "openai/gpt-astra-latest",
+         "brief": _brief("verifier", ["work"], {"name": "gate_v1"})}]})
+    _with_fake_fleet(fleet, lambda: o._run_workflow(first, "wf-recur"))
+    prior = frozenset(o._prior_outputs("wf-recur"))
+    assert prior == {"work", "gate"}
+    _, err = o._validate_workflow({"steps": [
+        {"id": "work", "model": "glm-5.3", "brief": _brief()}]}, prior)
+    assert err and "unique across every plan" in err
+    second, err = o._validate_workflow({"steps": [
+        {"id": "work2", "model": "glm-5.3", "brief": _brief(access=["work", "gate"])}]}, prior)
+    assert err is None, err
+    assert o._waves(second["steps"])[0][0]["id"] == "work2"
+    res = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(second, "wf-recur")))
+    revise_brief = fleet.calls[-1]["brief"]
+    assert "FIRST_DRAFT_OUTPUT" in revise_brief and "REVISE" in revise_brief
+    assert res["dispatches"]["task_total"] == 3
+    _, err = o._validate_workflow({"steps": [
+        {"id": "x", "model": "glm-5.3", "brief": _brief(access=["work"])}]})
+    assert err and "not earlier" in err, "without the task's prior ids, access is refused"
+
+
+def test_workflow_start_rejects_bad_plans_before_any_job():
+    out = json.loads(o.workflow_start({"steps": [{"id": "s1", "model": "nope",
+                                                  "brief": _brief()}]}))
+    assert out["status"] == "failed" and "unknown model" in out["error"]
+    seven = {"steps": [{"id": f"s{i}", "model": "glm-5.3", "brief": _brief()}
+                       for i in range(7)]}
+    out = json.loads(o.workflow_start(seven))
+    assert out["status"] == "failed" and "ceiling" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# v17 — TRINITY roles, enums, work types
+# ---------------------------------------------------------------------------
+
+def test_gate_and_critic_enums_are_checked():
+    gate = o._CONTRACTS["gate_v1"]
+    assert o._check_contract('{"verdict": "ACCEPT", "diagnosis": ""}', gate)["valid"] is True
+    bad = o._check_contract('{"verdict": "MAYBE", "diagnosis": "x"}', gate)
+    assert bad["valid"] is False and "MAYBE" in bad["errors"][0]
+    assert o._check_contract('{"verdict": "OK", "defects": []}',
+                             o._CONTRACTS["critic_v1"])["valid"] is False
+    inline, err = o._resolve_contract({"format": "json", "required_keys": ["x"],
+                                       "enums": {"x": ["a", "b"]}})
+    assert err is None and o._check_contract('{"x": "c"}', inline)["valid"] is False
+
+
+def test_thinker_role_and_plan_contract_render():
+    b, err = o._validate_brief({"role": "thinker", "instruction": "Plan it.",
+                                "output_contract": {"name": "plan_v1"}, "work_type": "swe"})
+    assert err is None, err
+    xml = o._render_brief(b)[1]["content"]
+    assert "<role>thinker</role>" in xml and "falsifier" in xml
+    assert "work_type" not in xml and "swe" not in xml, "work_type is metadata, never rendered"
+    gate, _ = o._validate_brief({"role": "verifier", "instruction": "Judge it.",
+                                 "output_contract": {"name": "gate_v1"}})
+    assert '<allowed key="verdict">ACCEPT | REVISE</allowed>' in o._render_brief(gate)[1]["content"]
+    _, err = o._validate_brief({"role": "thinker", "instruction": "x", "work_type": "vibes",
+                                "output_contract": {"format": "text"}})
+    assert err and "work_type" in err
+
+
+def test_routing_prior_covers_every_work_type_with_real_models():
+    assert set(o._ROUTING_PRIOR) == set(o._WORK_TYPES)
+    for wt, (primary, partner) in o._ROUTING_PRIOR.items():
+        assert primary in o._MODELS, wt
+        if partner:
+            assert partner in o._MODELS and \
+                o._MODELS[partner]["klass"] != o._MODELS[primary]["klass"], \
+                f"{wt}: the partner must be cross-class"
+
+
+# ---------------------------------------------------------------------------
+# v17 — outcome-driven routing
+# ---------------------------------------------------------------------------
+
+def _seed_outcomes(path, work_type, model, n, n_correct, basis="L1", mode="workflow",
+                   tag="x"):
+    with open(path, "a", encoding="utf-8") as f:
+        for i in range(n):
+            tid = f"{tag}-{model}-{i}"
+            f.write(json.dumps({"type": "dispatch", "task_id": tid, "model": model,
+                                "klass": o._MODELS[model]["klass"], "mode": mode,
+                                "outcome": "OK", "work_type": work_type}) + "\n")
+            f.write(json.dumps({"type": "outcome", "task_id": tid, "model": model,
+                                "correctness": "CORRECT" if i < n_correct else "WRONG",
+                                "basis": basis}) + "\n")
+
+
+def _with_temp_log(fn):
+    import tempfile
+    original = o._LOG_PATH
+    with tempfile.TemporaryDirectory() as d:
+        o._LOG_PATH = o.Path(d) / "log.jsonl"
+        try:
+            return fn(o._LOG_PATH)
+        finally:
+            o._LOG_PATH = original
+
+
+def test_log_outcome_records_basis():
+    def run(path):
+        assert "[ERROR]" in o.log_outcome("t", "glm-5.3", "CORRECT", basis="vibes")
+        assert "(L1)" in o.log_outcome("t", "glm-5.3", "OVERTURNED_BY_L1", basis="JUDGED"), \
+            "an L1 overturn is always basis L1"
+        assert "(JUDGED)" in o.log_outcome("t2", "glm-5.3", "CORRECT")
+        rows = [json.loads(x) for x in open(path, encoding="utf-8")]
+        assert [r["basis"] for r in rows] == ["L1", "JUDGED"]
+    _with_temp_log(run)
+
+
+def test_route_evidence_needs_a_measured_margin_to_override_the_prior():
+    def run(path):
+        _seed_outcomes(path, "swe", "glm-5.3", 10, 5)                   # prior primary 50%
+        _seed_outcomes(path, "swe", "openai/gpt-astra-latest", 10, 9)   # measured 90%
+        r = json.loads(o.route_evidence("swe"))
+        assert r["recommendation"]["model"] == "openai/gpt-astra-latest"
+        assert r["recommendation"]["source"] == "measured"
+        assert r["measured"]["glm-5.3"]["rate_source"] == "verified"
+        assert "deepseek-v4-pro" in r["explore"]
+    _with_temp_log(run)
+
+    def close_race(path):
+        _seed_outcomes(path, "swe", "glm-5.3", 10, 8)
+        _seed_outcomes(path, "swe", "openai/gpt-astra-latest", 10, 8)
+        r = json.loads(o.route_evidence("swe"))
+        assert r["recommendation"] == {"model": "glm-5.3", "source": "prior",
+                                       "why": r["recommendation"]["why"]}
+    _with_temp_log(close_race)
+
+    def thin(path):
+        _seed_outcomes(path, "swe", "openai/gpt-astra-latest", 9, 9)    # below the minimum
+        r = json.loads(o.route_evidence("swe"))
+        assert r["recommendation"]["source"] == "prior"
+        assert r["measured"]["openai/gpt-astra-latest"]["rate"] is None
+    _with_temp_log(thin)
+
+
+def test_route_evidence_excludes_adversarial_and_barred_verifiers():
+    def run(path):
+        _seed_outcomes(path, "factual", "glm-5.3", 10, 2, mode="adversarial")
+        r = json.loads(o.route_evidence("factual", role="verifier"))
+        assert r["measured"]["glm-5.3"]["verdicts"] == 0, "adversarial verdicts are excluded"
+        assert "deepseek-v4.1-flash" not in r["measured"], "barred verifiers are not eligible"
+        assert json.loads(o.route_evidence("nonsense"))["error"].startswith("[ERROR]")
+    _with_temp_log(run)
+
+
+def test_fleet_stats_reports_by_work_type():
+    def run(path):
+        _seed_outcomes(path, "algorithmic", "deepseek-v4-pro", 10, 7)
+        stats = json.loads(o.fleet_stats())
+        cell = stats["by_work_type"]["algorithmic"]["deepseek-v4-pro"]
+        assert cell["verdicts"] == 10 and cell["rate"] == 0.7
+    _with_temp_log(run)
+
+
+# ---------------------------------------------------------------------------
+# v17 — Proactive Memory
+# ---------------------------------------------------------------------------
+
+def _with_temp_bank(fn):
+    import tempfile
+    original = o._MEM_PATH
+    with tempfile.TemporaryDirectory() as d:
+        o._MEM_PATH = o.Path(d) / "bank.json"
+        try:
+            return fn()
+        finally:
+            o._MEM_PATH = original
+
+
+TRAJ = ("USER: the report must be a single PDF under 10 pages.\n"
+        "TOOL: pytest -> 3 failed: test_parse_dates (timezone naive vs aware)\n"
+        "ASSISTANT: switching the parser to dateutil fixed the timezone failures.")
+
+
+def test_memory_update_enforces_grounding():
+    def run():
+        res = json.loads(o.memory_update([
+            {"op": "save_knowledge", "content": "Deliverable: one PDF, under 10 pages",
+             "evidence": "the report must be a single PDF under 10 pages"},
+            {"op": "save_procedural", "content": "dateutil fixed tz failures",
+             "evidence": "the moon is made of cheese"},
+            {"op": "save_knowledge", "content": "Deliverable: one PDF, under 10 pages",
+             "evidence": "the report must be a single PDF under 10 pages"},
+            {"op": "update_status", "content": "parser fixed; report not started"},
+            {"op": "teleport"}], trajectory=TRAJ))
+        assert [a["id"] for a in res["applied"] if "id" in a] == ["k1"]
+        whys = " | ".join(r["why"] for r in res["rejected"])
+        assert "verbatim" in whys and "duplicate" in whys and "unknown" in whys
+        view = json.loads(o.memory_read())
+        assert view["knowledge"][0]["grounded"] is True
+        assert view["status_internal"].startswith("parser fixed")
+        assert json.loads(o.memory_update([{"op": "delete", "id": "k1"}]))["size"] == 0
+        assert json.loads(o.memory_update([{"op": "clear"}]))["applied"] == [{"op": "clear"}]
+        assert json.loads(o.memory_update([], bank="bad name!"))["error"]
+    _with_temp_bank(run)
+
+
+def test_memory_read_prefilters_large_banks_with_bm25():
+    def run():
+        ops = [{"op": "save_knowledge", "content": f"filler fact number {i} about logistics"}
+               for i in range(55)]
+        ops.append({"op": "save_knowledge",
+                    "content": "the modbus poll interval must stay at 250 ms"})
+        o.memory_update(ops)
+        view = json.loads(o.memory_read(query="what is the modbus poll interval", top_k=5))
+        assert view["total"] == 56 and len(view["knowledge"]) == 5
+        assert "modbus" in view["knowledge"][0]["content"]
+        assert "top 5 of 56" in view["knowledge_note"]
+    _with_temp_bank(run)
+
+
+def test_memory_review_two_phases_grounded_and_fail_closed():
+    """Phase 1 ops are grounded against the trajectory; phase 2's note must cite real
+    entries or it is suppressed (silence is the safe default)."""
+    def phase_reply(gate):
+        def reply(messages):
+            if "memory_ops_v1" in messages[-1]["content"]:
+                return json.dumps({"ops": [
+                    {"op": "save_procedural", "content": "dateutil fixed the tz failures",
+                     "evidence": "switching the parser to dateutil fixed the timezone failures"},
+                    {"op": "save_knowledge", "content": "invented requirement",
+                     "evidence": "never said anywhere"},
+                    {"op": "clear"}]})
+            return json.dumps(gate)
+        return reply
+
+    def run():
+        fleet = _FakeFleet({"glm-5.3": phase_reply(
+            {"intervene": True, "note": "The parser already moved to dateutil.",
+             "basis_ids": ["p1"]})})
+        res = json.loads(_with_fake_fleet(fleet, lambda: o._run_memory_review(
+            TRAJ, "rewrite the date parser with strptime", "default", "glm-5.3", "low",
+            "mem-1")))
+        assert [a["id"] for a in res["phase1"]["applied"]] == ["p1"]
+        assert len(res["phase1"]["rejected"]) == 1, "the ungrounded save is refused"
+        assert res["phase2"]["intervene"] is True and res["phase2"]["basis_ids"] == ["p1"]
+        assert json.loads(o.memory_read())["total"] == 1, "agent ops may never clear the bank"
+        assert len(fleet.calls) == 2
+
+        ungrounded = _FakeFleet({"glm-5.3": phase_reply(
+            {"intervene": True, "note": "Trust me.", "basis_ids": ["k99"]})})
+        res = json.loads(_with_fake_fleet(ungrounded, lambda: o._run_memory_review(
+            TRAJ, "next", "default", "glm-5.3", "low", "mem-2")))
+        assert res["phase2"]["intervene"] is False and res["phase2"]["suppressed"]
+    _with_temp_bank(run)
+
+
+def test_memory_review_refuses_unfit_models():
+    out = json.loads(o.memory_review("t", "n", model="deepseek-v4.1-flash"))
+    assert out["status"] == "failed" and "unfit" in out["error"]
+    assert json.loads(o.memory_review("", "n"))["status"] == "failed"
 
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
