@@ -10,12 +10,17 @@ import zipfile
 
 import requests
 
+import tempfile as _tempfile
+
+# Tests must never touch the operator's real state. The persisted fleet file is read at
+# IMPORT time (the committed one declares extra models), so it is redirected before the
+# server module loads; the log and memory bank are redirected right after.
+_TEST_DIR_PATH = _tempfile.mkdtemp(prefix="orchestra-test-")
+os.environ["ORCHESTRA_FLEET_EXTRA"] = os.path.join(_TEST_DIR_PATH, "fleet_extra.json")
+
 import orchestra_mcp_server as o
 
-# Tests must never append to the operator's real outcome log: every test that reaches
-# _logged_call / _logged_decide writes to a throwaway file instead.
-import tempfile as _tempfile
-_TEST_DIR = o.Path(_tempfile.mkdtemp(prefix="orchestra-test-"))
+_TEST_DIR = o.Path(_TEST_DIR_PATH)
 o._LOG_PATH = _TEST_DIR / "dispatch_log.jsonl"
 o._MEM_PATH = _TEST_DIR / "memory_bank.json"      # nor to the operator's memory bank
 
@@ -942,7 +947,7 @@ def test_skill_names_every_registry_model():
         skill = z.read("orchestra/SKILL.md").decode("utf-8")
     for ref in ("fleet-card.md", "dispatch-protocol.md", "verification.md",
                 "evidence-base.md", "decision-bench.md", "governance.md",
-                "research-alignment.md", "memory.md"):
+                "research-alignment.md", "memory.md", "dynamic-fleet.md"):
         assert f"orchestra/references/{ref}" in names, ref
         assert f"references/{ref}" in skill, f"SKILL.md does not index {ref}"
     for mid in list(o._MODELS) + list(o._DECIDERS):
@@ -1222,7 +1227,8 @@ def _seed_outcomes(path, work_type, model, n, n_correct, basis="L1", mode="workf
         for i in range(n):
             tid = f"{tag}-{model}-{i}"
             f.write(json.dumps({"type": "dispatch", "task_id": tid, "model": model,
-                                "klass": o._MODELS[model]["klass"], "mode": mode,
+                                "klass": o._MODELS.get(model, {}).get("klass", "?"),
+                                "provider": "openrouter", "mode": mode,
                                 "outcome": "OK", "work_type": work_type}) + "\n")
             f.write(json.dumps({"type": "outcome", "task_id": tid, "model": model,
                                 "correctness": "CORRECT" if i < n_correct else "WRONG",
@@ -1394,6 +1400,550 @@ def test_memory_review_refuses_unfit_models():
     out = json.loads(o.memory_review("t", "n", model="deepseek-v4.1-flash"))
     assert out["status"] == "failed" and "unfit" in out["error"]
     assert json.loads(o.memory_review("", "n"))["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# v18 — dynamic fleet: any OpenRouter model, by name
+# ---------------------------------------------------------------------------
+
+def _fleet_sandbox(fn):
+    """Reset everything a guest can touch — extra registry entries, the discovery cache,
+    the persisted-fleet file, load notes — before AND after, so no test inherits state."""
+    def reset():
+        for reg, built in ((o._MODELS, o._BUILTIN), (o._DECIDERS, o._BUILTIN_DECIDERS)):
+            for k in [k for k in reg if k not in built]:
+                del reg[k]
+        o._DISCOVER_CACHE.clear()
+        del o._EXTRA_NOTES[:]
+        try:
+            os.remove(o._EXTRA_PATH)
+        except FileNotFoundError:
+            pass
+
+    def wrapper():
+        reset()
+        try:
+            return fn()
+        finally:
+            reset()
+    wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
+    return wrapper
+
+
+def _endpoints_body(slug="meta/muse-spark-1.3", *, ctx=1_048_576, out=None,
+                    price_in="0.00000125", price_out="0.00000425",
+                    supported=("max_tokens", "reasoning", "tools"), modality="text->text",
+                    outputs=("text",), hosts=("Meta",)):
+    """OpenRouter's /models/{slug}/endpoints reply, in the shape its docs describe."""
+    return {"data": {"id": slug,
+                     "architecture": {"modality": modality, "output_modalities": list(outputs)},
+                     "endpoints": [{"provider_name": h, "context_length": ctx,
+                                    "max_completion_tokens": out,
+                                    "pricing": {"prompt": price_in, "completion": price_out},
+                                    "supported_parameters": list(supported),
+                                    "quantization": "fp8", "status": 0} for h in hosts]}}
+
+
+def _with_fake_get(handler, fn, key="dummy-test-key"):
+    original_get, original_key = requests.get, os.environ.get("OPENROUTER_API_KEY")
+    try:
+        if key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = key
+        requests.get = handler
+        return fn()
+    finally:
+        requests.get = original_get
+        if original_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = original_key
+
+
+def _get_by_slug(table):
+    """A fake requests.get serving _endpoints_body per slug; unknown slugs 404."""
+    calls = []
+
+    def handler(url, **kw):
+        slug = url.split("/models/", 1)[1].rsplit("/endpoints", 1)[0]
+        calls.append(slug)
+        return _FakeResp(200, table[slug]) if slug in table else _FakeResp(404, {})
+    handler.calls = calls
+    return handler
+
+
+MUSE = "meta/muse-spark-1.3"
+
+
+def test_slug_shapes():
+    for ok in ("meta/muse-spark-1.3", "openai/gpt-astra-latest", "~openai/gpt-astra-latest",
+               "inception/mercury-decide:free", "z-ai/glm-5.3-prime", "meta/muse-spark-1.3-contributor"):
+        assert o._SLUG.match(ok), ok
+    for bad in ("deepseek-v4-pro", "glm-5.3", "", "meta/", "/muse", "Meta Muse/spark",
+                "a/b/c", "meta/muse spark", "../etc/passwd", 'x/y"; drop'):
+        assert not o._SLUG.match(bad), bad
+
+
+@_fleet_sandbox
+def test_discovery_reads_openrouter_endpoints_and_caches_successes():
+    handler = _get_by_slug({MUSE: _endpoints_body(out=64_000, hosts=("Meta", "Other"))})
+    f = _with_fake_get(handler, lambda: o._discover(MUSE))
+    assert f["ctx"] == 1_048_576 and f["declared_out"] == 64_000
+    assert f["price_out"] == 4.25e-06 and f["price_in"] == 1.25e-06
+    assert f["reasoning"] is True and f["hosts"] == ["Meta", "Other"]
+    assert f["is_decision"] is False and f["emits_text"] is True
+    _with_fake_get(handler, lambda: o._discover(MUSE))
+    assert handler.calls == [MUSE], "a successful lookup is cached"
+    _with_fake_get(handler, lambda: o._discover(MUSE, fresh=True))
+    assert handler.calls == [MUSE, MUSE], "fresh=True bypasses the cache"
+
+
+@_fleet_sandbox
+def test_discovery_failures_are_clear_and_never_cached():
+    miss = _with_fake_get(_get_by_slug({}), lambda: o._discover("meta/nope"))
+    assert miss["error"].startswith("[ERROR]") and "not found" in miss["error"]
+    boom = _with_fake_get(lambda url, **kw: _FakeResp(500, {"e": 1}),
+                          lambda: o._discover("meta/x"))
+    assert "HTTP 500" in boom["error"]
+
+    def unreachable(url, **kw):
+        raise requests.exceptions.ConnectionError("dns")
+    assert "could not reach" in _with_fake_get(unreachable, lambda: o._discover("meta/x"))["error"]
+    empty = _with_fake_get(lambda url, **kw: _FakeResp(200, {"data": {"endpoints": []}}),
+                           lambda: o._discover("meta/x"))
+    assert "no live endpoints" in empty["error"]
+
+    class NotJson(_FakeResp):
+        def json(self):
+            raise ValueError("no")
+    assert "not JSON" in _with_fake_get(lambda url, **kw: NotJson(200, {}),
+                                        lambda: o._discover("meta/x"))["error"]
+    assert not o._DISCOVER_CACHE, "failures must not be cached"
+
+
+@_fleet_sandbox
+def test_guest_budget_is_bounded_by_ceiling_cap_and_worst_case_cost():
+    cap, usd = o._GUEST_MAX_OUT, o._GUEST_MAX_USD
+    o._GUEST_MAX_OUT, o._GUEST_MAX_USD = 32_000, 2.0
+    try:
+        f = lambda **kw: {"declared_out": None, "price_out": 4.25e-06, **kw}
+        assert o._guest_budget(f()) == (32_000, round(32_000 * 4.25e-06, 4))
+        assert o._guest_budget(f(declared_out=8_192))[0] == 8_192, "declared ceiling binds"
+        assert o._guest_budget(f(price_out=1e-4))[0] == 20_000, "$2 / $100 per M = 20,000"
+        assert o._guest_budget(f(price_out=1e-2))[0] == 1_024, "never below the floor"
+        assert o._guest_budget(f(price_out=0.0)) == (32_000, 0.0), "free models: no cost cap"
+        assert o._guest_budget(f(price_out=None)) == (16_000, None), "no price -> flat budget"
+    finally:
+        o._GUEST_MAX_OUT, o._GUEST_MAX_USD = cap, usd
+
+
+@_fleet_sandbox
+def test_unknown_slug_is_admitted_as_a_guest_on_first_mention():
+    handler = _get_by_slug({MUSE: _endpoints_body(out=None)})
+    assert _with_fake_get(handler, lambda: o._admit_model(MUSE)) is None
+    e = o._MODELS[MUSE]
+    assert e["extra"] and e["discovered"] and not e["persisted"] and not e["may_verify"]
+    assert e["klass"] == "GUEST-meta" and e["provider"] == "openrouter" and e["pin"] is None
+    assert e["reasoning"] is True and e["max_out"] == 32_000
+    assert e["worst_usd"] == round(32_000 * 4.25e-06, 4) and e["data_risk"] == ""
+    assert _with_fake_get(handler, lambda: o._admit_model(MUSE)) is None
+    assert handler.calls == [MUSE], "an admitted guest is not looked up again"
+    assert o._source(MUSE) == "guest" and o._source("glm-5.3") == "builtin"
+    assert o._guest_class("z-ai/glm-5.4") == "CN-OW" and o._guest_class("openai/x") == "US-CLOSED"
+
+
+@_fleet_sandbox
+def test_admission_failures_register_nothing():
+    text_model = _endpoints_body("a/text")
+    decision_model = _endpoints_body("typesafe/jev-9", modality="text->decisions",
+                                     outputs=("decisions",))
+    image_model = _endpoints_body("a/img", outputs=("image",))
+    handler = _get_by_slug({"a/text": text_model, "typesafe/jev-9": decision_model,
+                            "a/img": image_model})
+
+    def attempts():
+        return {"no-slash": o._admit_model("kimi"),
+                "missing": o._admit_model("meta/nope"),
+                "decision-as-generator": o._admit_model("typesafe/jev-9"),
+                "non-text": o._admit_model("a/img"),
+                "text-as-decider": o._admit_decider("a/text")}
+    r = _with_fake_get(handler, attempts)
+    assert "unknown model 'kimi'" in r["no-slash"] and "author/name" in r["no-slash"]
+    assert "not found" in r["missing"]
+    assert "decision model" in r["decision-as-generator"] and "decide" in r["decision-as-generator"]
+    assert "does not output text" in r["non-text"]
+    assert "text model" in r["text-as-decider"] and "call_model" in r["text-as-decider"]
+    assert set(o._MODELS) == set(o._BUILTIN) and set(o._DECIDERS) == set(o._BUILTIN_DECIDERS)
+    no_key = _with_fake_get(handler, lambda: o._admit_model("a/text"), key=None)
+    assert no_key.startswith("[SKIPPED]") and "a/text" not in o._MODELS
+
+
+def test_guest_provenance_demands_the_requested_model_not_a_lookalike():
+    ok = lambda served, wire: o._served_ok(served, wire)
+    assert ok("meta/muse-spark-1.3", MUSE)
+    assert ok("meta/muse-spark-1.3-20260902", MUSE) and ok("meta/muse-spark-1.3-2026-09-02", MUSE)
+    assert not ok("meta/muse-spark-1.3-contributor", MUSE), \
+        "the contributor tier is a different product on different data terms"
+    assert not ok("meta/muse-spark-1.2", MUSE) and not ok("other/muse-spark-1.3", MUSE)
+    assert ok("muse-spark-1.3", MUSE), "a tail-only served name is accepted"
+    assert ok("openai/gpt-6-astra-20260911", "~openai/gpt-astra-latest")
+    assert not ok("anthropic/claude-x", "~openai/gpt-astra-latest")
+    assert ok("inception/mercury-decide", "inception/mercury-decide:free")
+    cfg = {"extra": True, "provider": "openrouter", "api_id": None}
+    bad = o._check_provenance({"model": "meta/muse-spark-1.3-contributor"}, MUSE, cfg)
+    assert bad and bad.startswith("[SUBSTITUTED]")
+    assert o._check_provenance({"model": "meta/muse-spark-1.3"}, MUSE, cfg) is None
+
+
+@_fleet_sandbox
+def test_guests_hold_no_factual_role_until_added_with_may_verify():
+    handler = _get_by_slug({MUSE: _endpoints_body()})
+    _with_fake_get(handler, lambda: o._admit_model(MUSE))
+    for role, contract in (("verifier", {"name": "verifier_v1"}),
+                           ("memory_keeper", {"name": "memory_ops_v1"})):
+        _, err = o._validate_brief({"role": role, "instruction": "x",
+                                    "output_contract": contract}, MUSE)
+        assert err and f"may not act as a {role}" in err and "unvetted guest" in err, err
+    for role in ("generator", "critic", "extractor", "thinker", "synthesizer"):
+        _, err = o._validate_brief({"role": role, "instruction": "x",
+                                    "output_contract": {"format": "text"}}, MUSE)
+        assert err is None, (role, err)
+    assert json.loads(o.memory_review("t", "n", model=MUSE))["status"] == "failed"
+    assert o._verify_bar(MUSE) and o._verify_bar("deepseek-v4.1-flash") and not o._verify_bar("glm-5.3")
+    assert [r["may_verify_facts"] for r in json.loads(o.list_fleet())["fleet"]
+            if r["model"] == MUSE] == [False]
+    o._MODELS[MUSE]["may_verify"] = True
+    _, err = o._validate_brief({"role": "verifier", "instruction": "x",
+                                "output_contract": {"name": "verifier_v1"}}, MUSE)
+    assert err is None
+    r = json.loads(_with_fake_get(handler, lambda: o.route_evidence("factual", role="verifier")))
+    assert MUSE in r["measured"]
+
+
+@_fleet_sandbox
+def test_data_risk_variants_refuse_sensitive_context():
+    handler = _get_by_slug({MUSE + "-contributor": _endpoints_body(MUSE + "-contributor"),
+                            "a/free-one:free": _endpoints_body("a/free-one:free", price_in="0",
+                                                               price_out="0")})
+    _with_fake_get(handler, lambda: (o._admit_model(MUSE + "-contributor"),
+                                     o._admit_model("a/free-one:free")))
+    assert "contributor tier" in o._MODELS[MUSE + "-contributor"]["data_risk"]
+    assert "free endpoint" in o._MODELS["a/free-one:free"]["data_risk"]
+    assert o._data_risk(MUSE) == "" and o._data_risk("openai/gpt-x") == ""
+    sensitive = {"role": "generator", "instruction": "x", "output_contract": {"format": "text"},
+                 "context": [{"id": "doc", "content": "payroll", "sensitive": True}]}
+    plain = dict(sensitive, context=[{"id": "doc", "content": "public text"}])
+    for slug in (MUSE + "-contributor", "a/free-one:free"):
+        _, err = o._validate_brief(sensitive, slug)
+        assert err and "marked sensitive" in err, err
+        assert o._validate_brief(plain, slug)[1] is None
+    assert o._validate_brief(sensitive, "glm-5.3")[1] is None, "no risk, no refusal"
+    xml = o._render_brief(o._validate_brief(sensitive, "glm-5.3")[0])[1]["content"]
+    assert "sensitive" not in xml, "the flag is metadata, never rendered"
+
+
+def _stream_post(content, served="meta/muse-spark-1.3", sent=None):
+    class FakeStream:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def raise_for_status(self): pass
+        def iter_lines(self):
+            yield _sse({"model": served, "provider": "Meta",
+                        "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]})
+            yield b"data: [DONE]"
+
+    def post(url, **kw):
+        if sent is not None:
+            sent.update(kw["json"])
+            sent["_url"] = url
+        return FakeStream()
+    return post
+
+
+@_fleet_sandbox
+def test_a_guest_runs_end_to_end_with_no_setup():
+    handler = _get_by_slug({MUSE: _endpoints_body(out=None, supported=("max_tokens", "reasoning"))})
+    sent = {}
+    brief = {"role": "generator", "work_type": "agentic", "instruction": "Say ok.",
+             "output_contract": {"format": "text"}}
+
+    def run(served="meta/muse-spark-1.3"):
+        original = requests.post
+        requests.post = _stream_post("ok", served, sent)
+        try:
+            return json.loads(o.call_model(MUSE, brief))
+        finally:
+            requests.post = original
+    out = _with_fake_get(handler, run)
+    assert out["outcome"] == "OK" and out["content"] == "ok" and out["class"] == "GUEST-meta"
+    assert sent["model"] == MUSE and sent["max_tokens"] == 32_000 and sent["stream"] is True
+    assert "provider" not in sent, "a guest is unpinned: default routing, served host logged"
+    assert sent["reasoning"] == {"effort": "high"}
+    assert sent["_url"].endswith("/v1/chat/completions")
+    row = [json.loads(x) for x in open(o._LOG_PATH, encoding="utf-8") if out["task_id"] in x][-1]
+    assert row["source"] == "guest" and row["work_type"] == "agentic"
+    assert row["served_provider"] == "Meta" and row["klass"] == "GUEST-meta"
+    swapped = _with_fake_get(handler, lambda: run("meta/muse-spark-1.3-contributor"))
+    assert swapped["outcome"] == "SUBSTITUTED", swapped
+    assert swapped["content"].startswith("[SUBSTITUTED]") and "contributor" in swapped["content"]
+    assert swapped["content"] != "ok", "the lookalike tier's text must not be returned as content"
+    stats = json.loads(o.fleet_stats())
+    assert stats["per_model"][MUSE]["source"] == "guest"
+
+
+@_fleet_sandbox
+def test_reasoning_param_is_sent_only_when_the_model_supports_it():
+    handler = _get_by_slug({"a/plain": _endpoints_body("a/plain", supported=("max_tokens",))})
+    _with_fake_get(handler, lambda: o._admit_model("a/plain"))
+    assert o._MODELS["a/plain"]["reasoning"] is False
+    original_post, original_key = requests.post, os.environ.get("OPENROUTER_API_KEY")
+    sent = {}
+    try:
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        requests.post = _stream_post("hi", "a/plain", sent)
+        o._call("a/plain", [{"role": "user", "content": "t"}])
+    finally:
+        requests.post = original_post
+        if original_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = original_key
+    assert "reasoning" not in sent and sent["model"] == "a/plain"
+    sent2 = {}
+    try:
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        requests.post = _stream_post("hi", "openai/gpt-6-astra-20260911", sent2)
+        o._call("openai/gpt-astra-latest", [{"role": "user", "content": "t"}])
+    finally:
+        requests.post = original_post
+        if original_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = original_key
+    assert sent2["reasoning"] == {"effort": "high"}, "core OpenRouter models still send it"
+
+
+@_fleet_sandbox
+def test_guests_work_in_workflows_councils_and_adversarial_pairs():
+    table = {MUSE: _endpoints_body(), "meta/other-model": _endpoints_body("meta/other-model")}
+    handler = _get_by_slug(table)
+    fleet = _FakeFleet({"glm-5.3": "from glm", MUSE: "from muse",
+                        "openai/gpt-astra-latest": '{"verdict": "PASS", "defects": []}'})
+
+    def run():
+        plan, err = o._validate_workflow({"steps": [
+            {"id": "draft", "model": MUSE, "brief": _brief(work_type="agentic")},
+            {"id": "review", "model": "openai/gpt-astra-latest",
+             "brief": _brief("critic", ["draft"], {"name": "critic_v1"})}]})
+        assert err is None, err
+        wf = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(plan, "wf-guest")))
+        par = json.loads(_with_fake_fleet(fleet, lambda: o._run_parallel(
+            models=("glm-5.3", MUSE), brief=_brief(), task_id="par-guest")))
+        adv = _with_fake_fleet(fleet, lambda: o._run_adversarial(
+            _brief(), model_a=MUSE, model_b="glm-5.3", task_id="adv-guest"))
+        same = o._run_adversarial(_brief(), model_a=MUSE, model_b="meta/other-model")
+        return wf, par, adv, same
+    wf, par, adv, same = _with_fake_get(handler, run)
+    assert [st["model"] for st in wf["steps"]] == [MUSE, "openai/gpt-astra-latest"]
+    assert par["results"][MUSE]["class"] == "GUEST-meta"
+    assert json.loads(adv)["pair"] == {MUSE: "GUEST-meta", "glm-5.3": "CN-OW"}
+    assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
+        "two guests from one lab are one class, so they cannot cross-check each other"
+    assert any(c["model"] == MUSE for c in fleet.calls)
+
+
+@_fleet_sandbox
+def test_fleet_probe_reports_without_registering_or_spending():
+    handler = _get_by_slug({MUSE: _endpoints_body(out=None),
+                            "typesafe/jev-9": _endpoints_body("typesafe/jev-9",
+                                                              modality="text->decisions",
+                                                              outputs=("decisions",))})
+    out = json.loads(_with_fake_get(handler, lambda: o.fleet_probe(MUSE)))
+    assert out["registered"] is False and out["usable_as_this_kind"] is True
+    w = out["would_run_as"]
+    assert w["class"] == "GUEST-meta" and w["max_output_tokens"] == 32_000
+    assert w["roles_barred"] == ["verifier", "memory_keeper"] and w["reasoning_param_sent"] is True
+    assert out["facts"]["price_out_per_m"] == 4.25 and out["facts"]["context_tokens"] == 1_048_576
+    assert MUSE not in o._MODELS, "probing registers nothing"
+    wrong = json.loads(_with_fake_get(handler, lambda: o.fleet_probe("typesafe/jev-9")))
+    assert wrong["usable_as_this_kind"] is False and "decider" in wrong["problem"]
+    right = json.loads(_with_fake_get(handler, lambda: o.fleet_probe("typesafe/jev-9", "decider")))
+    assert right["usable_as_this_kind"] is True and "max_output_tokens" not in right["would_run_as"]
+    assert json.loads(o.fleet_probe("glm-5.3"))["source"] == "builtin"
+    assert "error" in json.loads(o.fleet_probe("nonsense"))
+    assert "error" in json.loads(o.fleet_probe(MUSE, kind="robot"))
+
+
+@_fleet_sandbox
+def test_fleet_add_persists_survives_a_restart_and_fleet_remove_undoes_it():
+    handler = _get_by_slug({MUSE: _endpoints_body()})
+    added = json.loads(_with_fake_get(handler, lambda: o.fleet_add(MUSE, note="trial")))
+    assert added["added"] == MUSE and added["class"] == "GUEST-meta"
+    assert added["may_verify_facts"] is False and "warning" not in added
+    saved = json.load(open(o._EXTRA_PATH, encoding="utf-8"))
+    assert saved["generators"][MUSE] == {"may_verify": False, "note": "trial"}
+    assert o._source(MUSE) == "added"
+
+    del o._MODELS[MUSE]                          # simulate a new process
+    o._DISCOVER_CACHE.clear()
+    o._load_extras()
+    assert o._MODELS[MUSE]["discovered"] is False and o._MODELS[MUSE]["persisted"] is True
+    try:
+        o._resolve(MUSE)
+        raise AssertionError("an unlooked-up saved entry must not be callable")
+    except KeyError as e:
+        assert "not been looked up" in str(e)
+    assert "not been looked up" in o._call(MUSE, [{"role": "user", "content": "t"}])
+    listed = json.loads(o.list_fleet())
+    assert MUSE in listed["dynamic_fleet"]["added"]
+    assert _with_fake_get(handler, lambda: o._admit_model(MUSE)) is None
+    assert o._MODELS[MUSE]["discovered"] and o._MODELS[MUSE]["persisted"]
+    assert o._MODELS[MUSE]["note"] == "trial", "the saved note survives the round trip"
+
+    gone = json.loads(o.fleet_remove(MUSE))
+    assert gone == {"removed": MUSE, "as": ["generator"], "was_saved": True}
+    assert MUSE not in o._MODELS
+    assert json.load(open(o._EXTRA_PATH, encoding="utf-8")) == {"generators": {}, "deciders": {}}
+    assert "error" in json.loads(o.fleet_remove(MUSE))
+
+
+@_fleet_sandbox
+def test_core_fleet_is_fixed_and_fleet_add_validates():
+    for core in ("glm-5.3", "deepseek-v4-pro", "openai/gpt-astra-latest", "typesafe/jev-1.13"):
+        assert "core fleet member" in json.loads(o.fleet_remove(core))["error"]
+    assert "already a core" in json.loads(o.fleet_add("openai/gpt-astra-latest"))["error"]
+    assert "not an OpenRouter slug" in json.loads(o.fleet_add("glm-5.3-prime"))["error"]
+    assert json.loads(_with_fake_get(_get_by_slug({}), lambda: o.fleet_add("meta/nope")))["error"]
+    no_key = json.loads(_with_fake_get(_get_by_slug({MUSE: _endpoints_body()}),
+                                       lambda: o.fleet_add(MUSE), key=None))
+    assert no_key["error"].startswith("[SKIPPED]") and MUSE not in o._MODELS
+    mismatch = _get_by_slug({"typesafe/jev-9": _endpoints_body(
+        "typesafe/jev-9", modality="text->decisions", outputs=("decisions",))})
+    err = json.loads(_with_fake_get(mismatch, lambda: o.fleet_add("typesafe/jev-9")))["error"]
+    assert "not a text model" in err
+    assert not os.path.exists(o._EXTRA_PATH), "a failed add must not write the file"
+    assert set(o._MODELS) == set(o._BUILTIN)
+
+
+@_fleet_sandbox
+def test_a_saved_entry_whose_lookup_fails_stays_uncallable():
+    with open(o._EXTRA_PATH, "w", encoding="utf-8") as f:
+        json.dump({"generators": {MUSE: {"may_verify": False}}}, f)
+    o._load_extras()
+    err = _with_fake_get(_get_by_slug({}), lambda: o._admit_model(MUSE))
+    assert "not found" in err
+    assert o._MODELS[MUSE]["discovered"] is False
+    assert o._MODELS[MUSE]["max_out"] == 16_000, "the provisional budget is a placeholder"
+    assert "not been looked up" in o._call(MUSE, [{"role": "user", "content": "t"}])
+    out = json.loads(_with_fake_get(_get_by_slug({}), lambda: o.call_model(MUSE, BRIEF)))
+    assert "not found" in out["error"]
+
+
+@_fleet_sandbox
+def test_invalid_fleet_file_entries_are_ignored_and_reported():
+    with open(o._EXTRA_PATH, "w", encoding="utf-8") as f:
+        json.dump({"generators": {"not a slug": {}, "glm-5.3": {}, "ok/model": {},
+                                  "bad/decl": "x"}, "deciders": {"nope": {}}}, f)
+    o._load_extras()
+    assert "ok/model" in o._MODELS and "not a slug" not in o._MODELS
+    assert len(o._EXTRA_NOTES) == 4, o._EXTRA_NOTES
+    del o._EXTRA_NOTES[:]
+    with open(o._EXTRA_PATH, "w", encoding="utf-8") as f:
+        f.write("{ not json")
+    o._load_extras()
+    assert o._EXTRA_NOTES and "could not read" in o._EXTRA_NOTES[0]
+    assert json.loads(o.list_fleet())["dynamic_fleet"]["load_notes"]
+
+
+@_fleet_sandbox
+def test_decision_model_guests_join_the_bench_by_name():
+    jev9 = _endpoints_body("typesafe/jev-9", ctx=64_000, price_in="0.00000004", price_out="0",
+                           modality="text->decisions", outputs=("decisions",))
+    handler = _get_by_slug({"typesafe/jev-9": jev9})
+    seen = {}
+
+    def post(url, **kw):
+        seen["json"], seen["url"] = kw["json"], url
+        return _FakeResp(200, {"model": "typesafe/jev-9", "answers": {"needs_fleet": {"noul": 0.8}}})
+    original = requests.post
+    requests.post = post
+    try:
+        res = _with_fake_get(handler, lambda: o._decide_raw("typesafe/jev-9", {"t": "x"}, Q))
+    finally:
+        requests.post = original
+    assert "answers" in res and seen["url"].endswith("/api/alpha/decisions")
+    e = o._DECIDERS["typesafe/jev-9"]
+    assert e["extra"] and e["ctx"] == 64_000 and e["klass"] == "US-CLOSED" and e["seat"] == "guest"
+    assert o._source("typesafe/jev-9") == "guest"
+    assert o._check_panel(["typesafe/jev-9", "upstage/solar-decide"]) is None, "cross-class"
+    assert "single-class" in o._check_panel(["typesafe/jev-9", "typesafe/jev-1.13"])
+    assert json.loads(o.fleet_remove("typesafe/jev-9"))["as"] == ["decider"]
+    assert "typesafe/jev-9" not in o._DECIDERS
+
+
+@_fleet_sandbox
+def test_route_evidence_measures_guests_and_offers_unmeasured_ones_for_exploration():
+    with open(o._EXTRA_PATH, "w", encoding="utf-8") as f:
+        json.dump({"generators": {MUSE: {}}}, f)
+    o._load_extras()                                  # saved, never looked up
+    r = json.loads(o.route_evidence("agentic"))
+    assert MUSE in r["explore"], "an unmeasured saved model is how a trial ever starts"
+    assert r["recommendation"]["source"] == "prior"
+
+    def seeded(path):
+        _seed_outcomes(path, "agentic", MUSE, 10, 10)
+        _seed_outcomes(path, "agentic", "openai/gpt-astra-latest", 10, 6)
+        rr = json.loads(o.route_evidence("agentic"))
+        assert rr["recommendation"]["model"] == MUSE and rr["recommendation"]["source"] == "measured"
+        assert rr["measured"][MUSE]["rate"] == 1.0
+    _with_temp_log(seeded)
+
+
+@_fleet_sandbox
+def test_history_of_unregistered_models_still_counts_toward_ceilings_and_stats():
+    """A guest used last week is not registered today, but its rows are still the task's
+    dispatches (ceiling) and its verdicts are still evidence (stats)."""
+    def run(path):
+        assert "meta/long-gone" not in o._MODELS
+        with open(path, "a", encoding="utf-8") as f:
+            for i in range(3):
+                f.write(json.dumps({"type": "dispatch", "task_id": "wf-hist",
+                                    "model": "meta/long-gone", "provider": "openrouter",
+                                    "klass": "GUEST-meta", "mode": "workflow",
+                                    "outcome": "OK", "work_type": "swe"}) + "\n")
+            f.write(json.dumps({"type": "dispatch", "task_id": "wf-hist",
+                                "model": "typesafe/jev-1.13", "provider": "openrouter-decisions",
+                                "klass": "US-CLOSED", "mode": "decide", "outcome": "OK",
+                                "work_type": "swe"}) + "\n")
+        assert o._dispatches_logged("wf-hist") == 3, \
+            "unregistered models count; decision calls never do"
+        _seed_outcomes(path, "swe", "meta/long-gone", 10, 9, tag="h")
+        table = o._work_type_table(o._read_log()["dispatches"], o._read_log()["outcomes"])
+        assert table["swe"]["meta/long-gone"]["verdicts"] == 10
+        assert "typesafe/jev-1.13" not in table["swe"], "decision calls carry no generator verdict"
+        cell = json.loads(o.fleet_stats())["by_work_type"]["swe"]["meta/long-gone"]
+        assert cell["rate"] == 0.9
+    _with_temp_log(run)
+
+
+def test_committed_fleet_file_is_valid_and_documented():
+    here = os.path.dirname(os.path.abspath(o.__file__))
+    data = json.load(open(os.path.join(here, "fleet_extra.json"), encoding="utf-8"))
+    with zipfile.ZipFile(os.path.join(here, "orchestra.skill")) as z:
+        card = z.read("orchestra/references/fleet-card.md").decode("utf-8")
+        dyn = z.read("orchestra/references/dynamic-fleet.md").decode("utf-8")
+    assert set(data) == {"generators", "deciders"}
+    for kind in ("generators", "deciders"):
+        for slug, decl in data[kind].items():
+            assert o._SLUG.match(slug), slug
+            assert slug not in o._BUILTIN and slug not in o._BUILTIN_DECIDERS
+            assert isinstance(decl, dict)
+            assert f"`{slug}`" in card, f"{slug} is saved in fleet_extra.json but not in fleet-card.md"
+    assert data["generators"]["meta/muse-spark-1.3"].get("may_verify") is False
+    assert "contributor" in data["generators"]["meta/muse-spark-1.3"]["note"]
+    for tool in ("fleet_probe", "fleet_add", "fleet_remove"):
+        assert tool in dyn, f"dynamic-fleet.md does not explain {tool}"
 
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
