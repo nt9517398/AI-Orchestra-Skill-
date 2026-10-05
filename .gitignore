@@ -1,0 +1,4 @@
+__pycache__/
+memory_bank.json
+memory_bank.tmp
+.env
