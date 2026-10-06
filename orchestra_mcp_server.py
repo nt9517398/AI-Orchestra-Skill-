@@ -1,6 +1,18 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v19 — NO MORE GUESSED CEILINGS; ONE-COMMAND LIVE CHECK  (2026-10-06)
+--------------------------------------------------------------------
+The 32,000-token budget on Muse Spark was a guess made because OpenRouter could not be
+reached from the build host. Removed, not replaced with a better guess:
+  1. Muse Spark's budget is resolved live on first use (auto_ceiling): min(declared
+     ceiling, 128,000), falling back to 64,000 — a value that fits every ceiling reported
+     for the model — when the lookup fails. See _live_ceiling.
+  2. fleet_check (and `python orchestra_mcp_server.py --check`) verifies the whole fleet
+     against the real services: registry budget vs declared ceiling, and one tiny real call
+     per model checking it answers OK from the model asked for. This is the live test the
+     offline suite cannot be.
+
 v18.1 — MUSE SPARK ADDED AS CORE; DYNAMIC FLEET KEPT BUT SWITCHED OFF  (2026-10-05)
 -----------------------------------------------------------------------------------
 Operator direction: add meta/muse-spark-1.3 to the current fleet the plain way, keep the
@@ -203,6 +215,7 @@ acceptable for session-scoped orchestration; use SQLite if that ever changes.
 import json
 import os
 import re
+import sys
 import time
 import threading
 import uuid
@@ -299,16 +312,24 @@ _MODELS = {
         # 128,000 max output / 1.05M context, $10 in / $50 out per 1M (OpenRouter
         # listing). Worst-case runaway at this budget is ~$6.40 per dispatch.
     "meta/muse-spark-1.3": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=32000, pin=None,
-        exact_served=True),
+        provider="openrouter", klass="US-CLOSED", max_out=64000, pin=None,
+        exact_served=True, auto_ceiling=True),
         # Added 2026-10-05 at the operator's request as a plain core entry. Meta, closed
         # weights, released 2026-09-02; 1,048,576 context; $1.25 in / $4.25 out per 1M
         # (OpenRouter listing, via a search summary).
-        # ⚠ max_out is a CONSERVATIVE PLACEHOLDER. The model's declared output ceiling was
-        # not found (the build host could not reach OpenRouter), and a ceiling above what a
-        # host accepts 400s every call. 32,000 tokens caps a runaway at ~$0.14. Run
-        # fleet_probe("meta/muse-spark-1.3") with a key and set this from the real number.
-        # ⚠ TWO TIERS. meta/muse-spark-1.3-contributor is the same model at $0.10/$0.20 on
+        # BUDGET — resolved live, not hard-coded. auto_ceiling=True makes the first dispatch
+        # of a process ask OpenRouter for the model's declared output ceiling; the budget is
+        # then min(declared, _CORE_MAX_OUT = 128,000), the fleet's cost/wall-time envelope
+        # (GPT Astra and Kimi both ran at 128,000: ~$0.54 worst case here, ~11 min at the
+        # ~191 tok/s AA measured). max_out=64,000 is only the FALLBACK, used when the lookup
+        # fails or declares nothing. Why 64,000: aggregator pages disagree on the ceiling —
+        # 943,718 (standard tier), 131,072 (one source), 65,536 (contributor tier) — and
+        # 64,000 fits every one of them, so a failed lookup cannot produce a rejected
+        # ceiling; it costs at most ~$0.27 per runaway. 943,718 is exactly 90% of the
+        # context window, the same figure recorded for Kimi K3 on OpenRouter, so it reads as
+        # OpenRouter's convention rather than a Meta limit (inference). `fleet_check` shows
+        # the declared ceiling next to the budget actually used.
+        # TWO TIERS. meta/muse-spark-1.3-contributor is the same model at $0.10/$0.20 on
         # terms where prompts and outputs may be used to improve Meta's products. This
         # entry is the STANDARD tier, and exact_served=True makes provenance exact: the
         # default substring test would accept the contributor tier's reply for this one.
@@ -545,6 +566,38 @@ def _guest_budget(facts: dict) -> tuple:
     return cap, round(cap * price, 4)
 
 
+# v19 — output ceilings resolved from OpenRouter instead of typed in. A registry entry with
+# auto_ceiling=True keeps its max_out as a FALLBACK; the first dispatch of a process asks
+# OpenRouter what the model declares and uses min(declared, _CORE_MAX_OUT). Success is kept
+# for the process; a failed lookup is remembered for five minutes so an outage does not put
+# a ten-second connect timeout in front of every call.
+_CORE_MAX_OUT = 128_000
+_CEILING_RETRY_SECONDS = 300
+_CEILING_LOCK = threading.Lock()
+_CEILING_STATE: dict = {}        # model -> {"max_out", "source", "ts"}
+
+
+def _live_ceiling(model: str, fallback: int) -> tuple:
+    """(max_out, source). Never raises: every failure degrades to `fallback`."""
+    with _CEILING_LOCK:
+        st = _CEILING_STATE.get(model)
+        if st and (st["source"] == "live lookup"
+                   or time.time() - st["ts"] < _CEILING_RETRY_SECONDS):
+            return st["max_out"], st["source"]
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        return fallback, "fallback (no OPENROUTER_API_KEY)"      # the call will SKIP anyway
+    facts = _discover(model)
+    if facts.get("error"):
+        res = (fallback, "fallback (lookup failed)")
+    elif not facts.get("declared_out"):
+        res = (fallback, "fallback (no ceiling declared)")
+    else:
+        res = (min(facts["declared_out"], _CORE_MAX_OUT), "live lookup")
+    with _CEILING_LOCK:
+        _CEILING_STATE[model] = {"max_out": res[0], "source": res[1], "ts": time.time()}
+    return res
+
+
 def _entry_for(slug: str, facts: dict, decl: dict) -> dict:
     """Registry entry for a discovered generator."""
     max_out, worst = _guest_budget(facts)
@@ -732,6 +785,8 @@ def _resolve(model: str) -> dict:
     m = dict(_MODELS[model])
     m.update(_CONFIGS[m["provider"]])
     m["key"] = os.environ.get(m["key_env"], "")
+    if m.get("auto_ceiling"):
+        m["max_out"], m["ceiling_source"] = _live_ceiling(model, m["max_out"])
     return m
 
 
@@ -2652,6 +2707,175 @@ def fleet_remove(model: str) -> str:
     return json.dumps(out, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# v19 FLEET CHECK — the whole fleet, verified live, in one command.
+#
+# Everything this server knows about an OpenRouter model (output ceiling, provenance
+# name, whether a parameter is accepted) is a claim about someone else's live system, and
+# the repo's history is a list of those claims going stale. The offline tests can only
+# check the code against fakes. This checks the fleet against the real services: for each
+# model, does the registry's budget fit what the host declares, and does one tiny real call
+# come back OK from the model that was asked for? Costs a fraction of a cent per model.
+# ---------------------------------------------------------------------------
+_CHECK_BRIEF = {"role": "generator", "output_contract": {"format": "text"},
+                "instruction": "Reply with exactly the word OK and nothing else."}
+
+
+def _check_generator(model: str) -> dict:
+    row = {"model": model, "kind": "generator", "class": _MODELS[model]["klass"],
+           "problems": [], "warnings": []}
+    try:
+        cfg = _resolve(model)
+    except KeyError as e:
+        return {**row, "status": "NOT READY", "problems": [str(e)]}
+    row["budget"] = cfg["max_out"]
+    if cfg.get("ceiling_source"):
+        row["budget_source"] = cfg["ceiling_source"]
+    if not cfg["key"]:
+        return {**row, "status": "SKIPPED", "note": f"{cfg['key_env']} is not set"}
+    if cfg["provider"] == "openrouter":
+        wire = cfg.get("api_id") or model          # the slug OpenRouter actually knows
+        facts = _discover(wire, fresh=True)
+        if facts.get("error"):
+            # A warning, not a failure: a floating ~alias may not be listed under its own
+            # name, and the real call below is the test that matters. Nothing is hidden —
+            # the row says the ceiling could not be compared.
+            row["warnings"].append("could not compare the budget with a declared ceiling — "
+                                   + facts["error"][:160])
+        else:
+            row["declared_ceiling"] = facts.get("declared_out")
+            if facts.get("price_out") is not None:
+                row["price_out_per_m"] = round(facts["price_out"] * 1e6, 4)
+            declared = facts.get("declared_out")
+            if declared and cfg["max_out"] > declared:
+                row["problems"].append(
+                    f"budget {cfg['max_out']:,} exceeds the declared ceiling {declared:,} — "
+                    f"every call would be rejected; lower max_out in the registry")
+    brief, err = _validate_brief(_CHECK_BRIEF, model)
+    if err:
+        return {**row, "status": "PROBLEM", "problems": row["problems"] + [err]}
+    meta, t0 = {}, time.time()
+    out = _call(model, _render_brief(brief, "check"), reasoning_effort="low", meta=meta)
+    tag = _outcome_tag(out)
+    row.update(call=tag, seconds=round(time.time() - t0, 1),
+               served_model=meta.get("model", ""), served_host=meta.get("provider", ""))
+    if tag == "OK":
+        row["reply"] = out.strip()[:40]
+    elif tag == "SUBSTITUTED":
+        row["problems"].append(
+            f"{out.strip()[:220]} — if that served name is a legitimate alias of this "
+            f"model, widen its provenance rule (served_as / exact_served); if it is a "
+            f"different tier, the rejection is correct")
+    else:
+        row["problems"].append(f"the test call returned {tag}: {out.strip()[:220]}")
+    row["status"] = "PROBLEM" if row["problems"] else "OK"
+    return row
+
+
+def _check_decider(model: str) -> dict:
+    row = {"model": model, "kind": "decider", "class": _DECIDERS[model]["klass"],
+           "problems": []}
+    res = _decide_raw(model, {"text": "Good morning."},
+                      {"greeting": {"type": "noul",
+                                    "instructions": "Is `text` a greeting?"}})
+    err = res.get("error", "")
+    if err.startswith("[SKIPPED]"):
+        return {**row, "status": "SKIPPED", "note": err[:160]}
+    if err:
+        return {**row, "status": "PROBLEM", "problems": [err[:240]]}
+    return {**row, "status": "OK", "served_model": res.get("served_model", ""),
+            "p_greeting": (res["answers"].get("greeting") or {}).get("noul")}
+
+
+@mcp.tool()
+def fleet_check(models: Optional[list] = None, include_deciders: bool = True) -> str:
+    """Verify the fleet against the LIVE services: for every model, does the registry's
+    output budget fit the ceiling its host declares, and does one tiny real call
+    ("reply with the word OK") come back OK from the model that was asked for? Run it
+    after any registry change, after adding an API key, and whenever a model starts
+    returning [SUBSTITUTED] or other unexpected tags. Costs a fraction of a cent per model
+    (reasoning is set to low; billing is on actual tokens).
+
+    models: fleet ids to check; default every generator, plus the decision models when
+      include_deciders is true.
+
+    Returns JSON {ok, verdict, tested, problems, rows}. `ok` is true only if at least one
+    model was verified live and none failed; with no API keys set, nothing is tested and ok
+    is false (verdict "NOTHING WAS TESTED"). Each row has status OK, SKIPPED (no API key —
+    not a failure, but not tested either), PROBLEM (with the specific fix) or NOT READY. For a [SUBSTITUTED] reply the
+    row shows the exact name that was served, which is what you need to decide whether the
+    provenance rule is too strict or the rejection was right.
+
+    Also runnable without Claude: `python orchestra_mcp_server.py --check` prints a table
+    and exits 1 on any problem.
+    """
+    names = list(models) if models else (
+        list(_MODELS) + (list(_DECIDERS) if include_deciders else []))
+
+    def one(name):
+        if name in _MODELS:
+            return _check_generator(name)
+        if name in _DECIDERS:
+            return _check_decider(name)
+        return {"model": name, "kind": "?", "status": "PROBLEM",
+                "problems": [f"{name!r} is not in the fleet — known: "
+                             f"{sorted(list(_MODELS) + list(_DECIDERS))}"]}
+    done = _run_threads({n: (lambda n=n: one(n)) for n in names})
+    rows = [done[n] for n in names]
+    bad = [r for r in rows if r["status"] in ("PROBLEM", "NOT READY")]
+    tested = [r for r in rows if r["status"] == "OK"]
+    # "ok" must mean something WAS verified live and nothing failed. A fleet where every
+    # model was skipped for want of a key has been checked for nothing, and saying "OK"
+    # about it would be the false assurance this tool exists to remove.
+    verdict = (f"{len(bad)} PROBLEM(S) — see the rows" if bad else
+               f"OK — {len(tested)} of {len(rows)} models verified live" if tested else
+               "NOTHING WAS TESTED — no API keys are set for these models")
+    return json.dumps({
+        "ok": bool(tested) and not bad,
+        "verdict": verdict,
+        "tested": len(tested),
+        "checked": len(rows),
+        "skipped": [r["model"] for r in rows if r["status"] == "SKIPPED"],
+        "warnings": [{"model": r["model"], "what": w} for r in rows
+                     for w in r.get("warnings", [])],
+        "problems": [{"model": r["model"], "what": p} for r in bad for p in r["problems"]],
+        "rows": rows,
+        "note": "OK means the spec lookup and one real call both passed. SKIPPED means "
+                "no key was set for that provider, so it was not tested.",
+    }, indent=2, ensure_ascii=False)
+
+
+def _format_check(result: dict) -> str:
+    """Plain-text table for the command-line form."""
+    lines = []
+    for r in result["rows"]:
+        bits = [r.get("call", ""), r.get("served_model", ""),
+                f"budget {r['budget']:,}" if r.get("budget") else "",
+                f"declared {r['declared_ceiling']:,}" if r.get("declared_ceiling") else "",
+                f"{r['seconds']}s" if r.get("seconds") is not None else "",
+                r.get("note", "")]
+        lines.append(f"{r['status']:<9} {r['model']:<28} " + "  ".join(b for b in bits if b))
+        lines += [f"          -> {p}" for p in r.get("problems", [])]
+        lines += [f"          ~> {w}" for w in r.get("warnings", [])]
+    lines.append("")
+    lines.append(("FLEET " if result["ok"] else "") + result["verdict"])
+    if result["skipped"]:
+        lines.append("not tested (no API key): " + ", ".join(result["skipped"]))
+    return "\n".join(lines)
+
+
+def _check_main(argv: list) -> int:
+    """`python orchestra_mcp_server.py --check [model ...]`.
+    Exit code: 0 verified and healthy; 1 at least one problem; 2 nothing could be tested
+    (no API keys) — distinct from 0 so a script cannot mistake "untested" for "fine"."""
+    ids = [a for a in argv if not a.startswith("-")]
+    result = json.loads(fleet_check(ids or None))
+    print(_format_check(result))
+    if result["problems"]:
+        return 1
+    return 0 if result["ok"] else 2
+
+
 @mcp.tool()
 def list_fleet() -> str:
     """Return both registries — generators and the decision bench — with correlation
@@ -2675,7 +2899,12 @@ def list_fleet() -> str:
                             or ("n/a" if m["provider"] != "openrouter"
                                 else "unpinned — default routing; the served host is logged"
                                 if m.get("extra") else "UNPINNED — run /endpoints first")),
-            "max_output_tokens": m["max_out"],
+            "max_output_tokens": (_CEILING_STATE[mid]["max_out"]
+                                  if m.get("auto_ceiling") and mid in _CEILING_STATE
+                                  else m["max_out"]),
+            **({"budget_source": (_CEILING_STATE[mid]["source"] if mid in _CEILING_STATE
+                                  else "registry fallback — resolved live on first use")}
+               if m.get("auto_ceiling") else {}),
             "may_verify_facts": _verify_bar(mid) is None,
             "api_key_present": key_present,
             "source": _source(mid),
@@ -3419,4 +3648,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
 
 
 if __name__ == "__main__":
+    if "--check" in sys.argv[1:]:
+        # CLI mode, not the stdio server: printing to stdout is correct here, and only here.
+        sys.exit(_check_main([a for a in sys.argv[1:] if a != "--check"]))
     mcp.run()  # stdio transport — default, correct for local Claude Desktop integration
