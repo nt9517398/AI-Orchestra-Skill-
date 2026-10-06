@@ -2112,6 +2112,65 @@ def test_a_ten_verdict_record_can_make_muse_spark_the_measured_route():
         assert r["recommendation"]["source"] == "measured"
     _with_temp_log(seeded)
 
+
+# ---------------------------------------------------------------------------
+# Packaging — the uploader's own limits, which a build cannot discover by itself
+# ---------------------------------------------------------------------------
+
+#: claude.ai's skill uploader rejects a longer description ("field 'description' in
+#: SKILL.md must be at most 1024 characters", seen 2026-10-06 on a 1123-char one).
+#: Not discoverable from the archive, so it is pinned here.
+SKILL_DESCRIPTION_LIMIT = 1024
+
+
+def test_packaged_skill_meets_the_uploader_requirements():
+    """The .skill archive must satisfy what the upload form checks: a SKILL.md at the
+    root of the skill folder, YAML frontmatter carrying name and description, and a
+    description within the length limit. A rejected upload is a shipped skill nobody
+    can install, and nothing else in this suite would catch it."""
+    here = os.path.dirname(os.path.abspath(o.__file__))
+    with zipfile.ZipFile(os.path.join(here, "orchestra.skill")) as z:
+        names = z.namelist()
+        raw = z.read("orchestra/SKILL.md").decode("utf-8")
+    assert "orchestra/SKILL.md" in names, "the archive must contain SKILL.md"
+
+    parts = raw.split("---", 2)
+    assert len(parts) == 3 and parts[0] == "", "SKILL.md must open with YAML frontmatter"
+    # Parsed without PyYAML on purpose: this suite installs nothing beyond the server's
+    # own dependencies. The frontmatter is two single-line `key: value` pairs, so a split
+    # on the first colon is exact; PyYAML cross-checks it when it happens to be present.
+    meta = {}
+    for line in parts[1].strip().split("\n"):
+        assert ": " in line, f"frontmatter line is not `key: value`: {line[:60]!r}"
+        key, value = line.split(": ", 1)
+        meta[key.strip()] = value.strip()
+    assert set(meta) == {"name", "description"}, sorted(meta)
+    for field in ("name", "description"):
+        assert meta[field] and not meta[field].startswith(("'", '"')), \
+            f"{field} must be a non-empty plain scalar"
+    try:
+        import yaml
+    except ImportError:
+        pass
+    else:
+        assert yaml.safe_load(parts[1]) == meta, "the hand parse disagrees with PyYAML"
+
+    n = len(meta["description"])
+    assert n <= SKILL_DESCRIPTION_LIMIT, (
+        f"description is {n} chars; the uploader rejects anything over "
+        f"{SKILL_DESCRIPTION_LIMIT}. Shorten it in SKILL.md and rebuild the archive.")
+    assert n <= SKILL_DESCRIPTION_LIMIT - 20, (
+        f"description is {n} chars, within {SKILL_DESCRIPTION_LIMIT - n} of the limit — "
+        f"too tight to edit safely. Keep at least 20 characters spare.")
+
+    # The description is what makes the skill trigger at all; these are its load-bearing
+    # parts, and a length cut must not quietly drop them.
+    low = meta["description"].lower()
+    for phrase in ('"orchestra"', '"the fleet"', '"the bench"', '"ask the models"',
+                   '"dispatch this"', '"cross-check this"', "necessity gate",
+                   "cross-model verification", "adversarial review"):
+        assert phrase in low, f"the description lost its {phrase} trigger"
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
