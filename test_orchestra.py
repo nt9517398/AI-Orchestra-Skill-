@@ -22,6 +22,25 @@ os.environ.pop("ORCHESTRA_DYNAMIC_FLEET", None)     # the default: dynamic fleet
 import orchestra_mcp_server as o
 
 _TEST_DIR = o.Path(_TEST_DIR_PATH)
+
+# No test may reach the network. A test that needs a reply fakes it (_with_fake_get,
+# _with_fake_decisions, a patched requests.post); anything else fails loudly here. The one
+# deliberate exception, test_registry_matches_live_endpoints, uses _REAL_GET. Without this
+# guard a lookup that fails against the real service is silently cached for later tests —
+# which is how a hidden coupling between two Muse tests went unnoticed.
+_REAL_GET, _REAL_POST = requests.get, requests.post
+
+
+def _no_net_get(*a, **k):
+    raise AssertionError("a test reached the network via requests.get — fake it with "
+                         "_with_fake_get")
+
+
+def _no_net_post(*a, **k):
+    raise AssertionError("a test reached the network via requests.post — patch it")
+
+
+requests.get, requests.post = _no_net_get, _no_net_post
 o._LOG_PATH = _TEST_DIR / "dispatch_log.jsonl"
 o._MEM_PATH = _TEST_DIR / "memory_bank.json"      # nor to the operator's memory bank
 
@@ -225,7 +244,7 @@ def test_registry_has_only_known_fields():
     call site somewhere is still reading a number this rework removed. v16 adds the
     two optional wire fields api_id and served_as."""
     allowed = {"provider", "klass", "max_out", "pin", "order", "api_id", "served_as",
-               "exact_served"}
+               "exact_served", "auto_ceiling"}
     for mid, m in o._MODELS.items():
         extra = set(m) - allowed
         assert not extra, f"{mid} still carries {extra}"
@@ -591,7 +610,7 @@ def test_registry_matches_live_endpoints():
         hosts = m.get("order") or ([m["pin"]] if m.get("pin") else [])
         wire = m.get("api_id") or mid
         try:
-            resp = requests.get(
+            resp = _REAL_GET(
                 f"https://openrouter.ai/api/v1/models/{wire}/endpoints",
                 headers={"Authorization": "Bearer " + key}, timeout=30)
             resp.raise_for_status()
@@ -1424,6 +1443,7 @@ def _fleet_sandbox(fn):
             for k in [k for k in reg if k not in built]:
                 del reg[k]
         o._DISCOVER_CACHE.clear()
+        o._CEILING_STATE.clear()
         del o._EXTRA_NOTES[:]
         try:
             os.remove(o._EXTRA_PATH)
@@ -2012,18 +2032,12 @@ def test_fleet_probe_still_works_while_off_and_says_how_to_use_the_result():
 
 
 def test_core_entries_are_unaffected_by_the_switch():
-    """With the mechanism off, every core model still resolves with no lookup at all."""
-    def no_network(url, **kw):
-        raise AssertionError("a core model must never trigger a lookup")
-    original_get = requests.get
-    requests.get = no_network
-    try:
-        for m in o._BUILTIN:
-            assert o._admit_model(m) is None
-        for m in o._BUILTIN_DECIDERS:
-            assert o._admit_decider(m) is None
-    finally:
-        requests.get = original_get
+    """With the mechanism off, admitting a core model needs no lookup at all (the guard in
+    this module would fail the test if one happened)."""
+    for m in o._BUILTIN:
+        assert o._admit_model(m) is None
+    for m in o._BUILTIN_DECIDERS:
+        assert o._admit_decider(m) is None
 
 
 MUSE_CORE = "meta/muse-spark-1.3"
@@ -2034,7 +2048,8 @@ def test_muse_spark_is_a_plain_core_registry_entry():
     assert MUSE_CORE in o._BUILTIN and o._source(MUSE_CORE) == "builtin"
     assert m["provider"] == "openrouter" and m["pin"] is None and m["exact_served"] is True
     assert not m.get("extra"), "core, not a guest"
-    assert m["max_out"] == 32_000, "a conservative placeholder until fleet_probe gives the real ceiling"
+    assert m["max_out"] == 64_000 and m["auto_ceiling"] is True, \
+        "64,000 is only the fallback; the live ceiling is resolved on first use"
     assert m["klass"] == o._MODELS["openai/gpt-astra-latest"]["klass"] == "US-CLOSED"
     same = o._run_adversarial(BRIEF, model_a=MUSE_CORE, model_b="openai/gpt-astra-latest")
     assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
@@ -2056,14 +2071,17 @@ def test_muse_spark_provenance_is_exact_and_its_payload_is_plain():
         assert bad and bad.startswith("[SUBSTITUTED]"), lookalike
     flash = o._resolve("deepseek-v4.1-flash")
     assert o._check_provenance({"model": "deepseek-flash"}, "deepseek-v4.1-flash", flash) is None
-    p = _capture_payload(MUSE_CORE, "OPENROUTER_API_KEY")
-    assert p["model"] == MUSE_CORE and p["max_tokens"] == 32_000 and p["stream"] is True
+    _reset_lookups()
+    handler = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)})
+    p = _with_fake_get(handler, lambda: _capture_payload(MUSE_CORE, "OPENROUTER_API_KEY"))
+    assert p["model"] == MUSE_CORE and p["stream"] is True
+    assert p["max_tokens"] == 128_000, "declared 943,718, trimmed to the fleet's envelope"
     assert "provider" not in p and p["reasoning"] == {"effort": "high"}
 
 
 def test_muse_spark_runs_as_a_core_model_and_rejects_the_contributor_tier():
-    def no_lookup(url, **kw):
-        raise AssertionError("a core model needs no lookup")
+    _reset_lookups()
+    no_lookup = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)})
     brief = {"role": "critic", "work_type": "review", "instruction": "Find defects.",
              "context": [{"id": "design", "content": "x"}],
              "output_contract": {"name": "critic_v1"}}
@@ -2076,6 +2094,7 @@ def test_muse_spark_runs_as_a_core_model_and_rejects_the_contributor_tier():
         finally:
             requests.post = original
     good = _with_fake_get(no_lookup, lambda: run("meta/muse-spark-1.3"))
+    assert no_lookup.calls == [MUSE_CORE], "one ceiling lookup, then cached for the process"
     assert good["outcome"] == "OK" and good["contract"]["valid"] is True
     assert good["class"] == "US-CLOSED"
     swapped = _with_fake_get(no_lookup, lambda: run("meta/muse-spark-1.3-contributor"))
@@ -2111,6 +2130,351 @@ def test_a_ten_verdict_record_can_make_muse_spark_the_measured_route():
         assert r["recommendation"]["model"] == MUSE_CORE
         assert r["recommendation"]["source"] == "measured"
     _with_temp_log(seeded)
+
+
+# ---------------------------------------------------------------------------
+# Packaging — the uploader's own limits, which a build cannot discover by itself
+# ---------------------------------------------------------------------------
+
+#: claude.ai's skill uploader rejects a longer description ("field 'description' in
+#: SKILL.md must be at most 1024 characters", seen 2026-10-06 on a 1123-char one).
+#: Not discoverable from the archive, so it is pinned here.
+SKILL_DESCRIPTION_LIMIT = 1024
+
+
+def test_packaged_skill_meets_the_uploader_requirements():
+    """The .skill archive must satisfy what the upload form checks: a SKILL.md at the
+    root of the skill folder, YAML frontmatter carrying name and description, and a
+    description within the length limit. A rejected upload is a shipped skill nobody
+    can install, and nothing else in this suite would catch it."""
+    here = os.path.dirname(os.path.abspath(o.__file__))
+    with zipfile.ZipFile(os.path.join(here, "orchestra.skill")) as z:
+        names = z.namelist()
+        raw = z.read("orchestra/SKILL.md").decode("utf-8")
+    assert "orchestra/SKILL.md" in names, "the archive must contain SKILL.md"
+
+    parts = raw.split("---", 2)
+    assert len(parts) == 3 and parts[0] == "", "SKILL.md must open with YAML frontmatter"
+    # Parsed without PyYAML on purpose: this suite installs nothing beyond the server's
+    # own dependencies. The frontmatter is two single-line `key: value` pairs, so a split
+    # on the first colon is exact; PyYAML cross-checks it when it happens to be present.
+    meta = {}
+    for line in parts[1].strip().split("\n"):
+        assert ": " in line, f"frontmatter line is not `key: value`: {line[:60]!r}"
+        key, value = line.split(": ", 1)
+        meta[key.strip()] = value.strip()
+    assert set(meta) == {"name", "description"}, sorted(meta)
+    for field in ("name", "description"):
+        assert meta[field] and not meta[field].startswith(("'", '"')), \
+            f"{field} must be a non-empty plain scalar"
+    try:
+        import yaml
+    except ImportError:
+        pass
+    else:
+        assert yaml.safe_load(parts[1]) == meta, "the hand parse disagrees with PyYAML"
+
+    n = len(meta["description"])
+    assert n <= SKILL_DESCRIPTION_LIMIT, (
+        f"description is {n} chars; the uploader rejects anything over "
+        f"{SKILL_DESCRIPTION_LIMIT}. Shorten it in SKILL.md and rebuild the archive.")
+    assert n <= SKILL_DESCRIPTION_LIMIT - 20, (
+        f"description is {n} chars, within {SKILL_DESCRIPTION_LIMIT - n} of the limit — "
+        f"too tight to edit safely. Keep at least 20 characters spare.")
+
+    # The description is what makes the skill trigger at all; these are its load-bearing
+    # parts, and a length cut must not quietly drop them.
+    low = meta["description"].lower()
+    for phrase in ('"orchestra"', '"the fleet"', '"the bench"', '"ask the models"',
+                   '"dispatch this"', '"cross-check this"', "necessity gate",
+                   "cross-model verification", "adversarial review"):
+        assert phrase in low, f"the description lost its {phrase} trigger"
+
+
+# ---------------------------------------------------------------------------
+# v19 — ceilings resolved live; fleet_check
+# ---------------------------------------------------------------------------
+
+def _reset_lookups():
+    o._CEILING_STATE.clear()
+    o._DISCOVER_CACHE.clear()
+
+
+def test_live_ceiling_is_the_declared_one_trimmed_to_the_fleet_envelope():
+    for declared, expected in ((943_718, 128_000), (131_072, 128_000), (128_000, 128_000),
+                               (65_536, 65_536), (20_000, 20_000)):
+        _reset_lookups()
+        handler = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=declared)})
+        got = _with_fake_get(handler, lambda: o._live_ceiling(MUSE_CORE, 64_000))
+        assert got == (expected, "live lookup"), (declared, got)
+    _reset_lookups()
+    undeclared = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=None)})
+    assert _with_fake_get(undeclared, lambda: o._live_ceiling(MUSE_CORE, 64_000)) == \
+        (64_000, "fallback (no ceiling declared)")
+
+
+def test_live_ceiling_falls_back_softly_and_remembers_what_it_learned():
+    # no key: no lookup is even attempted, and the dispatch would SKIP anyway
+    _reset_lookups()
+    never = _get_by_slug({})
+    assert _with_fake_get(never, lambda: o._live_ceiling(MUSE_CORE, 64_000), key=None) == \
+        (64_000, "fallback (no OPENROUTER_API_KEY)")
+    assert never.calls == []
+
+    # a failed lookup is remembered for five minutes, so an outage costs one attempt
+    _reset_lookups()
+    down = _get_by_slug({})                                  # every slug 404s
+    first = _with_fake_get(down, lambda: o._live_ceiling(MUSE_CORE, 64_000))
+    again = _with_fake_get(down, lambda: o._live_ceiling(MUSE_CORE, 64_000))
+    assert first == again == (64_000, "fallback (lookup failed)")
+    assert down.calls == [MUSE_CORE], "the failure was not retried inside the window"
+    o._CEILING_STATE[MUSE_CORE]["ts"] -= o._CEILING_RETRY_SECONDS + 1
+    _with_fake_get(down, lambda: o._live_ceiling(MUSE_CORE, 64_000))
+    assert down.calls == [MUSE_CORE, MUSE_CORE], "after the window it tries again"
+
+    # a success is kept for the process
+    _reset_lookups()
+    up = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=131_072)})
+    for _ in range(3):
+        assert _with_fake_get(up, lambda: o._live_ceiling(MUSE_CORE, 64_000)) == \
+            (128_000, "live lookup")
+    assert up.calls == [MUSE_CORE]
+
+
+def test_a_recovered_lookup_replaces_the_fallback():
+    _reset_lookups()
+    down = _get_by_slug({})
+    _with_fake_get(down, lambda: o._live_ceiling(MUSE_CORE, 64_000))
+    o._CEILING_STATE[MUSE_CORE]["ts"] -= o._CEILING_RETRY_SECONDS + 1
+    up = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=200_000)})
+    assert _with_fake_get(up, lambda: o._live_ceiling(MUSE_CORE, 64_000)) == \
+        (128_000, "live lookup")
+
+
+def test_resolve_applies_the_live_ceiling_only_to_flagged_entries():
+    _reset_lookups()
+    handler = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)})
+
+    def resolve_all():
+        return {m: o._resolve(m) for m in o._BUILTIN}
+    cfgs = _with_fake_get(handler, resolve_all)
+    assert cfgs[MUSE_CORE]["max_out"] == 128_000
+    assert cfgs[MUSE_CORE]["ceiling_source"] == "live lookup"
+    assert handler.calls == [MUSE_CORE], "no other core model triggers a lookup"
+    for m in o._BUILTIN - {MUSE_CORE}:
+        assert "ceiling_source" not in cfgs[m], m
+        assert cfgs[m]["max_out"] == o._MODELS[m]["max_out"], m
+
+
+def test_list_fleet_says_where_the_muse_budget_came_from():
+    _reset_lookups()
+    row = lambda: [r for r in json.loads(o.list_fleet())["fleet"] if r["model"] == MUSE_CORE][0]
+    before = row()          # list_fleet must not look anything up (the guard enforces it)
+    assert before["max_output_tokens"] == 64_000
+    assert "resolved live on first use" in before["budget_source"]
+    _with_fake_get(_get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)}),
+                   lambda: o._resolve(MUSE_CORE))
+    after = row()
+    assert after["max_output_tokens"] == 128_000 and after["budget_source"] == "live lookup"
+    plain = [r for r in json.loads(o.list_fleet())["fleet"] if r["model"] == "glm-5.3"][0]
+    assert "budget_source" not in plain
+
+
+def test_the_network_guard_is_installed_for_this_suite():
+    """The guard that keeps a stray real lookup from being cached and masking a bug."""
+    try:
+        requests.get("https://example.invalid/")
+    except AssertionError as e:
+        assert "reached the network" in str(e)
+    else:
+        raise AssertionError("requests.get is not guarded")
+
+
+# --- fleet_check -----------------------------------------------------------------------------------
+
+def _with_env(fn, **env):
+    saved = {k: os.environ.get(k) for k in env}
+    try:
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return fn()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+ALL_KEYS = dict(DEEPSEEK_API_KEY="k", ZHIPU_API_KEY="k", OPENROUTER_API_KEY="k")
+
+
+def _healthy_world(overrides=None, astra_declared=128_000, served=None):
+    """Fakes for a fleet that is fine: spec lookups, one-word replies, decision answers."""
+    overrides, served = overrides or {}, served or {}
+    table = {MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718),
+             "~openai/gpt-astra-latest": _endpoints_body("~openai/gpt-astra-latest",
+                                                         out=astra_declared)}
+    get = _get_by_slug(table)
+    calls = []
+
+    def fake_call(model, messages, reasoning_effort="max", progress=None, meta=None):
+        calls.append((model, reasoning_effort))
+        if meta is not None:
+            meta.update(served.get(model, {"model": model, "provider": "Host"}))
+        return overrides.get(model, "OK")
+
+    def post(url, **kw):
+        return _FakeResp(200, {"model": kw["json"]["model"],
+                               "answers": {"greeting": {"type": "noul", "noul": 0.97}}})
+    return get, fake_call, post, calls
+
+
+def _run_check(world, call=lambda: o.fleet_check(), **env):
+    get, fake_call, post, calls = world
+    original_call, original_post = o._call, requests.post
+    o._call, requests.post = fake_call, post
+    try:
+        return json.loads(_with_fake_get(get, lambda: _with_env(call, **{**ALL_KEYS, **env}))), calls
+    finally:
+        o._call, requests.post = original_call, original_post
+
+
+def test_fleet_check_passes_a_healthy_fleet():
+    _reset_lookups()
+    res, calls = _run_check(_healthy_world())
+    assert res["ok"] is True and res["problems"] == [] and res["checked"] == 8
+    assert {r["status"] for r in res["rows"]} == {"OK"}
+    muse = [r for r in res["rows"] if r["model"] == MUSE_CORE][0]
+    assert muse["budget"] == 128_000 and muse["declared_ceiling"] == 943_718
+    assert muse["budget_source"] == "live lookup" and muse["reply"] == "OK"
+    assert muse["price_out_per_m"] == 4.25 and muse["served_model"] == MUSE_CORE
+    assert {m for m, _ in calls} == set(o._BUILTIN), "one tiny call per generator"
+    assert {e for _, e in calls} == {"low"}, "the check never asks for deep reasoning"
+    assert [r["kind"] for r in res["rows"]].count("decider") == 3
+    assert res["warnings"] == []
+
+
+def test_fleet_check_reports_a_substitution_with_the_served_name_and_the_fix():
+    _reset_lookups()
+    msg = ("[SUBSTITUTED] requested 'meta/muse-spark-1.3' but the endpoint served "
+           "'meta/muse-spark-1.3-0902' — do not audit this as content")
+    res, _ = _run_check(_healthy_world({MUSE_CORE: msg},
+                                       served={MUSE_CORE: {"model": "meta/muse-spark-1.3-0902",
+                                                           "provider": "Meta"}}))
+    assert res["ok"] is False
+    row = [r for r in res["rows"] if r["model"] == MUSE_CORE][0]
+    assert row["status"] == "PROBLEM" and row["call"] == "SUBSTITUTED"
+    assert row["served_model"] == "meta/muse-spark-1.3-0902" and row["served_host"] == "Meta"
+    assert "meta/muse-spark-1.3-0902" in res["problems"][0]["what"]
+    assert "legitimate alias" in res["problems"][0]["what"]
+    assert [r["status"] for r in res["rows"] if r["model"] != MUSE_CORE] == ["OK"] * 7
+
+
+def test_fleet_check_flags_a_budget_above_the_declared_ceiling():
+    _reset_lookups()
+    res, _ = _run_check(_healthy_world(astra_declared=100_000))
+    assert res["ok"] is False
+    row = [r for r in res["rows"] if r["model"] == "openai/gpt-astra-latest"][0]
+    assert row["status"] == "PROBLEM" and row["declared_ceiling"] == 100_000
+    assert "exceeds the declared ceiling 100,000" in row["problems"][0]
+    assert "lower max_out" in row["problems"][0]
+
+
+def test_fleet_check_skips_providers_with_no_key_without_failing():
+    _reset_lookups()
+    res, calls = _run_check(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None)
+    assert res["ok"] is True
+    assert sorted(res["skipped"]) == ["deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3"]
+    assert {m for m, _ in calls} == {MUSE_CORE, "openai/gpt-astra-latest"}
+    skipped = [r for r in res["rows"] if r["status"] == "SKIPPED"][0]
+    assert "is not set" in skipped["note"]
+    assert res["tested"] == 5 and res["verdict"].startswith("OK — 5 of 8"), res["verdict"]
+    nothing, _ = _run_check(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None,
+                            OPENROUTER_API_KEY=None)
+    assert nothing["checked"] == 8 and len(nothing["skipped"]) == 8 and nothing["problems"] == []
+    assert nothing["tested"] == 0 and nothing["ok"] is False, \
+        "nothing tested must never read as healthy"
+    assert nothing["verdict"].startswith("NOTHING WAS TESTED")
+
+
+def test_fleet_check_treats_an_unlisted_alias_as_a_warning_not_a_failure():
+    _reset_lookups()
+    get, fake_call, post, calls = _healthy_world()
+    get = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)})   # alias 404s
+    res, _ = _run_check((get, fake_call, post, calls))
+    assert res["ok"] is True
+    row = [r for r in res["rows"] if r["model"] == "openai/gpt-astra-latest"][0]
+    assert row["status"] == "OK" and row["warnings"], "still passes: the real call succeeded"
+    assert "could not compare" in row["warnings"][0]
+    assert res["warnings"][0]["model"] == "openai/gpt-astra-latest"
+
+
+def test_fleet_check_reports_failed_calls_and_unknown_models():
+    _reset_lookups()
+    res, _ = _run_check(_healthy_world({"glm-5.3": "[EMPTY] glm-5.3 streamed no answer"}))
+    glm = [r for r in res["rows"] if r["model"] == "glm-5.3"][0]
+    assert glm["status"] == "PROBLEM" and "EMPTY" in glm["problems"][0]
+    only, calls = _run_check(_healthy_world(), call=lambda: o.fleet_check(["glm-5.3", "kimi"]))
+    assert [r["model"] for r in only["rows"]] == ["glm-5.3", "kimi"]
+    assert only["rows"][1]["status"] == "PROBLEM" and "not in the fleet" in only["rows"][1]["problems"][0]
+    assert [m for m, _ in calls] == ["glm-5.3"], "only the models asked for are called"
+    none_dec, _ = _run_check(_healthy_world(), call=lambda: o.fleet_check(include_deciders=False))
+    assert none_dec["checked"] == 5
+
+
+def test_fleet_check_decider_failures_are_reported():
+    _reset_lookups()
+    world = _healthy_world()
+    get, fake_call, _post, calls = world
+
+    def bad_post(url, **kw):
+        return _FakeResp(500, {"error": "boom"})
+    res, _ = _run_check((get, fake_call, bad_post, calls),
+                        call=lambda: o.fleet_check(["typesafe/jev-1.13"]))
+    row = res["rows"][0]
+    assert row["status"] == "PROBLEM" and "HTTP 500" in row["problems"][0]
+
+
+def test_the_command_line_check_prints_a_table_and_sets_the_exit_code():
+    import contextlib
+    import io
+
+    def run(world, argv=(), **env):
+        buf = io.StringIO()
+        get, fake_call, post, calls = world
+        original_call, original_post = o._call, requests.post
+        o._call, requests.post = fake_call, post
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = _with_fake_get(get, lambda: _with_env(
+                    lambda: o._check_main(list(argv)), **{**ALL_KEYS, **env}))
+        finally:
+            o._call, requests.post = original_call, original_post
+        return code, buf.getvalue()
+    _reset_lookups()
+    code, text = run(_healthy_world())
+    assert code == 0 and "FLEET OK" in text and f"OK        {MUSE_CORE}" in text
+    assert "budget 128,000" in text and "declared 943,718" in text
+    _reset_lookups()
+    msg = "[SUBSTITUTED] requested 'x' but the endpoint served 'y'"
+    code, text = run(_healthy_world({MUSE_CORE: msg}))
+    assert code == 1 and "PROBLEM" in text and "1 PROBLEM(S)" in text and "->" in text
+    _reset_lookups()
+    code, text = run(_healthy_world(), argv=["glm-5.3"])
+    rows = [ln for ln in text.splitlines() if ln.startswith("OK ")]
+    assert code == 0 and len(rows) == 1 and rows[0].split()[1] == "glm-5.3"
+    assert MUSE_CORE not in text, "only the model asked for is checked"
+    code, text = run(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None)
+    assert code == 0 and "not tested (no API key)" in text and "FLEET OK — 5 of 8" in text
+    _reset_lookups()
+    code, text = run(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None,
+                     OPENROUTER_API_KEY=None)
+    assert code == 2, "exit 2: nothing could be tested, which is not the same as healthy"
+    assert "NOTHING WAS TESTED" in text and "FLEET OK" not in text
 
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
