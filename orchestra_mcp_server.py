@@ -1,6 +1,24 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v20 — A DECISION MODEL TAKES PART IN ROUTING; MERCURY DECIDE REPLACED  (2026-10-10)
+------------------------------------------------------------------------------------
+  1. route_decide: Jev rules on every fleet routing choice (a `choice` over the eligible
+     generators, asked in BOTH option orders, plus a noul asked in both polarities), with
+     route_evidence's measured rates in front of it. Claude no longer holds the default
+     route alone. A ruling serves only if it is order-consistent, polarity-consistent and
+     >= 0.60 (provisional), a MEASURED leader still outranks it, and the router earns or
+     loses its authority by measurement:
+     when the router and the evidence pick disagree and an L1 check exists, BOTH run
+     under one task_id, and fleet_stats grades the router on those head-to-heads. A
+     router that falls behind is demoted to log-only automatically. ORCHESTRA_ROUTER_MODE
+     = active (default) | shadow (log only, the evidence pick serves).
+  2. inception/mercury-decide:free -> perplexity/pplx-decider-v1.1-27b: the free tier was
+     rate-limited and its data terms unconfirmed. See the registry comment for the
+     evidence, and for why the class is CN-OW (an inference from the base model).
+  3. orchestra_parallel and orchestra_start take an optional task_id, so a routing
+     ruling and the generator runs it triggered can be joined and graded together.
+
 v19 — NO MORE GUESSED CEILINGS; ONE-COMMAND LIVE CHECK  (2026-10-06)
 --------------------------------------------------------------------
 The 32,000-token budget on Muse Spark was a guess made because OpenRouter could not be
@@ -373,11 +391,16 @@ _DECIDERS = {
         klass="US-CLOSED", ctx=32_000, seat="gatekeeper", free=False),
         # $0.042/M in, $0 out. 0.14-0.32s measured by SIL. Best-calibrated of the
         # models SIL tested. Pinned build; ~typesafe/jev-latest floats.
-    "inception/mercury-decide:free": dict(
-        klass="US-CLOSED", ctx=33_000, seat="screener", free=True),
-        # $0 (early-access free tier; rate-limited per OpenRouter's free-model rules).
-        # Vendor claims #1 on JevBench v1.4 and up to 14 decisions/s — vendor-reported.
-        # FREE ENDPOINT: never send sensitive state here; route it to Jev instead.
+    "perplexity/pplx-decider-v1.1-27b": dict(
+        klass="CN-OW", ctx=262_144, seat="screener", free=False),
+        # $0.02/M in (OpenRouter listing), $0 out; 262K context; ~187 ms listed. Replaced
+        # the free Mercury Decide (rate-limited, ~200 req/day per a third-party listing;
+        # training terms unconfirmed). Class by BASE lineage, an inference: BenchLM (third
+        # party) reports a Qwen3.8-27B base, which puts it with DeepSeek and GLM rather
+        # than with Jev, so it is not an independent check on those two. Quality evidence
+        # is thin: one BenchLM-verified row (Decision Index 0.3, 62.8) and Perplexity's
+        # own panel (85.71% vs Jev 84.51%, provider-reported, not rerun). Same wire id
+        # style as Jev: the version is pinned, a dated build (-20261006) is accepted.
     "upstage/solar-decide": dict(
         klass="KR-CLOSED", ctx=512_000, seat="long-context judge", free=False),
         # $0.05/M in while 50% off (list price presumably $0.10), $0 out. Solar Mini 4.
@@ -463,7 +486,7 @@ _LAB_CLASS = {"deepseek": "CN-OW", "z-ai": "CN-OW", "moonshotai": "CN-OW",
               "qwen": "CN-OW", "minimax": "CN-OW",
               "openai": "US-CLOSED", "anthropic": "US-CLOSED", "google": "US-CLOSED",
               "x-ai": "US-CLOSED", "upstage": "KR-CLOSED", "typesafe": "US-CLOSED", "meta": "US-CLOSED",
-              "inception": "US-CLOSED"}
+              "inception": "US-CLOSED", "perplexity": "US-CLOSED"}
 
 
 def _author(slug: str) -> str:
@@ -1111,6 +1134,20 @@ def _new_task_id() -> str:
     return str(uuid.uuid4())[:8]
 
 
+_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def _task_id_arg(task_id: str) -> tuple:
+    """(id, error). An empty argument means 'make one'. A supplied id lets one task span
+    several tools — a routing ruling and the dispatches it triggered — so the outcome log
+    can pair them."""
+    tid = (task_id or "").strip()
+    if tid and not _TASK_ID_RE.fullmatch(tid):
+        return "", ("[ERROR] task_id must be 1-64 characters of letters, digits, '_', '.', "
+                    "'-' and start with a letter or digit")
+    return tid, None
+
+
 # A model may name a single host (pin) OR an ordered set (order), never both —
 # ambiguous routing otherwise.
 for _name, _m in _MODELS.items():
@@ -1735,7 +1772,7 @@ def _check_panel(models) -> Optional[str]:
         return "[ERROR] a panel needs at least two distinct decision models"
     if len({_DECIDERS[m]["klass"] for m in models}) < 2:
         return (f"[ERROR] panel {models} is single-class — include a model from another "
-                f"class (upstage/solar-decide is the only core KR-CLOSED member). Same-class "
+                f"class (the core bench spans US-CLOSED, KR-CLOSED and CN-OW). Same-class "
                 f"agreement is not confirmation (SKILL.md 'Verification ladder').")
     return None
 
@@ -2214,7 +2251,8 @@ def _start_job(mode: str, work) -> str:
 def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v4-pro",
                     reasoning_effort: str = "max",
                     model_a: Optional[str] = None,
-                    model_b: Optional[str] = None) -> str:
+                    model_b: Optional[str] = None,
+                    task_id: str = "") -> str:
     """START a generator task as a background job and return IMMEDIATELY with a job_id —
     the required path for anything that may take more than ~30 seconds. Claude Desktop
     silently drops MCP tool results that take too long; jobs never block on the work.
@@ -2251,9 +2289,15 @@ def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v
     A job never times out on its own: it stops only when the provider goes silent for
     _SILENCE_SECONDS between chunks, and partial text comes back under [TIMEOUT].
 
+    task_id: optional. Pass the task_id route_decide returned when it told you to run both
+      picks, so the router's ruling and these runs are graded together. Default: the job_id.
+
     Returns JSON: {"job_id": "...", "status": "running"}.
     NEXT STEP (mandatory): call check_job(job_id) until status is "complete" or "failed".
     """
+    given_tid, tid_err = _task_id_arg(task_id)
+    if tid_err:
+        return json.dumps({"status": "failed", "error": tid_err})
     mode = mode.strip().lower()
     if mode not in ("model", "parallel", "adversarial"):
         return json.dumps({"status": "failed",
@@ -2273,7 +2317,8 @@ def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v
             return json.dumps({"status": "failed", "error": f"invalid brief: {err}"})
 
     def work(job_id, progress):
-        # The job_id IS the task_id for the outcome log.
+        # The job_id IS the task_id for the outcome log, unless the caller supplied one.
+        job_id = given_tid or job_id
         if mode == "model":
             progress(f"calling {model}")
             out = _logged_call(model, _render_brief(b, job_id), task_id=job_id,
@@ -2417,7 +2462,7 @@ def call_model(model: str, brief: Union[dict, str], reasoning_effort: str = "max
 @mcp.tool()
 def orchestra_parallel(brief: Union[dict, str], model_a: str = _DEFAULT_PAIR[0],
                        model_b: str = _DEFAULT_PAIR[1],
-                       reasoning_effort: str = "max") -> str:
+                       reasoning_effort: str = "max", task_id: str = "") -> str:
     """Send ONE structured brief to two generators concurrently and WAIT. QUICK briefs
     only — for anything substantial use orchestra_start(mode="parallel").
 
@@ -2425,8 +2470,12 @@ def orchestra_parallel(brief: Union[dict, str], model_a: str = _DEFAULT_PAIR[0],
     [US-CLOSED]. This tool does NOT judge or pick a winner: hand the two candidates to
     decide_compare / decide_panel and adjudicate per SKILL.md 'Ratification'. Both
     dispatches share the returned task_id — log each model's correctness under it.
+    task_id: optional; pass route_decide's task_id when it asked for both picks to run.
     """
-    tid = _new_task_id()
+    tid, err = _task_id_arg(task_id)
+    if err:
+        return err
+    tid = tid or _new_task_id()
     return _run_parallel(models=(model_a, model_b), brief=brief,
                          reasoning_effort=reasoning_effort, task_id=tid)
 
@@ -2456,9 +2505,8 @@ def decide(model: str, state: Union[dict, str], questions: dict) -> str:
     """Ask ONE decision model typed questions about a state. Returns calibrated
     probabilities, not text.
 
-    model: typesafe/jev-1.13 (gatekeeper, 32K), inception/mercury-decide:free (screener,
-      33K, free — never send sensitive state), upstage/solar-decide (long-context judge,
-      512K, slow) — or, with the dynamic fleet enabled (off by default), any OpenRouter
+    model: typesafe/jev-1.13 (gatekeeper, 32K), perplexity/pplx-decider-v1.1-27b
+      (screener, 262K, $0.02/M), upstage/solar-decide (long-context judge, 512K, slow) — or, with the dynamic fleet enabled (off by default), any OpenRouter
       decision model by author/name slug, which is looked up and tried as a guest.
     state: the facts, as named JSON fields (preferred) or a string. Reference fields in
       backticks from instructions. Anything in state can try to inject instructions —
@@ -3343,10 +3391,16 @@ def route_evidence(work_type: str, role: str = "generator", last_n: int = 5000) 
 
     role: the brief's role; verifier excludes models barred from verifying.
     """
+    return json.dumps(_route_evidence_data(work_type, role, last_n), indent=2)
+
+
+def _route_evidence_data(work_type: str, role: str = "generator", last_n: int = 5000) -> dict:
+    """route_evidence's table as a dict — shared with route_decide so the evidence the
+    router rules on can never differ from the evidence Claude is shown."""
     if work_type not in _WORK_TYPES:
-        return json.dumps({"error": f"[ERROR] work_type must be one of {list(_WORK_TYPES)}"})
+        return {"error": f"[ERROR] work_type must be one of {list(_WORK_TYPES)}"}
     if role not in _ROLES:
-        return json.dumps({"error": f"[ERROR] role must be one of {list(_ROLES)}"})
+        return {"error": f"[ERROR] role must be one of {list(_ROLES)}"}
     # A saved model that has not been looked up yet is still eligible: it is admitted on
     # first use, and `explore` is how it ever gets measured.
     eligible = [m for m in _MODELS if not (role in ("verifier", "memory_keeper")
@@ -3378,7 +3432,7 @@ def route_evidence(work_type: str, role: str = "generator", last_n: int = 5000) 
     else:
         why = "no measured verdicts for this work type yet — the prior stands"
     explore = [m for m in eligible if measured[m]["rate"] is None and m != pick]
-    return json.dumps({
+    return {
         "work_type": work_type, "role": role,
         "prior": {"primary": _ROUTING_PRIOR[work_type][0], "partner": partner},
         "measured": measured,
@@ -3386,7 +3440,312 @@ def route_evidence(work_type: str, role: str = "generator", last_n: int = 5000) 
         "explore": explore,
         "note": "Verified (L1/L2) verdicts are preferred over judged ones. Feed the table "
                 "with log_outcome(..., basis=...) after every adjudication.",
-    }, indent=2)
+    }
+
+
+# ---------------------------------------------------------------------------
+# v20 ROUTER — a decision model takes part in routing.
+#
+# Before v20 the default route was Claude's: route_evidence's measured leader, else the
+# fleet card's prior, both read and applied by the same model that writes the briefs and
+# spends the money. A decision model now rules on every route. That moves the judgment;
+# it does not by itself make the judgment good — Jev has no measured skill at matching
+# models to tasks, TypedBench reports hosted decision models are wording-sensitive and
+# underconfident, and a Jev paper reports probabilities calibrated when pooled but not
+# within a benchmark. So the router is asked in a way that exposes those weaknesses
+# (both option orders, both polarities), it serves only a clean ruling, and it is graded:
+# when it disagrees with the evidence pick and an L1 check exists, both run under one
+# task_id and fleet_stats counts who was right. A router that falls behind is demoted.
+# All thresholds below are PROVISIONAL policy, not measurements.
+# ---------------------------------------------------------------------------
+_ROUTER_CHAIN = (_GATEKEEPER, "perplexity/pplx-decider-v1.1-27b", "upstage/solar-decide")
+_ROUTER_ACCEPT = 0.60         # averaged probability the winning option needs (provisional)
+_ROUTER_POLARITY = 0.25       # max gap between a noul and its negated twin (provisional)
+_ROUTER_MIN_DECISIVE = 10     # decisive verified head-to-heads before the record counts
+_ROUTER_LEAD = 0.20           # (wins - losses) / decisive needed to be "ahead"/"behind"
+
+_ROUTE_BLURB = {
+    "glm-5.3": "strong real-world software-engineering and terminal work; 1M context",
+    "openai/gpt-astra-latest": "lowest measured hallucination rate among the generators; "
+                               "the only non-CN-OW generator; costs $10/$50 per M tokens",
+    "deepseek-v4-pro": "best on competitive and algorithmic code; weaker on general reasoning",
+    "deepseek-v4.1-flash": "cheapest; image input; for drafting and bulk work only",
+    "meta/muse-spark-1.3": "candidate added at the operator's request; closed weights; "
+                           "strong published coding-agent scores; unmeasured here",
+}
+
+
+def _router_mode() -> tuple:
+    """(mode, note). active = a clean ruling serves; shadow = ruling is logged, the
+    evidence pick serves. An unrecognised value fails safe to shadow, and says so."""
+    raw = os.environ.get("ORCHESTRA_ROUTER_MODE", "").strip().lower()
+    if raw in ("", "active"):
+        return "active", ""
+    if raw == "shadow":
+        return "shadow", ""
+    return "shadow", f"ORCHESTRA_ROUTER_MODE={raw!r} is not active|shadow — running shadow"
+
+
+def _has_key(model: str) -> bool:
+    e = _MODELS.get(model) or {}
+    cfg = _CONFIGS.get(e.get("provider"), {})
+    return bool(os.environ.get(cfg.get("key_env", ""), ""))
+
+
+def _router_record(log: dict) -> dict:
+    """Grade the router: over rulings that asked for BOTH picks to run (a disagreement
+    with the evidence pick, an L1 check available), who was right? Only verified (L1/L2)
+    verdicts count, and a tie (both right or both wrong) says nothing about the router."""
+    last = {}
+    for o in log["outcomes"]:
+        last[(o.get("task_id"), o.get("model"))] = o
+
+    def verdict(tid, m):
+        o = last.get((tid, m))
+        if not o or o.get("correctness") not in ("CORRECT", "WRONG", "OVERTURNED_BY_L1"):
+            return None
+        verified = o.get("basis") in ("L1", "L2") or o.get("correctness") == "OVERTURNED_BY_L1"
+        return o.get("correctness") == "CORRECT", verified
+
+    wins = losses = ties = unverified = waiting = 0
+    for r in log["rulings"]:
+        if not r.get("explore"):
+            continue
+        a, b = verdict(r.get("task_id"), r.get("router_pick")), \
+            verdict(r.get("task_id"), r.get("evidence_pick"))
+        if a is None or b is None:
+            waiting += 1
+        elif not (a[1] and b[1]):
+            unverified += 1
+        elif a[0] and not b[0]:
+            wins += 1
+        elif b[0] and not a[0]:
+            losses += 1
+        else:
+            ties += 1
+    decisive = wins + losses
+    if decisive < _ROUTER_MIN_DECISIVE:
+        state = "unproven"
+    else:
+        margin = (wins - losses) / decisive
+        state = "ahead" if margin >= _ROUTER_LEAD else \
+            "behind" if margin <= -_ROUTER_LEAD else "level"
+    return {"state": state, "router_wins": wins, "evidence_wins": losses, "ties": ties,
+            "awaiting_verdicts": waiting, "ungraded_unverified": unverified,
+            "rule": f"unproven until {_ROUTER_MIN_DECISIVE} decisive verified head-to-heads; "
+                    f"then ahead/behind at a {_ROUTER_LEAD:.0%} margin (provisional); "
+                    f"'behind' demotes the router to log-only"}
+
+
+def _routing_report(rulings: list, record: dict) -> Optional[dict]:
+    if not rulings:
+        return None
+    return {"rulings": len(rulings),
+            "accepted": sum(1 for r in rulings if r.get("accepted")),
+            "agreed_with_evidence_pick": sum(1 for r in rulings if r.get("agree")),
+            "order_inconsistent": sum(1 for r in rulings if r.get("order_consistent") is False),
+            "polarity_inconsistent": sum(1 for r in rulings
+                                         if r.get("polarity_consistent") is False),
+            "both_picks_run": sum(1 for r in rulings if r.get("explore")),
+            "by_mode": dict(Counter(r.get("mode", "?") for r in rulings)),
+            "router_record": record}
+
+
+def _prob(x) -> float:
+    try:
+        v = float(x)
+        return v if 0.0 <= v <= 1.0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@mcp.tool()
+def route_decide(work_type: str, role: str = "generator", has_l1: bool = False,
+                 task_gist: str = "", task_id: str = "") -> str:
+    """Let a DECISION MODEL rule on which generator takes this work, with route_evidence's
+    measured rates in front of it. Use it for every routing choice that reaches the fleet;
+    Claude acts against a ruling only after log_override("route", ...).
+
+    Asked three ways at once (costs 3 decision calls, one task_id): the same `choice`
+    over the eligible generators in two opposite option orders (position and label bias
+    cancel; a ruling that flips with the order is not accepted), and a yes/no on whether
+    the evidence pick is adequate asked in both polarities (a model that answers yes to a
+    question and yes to its negation is reacting to wording, and is not accepted).
+
+    work_type / role: as route_evidence. has_l1: a deterministic check will verify the
+      output — the only case where disagreement is worth running both picks to settle.
+    task_gist: one or two sentences describing the work, no sensitive content (it goes to
+      an external service). task_id: optional; reuse it for the dispatches that follow.
+
+    Returns the ruling, the evidence pick, `serve` (the model to dispatch) and why, and
+    `explore` — when set, run BOTH picks under the returned task_id (orchestra_parallel or
+    orchestra_start with task_id=...), check each with the L1 check, and log_outcome each
+    with basis L1. That head-to-head is the only thing that grades the router.
+
+    A MEASURED leader (route_evidence: >= 10 verdicts, +10 points) always serves — outcomes
+    outrank a router that has not earned the right to overrule them — so the router rules
+    where the evidence is only the prior. It is still asked, and a disagreement with a
+    measured leader is graded like any other.
+
+    ORCHESTRA_ROUTER_MODE: active (default; a clean ruling serves) | shadow (logged only,
+    the evidence pick serves). A router that falls behind on verified head-to-heads is
+    demoted to shadow automatically (fleet_stats shows its record). Thresholds are
+    provisional policy.
+    """
+    tid, err = _task_id_arg(task_id)
+    if err:
+        return json.dumps({"error": err})
+    tid = tid or _new_task_id()
+    ev = _route_evidence_data(work_type, role)
+    if "error" in ev:
+        return json.dumps(ev)
+    candidates = sorted(m for m in ev["measured"] if _has_key(m))
+    if not candidates:
+        return json.dumps({"error": "[SKIPPED] no eligible generator has its API key set — "
+                                    "run fleet_check"})
+    evidence_pick = ev["recommendation"]["model"]
+    if evidence_pick not in candidates:
+        partner = ev["prior"]["partner"]
+        evidence_pick = partner if partner in candidates else candidates[0]
+    if len(candidates) == 1:
+        return json.dumps({"task_id": tid, "serve": candidates[0], "router_pick": None,
+                           "note": "only one eligible generator has a key — nothing to rule on"})
+
+    def about(m):
+        v = ev["measured"][m]
+        seen = (f"unmeasured on this work type ({v['verdicts']} verdicts)" if v["rate"] is None
+                else f"measured {v['rate']:.0%} correct over {v['verdicts']} verdicts "
+                     f"({v['rate_source']})")
+        return f"{m} — {_ROUTE_BLURB.get(m, 'no description on file')}; {seen}."
+
+    gist = (task_gist or "").strip()[:800]
+    base = {"work_type": work_type, "role": role, "an_l1_check_exists": bool(has_l1)}
+    if gist:
+        base["task_gist"] = gist
+    pick_instr = ("Which candidate should take this `work_type` work in the `role` role? "
+                  "Choose the one most likely to produce correct output. A measured correct "
+                  "rate outranks a description; use the description only where nothing is "
+                  "measured. `an_l1_check_exists` says whether a deterministic check will "
+                  "verify the output.")
+
+    def pick_call(order):
+        alias = {f"c{i + 1}": m for i, m in enumerate(order)}
+        crit = {a: about(m) for a, m in alias.items()}
+        crit["none"] = "No candidate is suitable for this work."
+        return alias, {"pick": {"type": "choice", "instructions": pick_instr, "criteria": crit}}
+
+    adq_state = {**base, "evidence_pick": evidence_pick,
+                 "candidates": [about(m) for m in candidates]}
+    adq_q = {
+        "adequate": {"type": "noul", "instructions":
+                     "Is `evidence_pick` an adequate choice for this `work_type` work in the "
+                     "`role` role, meaning no other entry in `candidates` is clearly more "
+                     "likely to produce correct output?"},
+        "inadequate": {"type": "noul", "instructions":
+                       "Is some other entry in `candidates` clearly more likely than "
+                       "`evidence_pick` to produce correct output for this `work_type` work "
+                       "in the `role` role?"}}
+
+    alias_a, qa = pick_call(candidates)
+    alias_b, qb = pick_call(list(reversed(candidates)))
+    router, calls, tried = None, None, {}
+    for m in _ROUTER_CHAIN:
+        if _admit_decider(m):
+            tried[m] = "not in the decision registry"
+            continue
+        r = _run_threads({
+            "a": lambda m=m: _logged_decide(m, base, qa, task_id=tid, role="route", mode="route"),
+            "b": lambda m=m: _logged_decide(m, base, qb, task_id=tid, role="route", mode="route"),
+            "adq": lambda m=m: _logged_decide(m, adq_state, adq_q, task_id=tid, role="route",
+                                              mode="route")})
+        bad = {k: v["error"] for k, v in r.items() if "error" in v}
+        if "a" in bad or "b" in bad:
+            tried[m] = bad.get("a") or bad.get("b")
+            continue
+        router, calls = m, r
+        break
+    if router is None:
+        return json.dumps({"task_id": tid, "error": "[ERROR] no decision model could rule on "
+                           "this route — Claude routes it and says the bench was unavailable",
+                           "tried": tried, "evidence_pick": evidence_pick,
+                           "serve": evidence_pick}, indent=2, ensure_ascii=False)
+
+    def read(res, alias):
+        a = res["answers"]["pick"]
+        probs = a.get("probabilities") or {}
+        dist = {m: _prob(probs.get(k)) for k, m in alias.items()}
+        dist["none"] = _prob(probs.get("none"))
+        ch = a.get("choice")
+        return dist, (alias[ch] if ch in alias else "none" if ch == "none" else None)
+
+    da, ca = read(calls["a"], alias_a)
+    db, cb = read(calls["b"], alias_b)
+    avg = {k: (da[k] + db[k]) / 2 for k in da}
+    top = max(avg, key=lambda k: avg[k])
+    order_consistent = ca is not None and ca == cb
+    polarity_consistent, p_adequate = None, None
+    if "answers" in calls["adq"]:
+        ans = calls["adq"]["answers"]
+        p1, p2 = _prob(ans["adequate"].get("noul")), 1.0 - _prob(ans["inadequate"].get("noul"))
+        polarity_consistent = abs(p1 - p2) <= _ROUTER_POLARITY
+        p_adequate = round((p1 + p2) / 2, 3)
+    router_pick = None if top == "none" else top
+    why_not = []
+    if router_pick is None:
+        why_not.append("the router found no suitable candidate")
+    if not order_consistent:
+        why_not.append("the pick changed with the option order")
+    if avg[top] < _ROUTER_ACCEPT:
+        why_not.append(f"top probability {avg[top]:.2f} is below {_ROUTER_ACCEPT:.2f}")
+    if polarity_consistent is False:
+        why_not.append("the adequacy answer contradicted its own negation")
+    accepted = not why_not
+    agree = router_pick == evidence_pick
+
+    mode, mode_note = _router_mode()
+    record = _router_record(_read_log(5000))
+    serve, serve_why = evidence_pick, ""
+    if not accepted:
+        serve_why = "ruling not accepted (" + "; ".join(why_not) + ") — the evidence pick serves"
+    elif mode == "shadow":
+        serve_why = "shadow mode — the ruling is logged and the evidence pick serves"
+    elif ev["recommendation"]["source"] == "measured" and not agree:
+        serve_why = ("the evidence pick is MEASURED on this work type and measured outcomes "
+                     "outrank a router's judgment — it serves; the disagreement is still "
+                     "graded if both run")
+    elif record["state"] == "behind":
+        serve_why = ("the router is behind the evidence pick on verified head-to-heads — "
+                     "demoted to log-only; the evidence pick serves")
+    else:
+        serve, serve_why = router_pick, "active mode, clean ruling — the router's pick serves"
+    explore = bool(has_l1 and accepted and not agree)
+    _log_event({"type": "route_ruling", "ts": _now(), "task_id": tid, "work_type": work_type,
+                "role": role, "router_model": router, "router_pick": router_pick,
+                "p_pick": round(avg[top], 3), "order_consistent": order_consistent,
+                "polarity_consistent": polarity_consistent,
+                "evidence_pick_adequate": p_adequate, "evidence_pick": evidence_pick,
+                "evidence_source": ev["recommendation"]["source"], "agree": agree,
+                "accepted": accepted, "served": serve, "mode": mode, "explore": explore,
+                "has_l1": bool(has_l1)})
+    nxt = ("run BOTH picks under this task_id — orchestra_parallel(model_a=..., model_b=..., "
+           f"task_id='{tid}') or orchestra_start(mode='parallel', ..., task_id='{tid}') — then "
+           "L1-check each and log_outcome(..., basis='L1') for both: that head-to-head is what "
+           "grades the router" if explore else
+           f"dispatch `serve`; to act against this ruling call log_override('route', ...) first; "
+           f"then log_outcome('{tid}', model, correctness, basis=...) as usual")
+    return json.dumps({
+        "task_id": tid, "mode": mode, **({"mode_note": mode_note} if mode_note else {}),
+        "router_model": router, "router_pick": router_pick,
+        "p_pick": round(avg[top], 3), "order_consistent": order_consistent,
+        "per_order_pick": [ca, cb], "polarity_consistent": polarity_consistent,
+        "evidence_pick_adequate": p_adequate,
+        "evidence_pick": evidence_pick, "evidence_source": ev["recommendation"]["source"],
+        "agree": agree, "accepted": accepted,
+        "serve": serve, "serve_why": serve_why,
+        "explore": {"run_both": [router_pick, evidence_pick]} if explore else None,
+        "router_record": record, "tried": tried or None, "next": nxt,
+        "caveat": "the router has no measured routing skill until router_record says so; "
+                  "thresholds are provisional"}, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -3440,7 +3799,7 @@ def log_outcome(task_id: str, model: str, correctness: str,
 def _read_log(last_n: int = 1000) -> dict:
     """Parse the last `last_n` log lines into dispatch / outcome / override rows.
     Shared by fleet_stats and route_evidence so the two can never disagree."""
-    out = {"lines": 0, "dispatches": [], "outcomes": [], "overrides": [],
+    out = {"lines": 0, "dispatches": [], "outcomes": [], "overrides": [], "rulings": [],
            "malformed": 0, "error": None}
     lines = []
     try:
@@ -3453,7 +3812,8 @@ def _read_log(last_n: int = 1000) -> dict:
         return out
     lines = lines[-max(1, last_n):]
     out["lines"] = len(lines)
-    bucket = {"dispatch": "dispatches", "outcome": "outcomes", "override": "overrides"}
+    bucket = {"dispatch": "dispatches", "outcome": "outcomes", "override": "overrides",
+              "route_ruling": "rulings"}
     for ln in lines:
         ln = ln.strip()
         if not ln:
@@ -3638,6 +3998,8 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
                              "dominate. The fleet_stats() / SKILL.md 'Outcome log' seed, not the finished result.",
         "worst_recent": worst,
         "claude_overrides_of_bench": override_counts or "none logged",
+        "routing": _routing_report(log["rulings"], _router_record(log))
+                   or "no routing rulings yet — route_decide has not been used",
         "by_work_type": {wt: {m: {**cell, "rate": _rate(cell)[0], "rate_source": _rate(cell)[1]}
                               for m, cell in models.items()}
                          for wt, models in _work_type_table(all_dispatches, outcomes).items()}
