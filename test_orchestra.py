@@ -2062,13 +2062,26 @@ def test_core_entries_are_unaffected_by_the_switch():
 MUSE_CORE = "meta/muse-spark-1.3"
 
 
+def _with_auto_ceiling_standin(fn, fallback=50_000):
+    """Register a throwaway auto_ceiling generator so the live-ceiling machinery stays
+    covered now that Muse Spark uses a fixed operator-set ceiling instead."""
+    slug = "acme/auto-ceiling-1"
+    o._MODELS[slug] = dict(provider="openrouter", klass="US-CLOSED",
+                           max_out=fallback, pin=None, auto_ceiling=True)
+    try:
+        return fn(slug)
+    finally:
+        o._MODELS.pop(slug, None)
+        o._CEILING_STATE.pop(slug, None)
+
+
 def test_muse_spark_is_a_plain_core_registry_entry():
     m = o._MODELS[MUSE_CORE]
     assert MUSE_CORE in o._BUILTIN and o._source(MUSE_CORE) == "builtin"
     assert m["provider"] == "openrouter" and m["pin"] is None and m["exact_served"] is True
     assert not m.get("extra"), "core, not a guest"
-    assert m["max_out"] == 64_000 and m["auto_ceiling"] is True, \
-        "64,000 is only the fallback; the live ceiling is resolved on first use"
+    assert m["max_out"] == 640_000 and "auto_ceiling" not in m, \
+        "operator-set hard ceiling (2026-10-10); not looked up or trimmed for this model"
     assert m["klass"] == o._MODELS["openai/gpt-astra-latest"]["klass"] == "US-CLOSED"
     same = o._run_adversarial(BRIEF, model_a=MUSE_CORE, model_b="openai/gpt-astra-latest")
     assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
@@ -2091,10 +2104,9 @@ def test_muse_spark_provenance_is_exact_and_its_payload_is_plain():
     flash = o._resolve("deepseek-v4.1-flash")
     assert o._check_provenance({"model": "deepseek-flash"}, "deepseek-v4.1-flash", flash) is None
     _reset_lookups()
-    handler = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)})
-    p = _with_fake_get(handler, lambda: _capture_payload(MUSE_CORE, "OPENROUTER_API_KEY"))
+    p = _capture_payload(MUSE_CORE, "OPENROUTER_API_KEY")
     assert p["model"] == MUSE_CORE and p["stream"] is True
-    assert p["max_tokens"] == 128_000, "declared 943,718, trimmed to the fleet's envelope"
+    assert p["max_tokens"] == 640_000, "operator-set hard ceiling, sent as-is; no live trim"
     assert "provider" not in p and p["reasoning"] == {"effort": "high"}
 
 
@@ -2113,7 +2125,7 @@ def test_muse_spark_runs_as_a_core_model_and_rejects_the_contributor_tier():
         finally:
             requests.post = original
     good = _with_fake_get(no_lookup, lambda: run("meta/muse-spark-1.3"))
-    assert no_lookup.calls == [MUSE_CORE], "one ceiling lookup, then cached for the process"
+    assert no_lookup.calls == [], "a fixed operator ceiling needs no live lookup on dispatch"
     assert good["outcome"] == "OK" and good["contract"]["valid"] is True
     assert good["class"] == "US-CLOSED"
     swapped = _with_fake_get(no_lookup, lambda: run("meta/muse-spark-1.3-contributor"))
@@ -2272,29 +2284,37 @@ def test_a_recovered_lookup_replaces_the_fallback():
 
 def test_resolve_applies_the_live_ceiling_only_to_flagged_entries():
     _reset_lookups()
-    handler = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)})
 
-    def resolve_all():
-        return {m: o._resolve(m) for m in o._BUILTIN}
-    cfgs = _with_fake_get(handler, resolve_all)
-    assert cfgs[MUSE_CORE]["max_out"] == 128_000
-    assert cfgs[MUSE_CORE]["ceiling_source"] == "live lookup"
-    assert handler.calls == [MUSE_CORE], "no other core model triggers a lookup"
-    for m in o._BUILTIN - {MUSE_CORE}:
-        assert "ceiling_source" not in cfgs[m], m
-        assert cfgs[m]["max_out"] == o._MODELS[m]["max_out"], m
+    def check(slug):
+        handler = _get_by_slug({slug: _endpoints_body(slug, out=943_718)})
+        cfgs = _with_fake_get(handler, lambda: {m: o._resolve(m)
+                                                for m in list(o._BUILTIN) + [slug]})
+        assert cfgs[slug]["max_out"] == 128_000, "declared 943,718 trimmed to the envelope"
+        assert cfgs[slug]["ceiling_source"] == "live lookup"
+        assert handler.calls == [slug], "no fixed-ceiling model triggers a lookup"
+        assert cfgs[MUSE_CORE]["max_out"] == 640_000, "Muse is a hard ceiling now, not flagged"
+        for m in o._BUILTIN:
+            assert "ceiling_source" not in cfgs[m], m
+            assert cfgs[m]["max_out"] == o._MODELS[m]["max_out"], m
+    _with_auto_ceiling_standin(check)
 
 
-def test_list_fleet_says_where_the_muse_budget_came_from():
+def test_list_fleet_shows_muse_hard_ceiling_and_the_live_source_for_flagged_entries():
     _reset_lookups()
-    row = lambda: [r for r in json.loads(o.list_fleet())["fleet"] if r["model"] == MUSE_CORE][0]
-    before = row()          # list_fleet must not look anything up (the guard enforces it)
-    assert before["max_output_tokens"] == 64_000
-    assert "resolved live on first use" in before["budget_source"]
-    _with_fake_get(_get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)}),
-                   lambda: o._resolve(MUSE_CORE))
-    after = row()
-    assert after["max_output_tokens"] == 128_000 and after["budget_source"] == "live lookup"
+    muse = [r for r in json.loads(o.list_fleet())["fleet"] if r["model"] == MUSE_CORE][0]
+    assert muse["max_output_tokens"] == 640_000 and "budget_source" not in muse, \
+        "Muse is a fixed operator ceiling now, not a live-resolved one"
+
+    def check(slug):
+        row = lambda: [r for r in json.loads(o.list_fleet())["fleet"] if r["model"] == slug][0]
+        before = row()      # list_fleet must not look anything up (the guard enforces it)
+        assert before["max_output_tokens"] == 50_000
+        assert "resolved live on first use" in before["budget_source"]
+        _with_fake_get(_get_by_slug({slug: _endpoints_body(slug, out=943_718)}),
+                       lambda: o._resolve(slug))
+        after = row()
+        assert after["max_output_tokens"] == 128_000 and after["budget_source"] == "live lookup"
+    _with_auto_ceiling_standin(check)
     plain = [r for r in json.loads(o.list_fleet())["fleet"] if r["model"] == "glm-5.3"][0]
     assert "budget_source" not in plain
 
@@ -2368,8 +2388,8 @@ def test_fleet_check_passes_a_healthy_fleet():
     assert res["ok"] is True and res["problems"] == [] and res["checked"] == 8
     assert {r["status"] for r in res["rows"]} == {"OK"}
     muse = [r for r in res["rows"] if r["model"] == MUSE_CORE][0]
-    assert muse["budget"] == 128_000 and muse["declared_ceiling"] == 943_718
-    assert muse["budget_source"] == "live lookup" and muse["reply"] == "OK"
+    assert muse["budget"] == 640_000 and muse["declared_ceiling"] == 943_718
+    assert "budget_source" not in muse and muse["reply"] == "OK"
     assert muse["price_out_per_m"] == 4.25 and muse["served_model"] == MUSE_CORE
     assert {m for m, _ in calls} == set(o._BUILTIN), "one tiny call per generator"
     assert {e for _, e in calls} == {"low"}, "the check never asks for deep reasoning"
@@ -2477,7 +2497,7 @@ def test_the_command_line_check_prints_a_table_and_sets_the_exit_code():
     _reset_lookups()
     code, text = run(_healthy_world())
     assert code == 0 and "FLEET OK" in text and f"OK        {MUSE_CORE}" in text
-    assert "budget 128,000" in text and "declared 943,718" in text
+    assert "budget 640,000" in text and "declared 943,718" in text
     _reset_lookups()
     msg = "[SUBSTITUTED] requested 'x' but the endpoint served 'y'"
     code, text = run(_healthy_world({MUSE_CORE: msg}))
