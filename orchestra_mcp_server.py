@@ -18,6 +18,8 @@ v20 — A DECISION MODEL TAKES PART IN ROUTING; MERCURY DECIDE REPLACED  (2026-1
      evidence, and for why the class is CN-OW (an inference from the base model).
   3. orchestra_parallel and orchestra_start take an optional task_id, so a routing
      ruling and the generator runs it triggered can be joined and graded together.
+  4. meta/muse-spark-1.3 output budget set to a hard 640,000 tokens at the operator's
+     request (was v19 auto_ceiling). See its registry comment.
 
 v19 — NO MORE GUESSED CEILINGS; ONE-COMMAND LIVE CHECK  (2026-10-06)
 --------------------------------------------------------------------
@@ -330,23 +332,21 @@ _MODELS = {
         # 128,000 max output / 1.05M context, $10 in / $50 out per 1M (OpenRouter
         # listing). Worst-case runaway at this budget is ~$6.40 per dispatch.
     "meta/muse-spark-1.3": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=64000, pin=None,
-        exact_served=True, auto_ceiling=True),
+        provider="openrouter", klass="US-CLOSED", max_out=640000, pin=None,
+        exact_served=True),
         # Added 2026-10-05 at the operator's request as a plain core entry. Meta, closed
         # weights, released 2026-09-02; 1,048,576 context; $1.25 in / $4.25 out per 1M
         # (OpenRouter listing, via a search summary).
-        # BUDGET — resolved live, not hard-coded. auto_ceiling=True makes the first dispatch
-        # of a process ask OpenRouter for the model's declared output ceiling; the budget is
-        # then min(declared, _CORE_MAX_OUT = 128,000), the fleet's cost/wall-time envelope
-        # (GPT Astra and Kimi both ran at 128,000: ~$0.54 worst case here, ~11 min at the
-        # ~191 tok/s AA measured). max_out=64,000 is only the FALLBACK, used when the lookup
-        # fails or declares nothing. Why 64,000: aggregator pages disagree on the ceiling —
-        # 943,718 (standard tier), 131,072 (one source), 65,536 (contributor tier) — and
-        # 64,000 fits every one of them, so a failed lookup cannot produce a rejected
-        # ceiling; it costs at most ~$0.27 per runaway. 943,718 is exactly 90% of the
-        # context window, the same figure recorded for Kimi K3 on OpenRouter, so it reads as
-        # OpenRouter's convention rather than a Meta limit (inference). `fleet_check` shows
-        # the declared ceiling next to the budget actually used.
+        # BUDGET — operator-set HARD ceiling of 640,000 output tokens (2026-10-10, by
+        # explicit operator request; the operator confirms the served tier supports it).
+        # This supersedes v19's auto_ceiling for this model: auto_ceiling existed to resolve
+        # a ceiling we did not know, and the operator has now set one deliberately, so the
+        # number is fixed here, not looked up and trimmed. The budget is a CEILING, not a
+        # target (billing is on actual output), but at $4.25/M output a full 640,000-token
+        # run is ~$2.72 worst case — keep it for work that needs the length. fleet_check
+        # still reads the live declared ceiling and FLAGS this budget if the host declares
+        # less (every call would then be rejected): run it after this change. The
+        # auto_ceiling machinery (_live_ceiling, _CORE_MAX_OUT) stays for future entries.
         # TWO TIERS. meta/muse-spark-1.3-contributor is the same model at $0.10/$0.20 on
         # terms where prompts and outputs may be used to improve Meta's products. This
         # entry is the STANDARD tier, and exact_served=True makes provenance exact: the
