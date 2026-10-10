@@ -837,6 +837,18 @@ def _with_fake_decisions(handler, fn):
 
 
 Q = {"needs_fleet": {"type": "noul", "instructions": "Does `task` need another model?"}}
+DECIDER = "perplexity/pplx-decider-v1.1-27b"
+
+
+def _with_standin_decider(klass, fn):
+    """Run fn(slug) with a throwaway decision model of the given class registered, to
+    test class rules the core bench no longer has a same-class pair for."""
+    slug = "acme/decide-x"
+    o._DECIDERS[slug] = dict(klass=klass, ctx=32_000, seat="screener", free=False)
+    try:
+        return fn(slug)
+    finally:
+        o._DECIDERS.pop(slug, None)
 
 
 def test_question_validation():
@@ -877,11 +889,17 @@ def test_decide_flags_substitution_and_missing_answers():
         lambda url, **kw: _FakeResp(200, {"model": "typesafe/jev-1.13", "answers": {}}),
         lambda: o._decide_raw("typesafe/jev-1.13", "s", Q))
     assert miss["error"].startswith("[ERROR]") and "needs_fleet" in miss["error"]
-    free = _with_fake_decisions(
-        lambda url, **kw: _FakeResp(200, {"model": "inception/mercury-decide-0930",
+    dated = _with_fake_decisions(
+        lambda url, **kw: _FakeResp(200, {"model": "perplexity/pplx-decider-v1.1-27b-20261006",
                                           "answers": {"needs_fleet": {"noul": 0.2}}}),
-        lambda: o._decide_raw("inception/mercury-decide:free", "s", Q))
-    assert "answers" in free, "the :free suffix must not trip provenance"
+        lambda: o._decide_raw(DECIDER, "s", Q))
+    assert "answers" in dated, "a dated build of the pinned version is accepted"
+    older = _with_fake_decisions(
+        lambda url, **kw: _FakeResp(200, {"model": "perplexity/pplx-decider-v1-27b",
+                                          "answers": {"needs_fleet": {"noul": 0.2}}}),
+        lambda: o._decide_raw(DECIDER, "s", Q))
+    assert older["error"].startswith("[SUBSTITUTED]"), \
+        "Decider V1 is a different checkpoint from V1.1 and must not answer for it"
 
 
 def test_decide_skips_states_that_overflow_context():
@@ -906,7 +924,8 @@ def test_decide_without_key_is_skipped_not_raised():
 
 
 def test_panel_refuses_single_class():
-    err = o._check_panel(["typesafe/jev-1.13", "inception/mercury-decide:free"])
+    err = _with_standin_decider("US-CLOSED",
+                                lambda slug: o._check_panel(["typesafe/jev-1.13", slug]))
     assert err and "single-class" in err
     assert o._check_panel(list(o._DEFAULT_PANEL)) is None
 
@@ -1034,8 +1053,8 @@ def test_panel_end_to_end_reports_cross_class_agreement():
     res = json.loads(_with_fake_decisions(handler, lambda: o.decide_panel(
         {"task": "x"}, Q)))
     assert res["agreement"]["needs_fleet"]["cross_class_agree"] is True, res
-    bad = json.loads(o.decide_panel({"task": "x"}, Q,
-                                    ["typesafe/jev-1.13", "inception/mercury-decide:free"]))
+    bad = json.loads(_with_standin_decider("US-CLOSED", lambda slug: o.decide_panel(
+        {"task": "x"}, Q, ["typesafe/jev-1.13", slug])))
     assert "single-class" in bad["error"]
 
 
@@ -1510,7 +1529,7 @@ GUEST = "meta/muse-spark-9"
 
 def test_slug_shapes():
     for ok in ("meta/muse-spark-9", "openai/gpt-astra-latest", "~openai/gpt-astra-latest",
-               "inception/mercury-decide:free", "z-ai/glm-5.3-prime", "meta/muse-spark-9-contributor"):
+               "acme/decide-x:free", "z-ai/glm-5.3-prime", "meta/muse-spark-9-contributor"):
         assert o._SLUG.match(ok), ok
     for bad in ("deepseek-v4-pro", "glm-5.3", "", "meta/", "/muse", "Meta Muse/spark",
                 "a/b/c", "meta/muse spark", "../etc/passwd", 'x/y"; drop'):
@@ -1623,7 +1642,7 @@ def test_guest_provenance_demands_the_requested_model_not_a_lookalike():
     assert ok("muse-spark-9", GUEST), "a tail-only served name is accepted"
     assert ok("openai/gpt-6-astra-20260911", "~openai/gpt-astra-latest")
     assert not ok("anthropic/claude-x", "~openai/gpt-astra-latest")
-    assert ok("inception/mercury-decide", "inception/mercury-decide:free")
+    assert ok("acme/decide-x", "acme/decide-x:free"), "a :free suffix must not trip provenance"
     cfg = {"extra": True, "provider": "openrouter", "api_id": None}
     bad = o._check_provenance({"model": "meta/muse-spark-9-contributor"}, GUEST, cfg)
     assert bad and bad.startswith("[SUBSTITUTED]")
@@ -2475,6 +2494,331 @@ def test_the_command_line_check_prints_a_table_and_sets_the_exit_code():
                      OPENROUTER_API_KEY=None)
     assert code == 2, "exit 2: nothing could be tested, which is not the same as healthy"
     assert "NOTHING WAS TESTED" in text and "FLEET OK" not in text
+
+# ---------------------------------------------------------------------------
+# v20 — a decision model takes part in routing; Mercury Decide replaced
+# ---------------------------------------------------------------------------
+
+def test_the_core_bench_is_three_classes_and_has_no_free_tier():
+    classes = {m: e["klass"] for m, e in o._DECIDERS.items()}
+    assert len(set(classes.values())) == 3, classes
+    assert not any(e["free"] for e in o._DECIDERS.values()), \
+        "the free tier's rate limit and unconfirmed data terms are why Mercury Decide went"
+    assert "inception/mercury-decide:free" not in o._DECIDERS
+    assert o._DECIDERS[DECIDER]["klass"] == "CN-OW", "classed by base lineage (inference)"
+    assert o._check_panel([o._GATEKEEPER, DECIDER]) is None, "Jev + Decider is cross-class"
+
+
+def test_every_core_generator_has_a_routing_blurb_and_every_router_is_a_decider():
+    core = [m for m, e in o._MODELS.items() if not e.get("extra")]
+    assert [m for m in core if m not in o._ROUTE_BLURB] == [], \
+        "a model without a blurb is routed on 'no description on file'"
+    assert all(m in o._DECIDERS for m in o._ROUTER_CHAIN)
+    assert o._ROUTER_CHAIN[0] == o._GATEKEEPER
+
+
+_ROUTER_KEYS = ("OPENROUTER_API_KEY", "ZHIPU_API_KEY", "DEEPSEEK_API_KEY")
+
+
+def _router_world(handler, fn, keys=_ROUTER_KEYS, mode=None):
+    """Run fn(log_path) with a fake decisions endpoint, a temp log, exactly `keys` set
+    and ORCHESTRA_ROUTER_MODE set (or cleared when mode is None); restore everything."""
+    import tempfile
+    names = _ROUTER_KEYS + ("ORCHESTRA_ROUTER_MODE",)
+    saved = {k: os.environ.get(k) for k in names}
+    original_post, original_log = requests.post, o._LOG_PATH
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            for k in _ROUTER_KEYS:
+                if k in keys:
+                    os.environ[k] = "dummy-test-key"
+                else:
+                    os.environ.pop(k, None)
+            if mode is None:
+                os.environ.pop("ORCHESTRA_ROUTER_MODE", None)
+            else:
+                os.environ["ORCHESTRA_ROUTER_MODE"] = mode
+            requests.post = handler
+            o._LOG_PATH = o.Path(d) / "log.jsonl"
+            return fn(o._LOG_PATH)
+        finally:
+            requests.post, o._LOG_PATH = original_post, original_log
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+def _router_handler(target=None, adequate=0.9, inadequate=0.1, fail=(), top=0.8):
+    """A fake decisions endpoint. It prefers the option whose description starts with
+    `target` (None: always the first-listed option, a position-biased judge), answers the
+    adequacy pair with the given probabilities, and answers HTTP 400 for models in `fail`."""
+    seen = []
+
+    def handler(url, **kw):
+        body = kw["json"]
+        model, qs = body["model"], body["questions"]
+        seen.append((model, body))
+        if model in fail:
+            return _FakeResp(400, {"error": "unavailable"})
+        answers = {}
+        if "pick" in qs:
+            crit = qs["pick"]["criteria"]
+            alias = next((a for a, txt in crit.items()
+                          if target and txt.startswith(target + " ")), "c1")
+            rest = (1 - top) / (len(crit) - 1)
+            answers["pick"] = {"type": "choice", "choice": alias, "confidence": top,
+                               "probabilities": {a: top if a == alias else rest for a in crit}}
+        if "adequate" in qs:
+            answers["adequate"] = {"type": "noul", "noul": adequate}
+            answers["inadequate"] = {"type": "noul", "noul": inadequate}
+        return _FakeResp(200, {"model": model, "answers": answers})
+    handler.seen = seen
+    return handler
+
+
+ASTRA, GLM = "openai/gpt-astra-latest", "glm-5.3"
+
+
+def test_route_decide_serves_a_clean_ruling_and_logs_it():
+    h = _router_handler(GLM)
+
+    def run(path):
+        res = json.loads(o.route_decide("swe", task_gist="fix the parser", task_id="rt-1"))
+        assert res["task_id"] == "rt-1" and res["router_model"] == o._GATEKEEPER, res
+        assert res["router_pick"] == res["evidence_pick"] == res["serve"] == GLM
+        assert res["accepted"] and res["order_consistent"] and res["polarity_consistent"]
+        assert res["explore"] is None and res["agree"] is True
+        assert len(h.seen) == 3 and {m for m, _ in h.seen} == {o._GATEKEEPER}
+        picks = [b for _, b in h.seen if "pick" in b["questions"]]
+        firsts = {next(iter(b["questions"]["pick"]["criteria"].values())).split(" ")[0]
+                  for b in picks}
+        assert len(picks) == 2 and len(firsts) == 2, \
+            "the two pick calls must list the candidates in opposite orders"
+        assert picks[0]["state"]["task_gist"] == "fix the parser"
+        rows = [json.loads(x) for x in open(path, encoding="utf-8")]
+        rulings = [r for r in rows if r["type"] == "route_ruling"]
+        assert len(rulings) == 1 and rulings[0]["task_id"] == "rt-1" and rulings[0]["accepted"]
+    _router_world(h, run)
+
+
+def test_route_decide_asks_for_both_picks_only_on_a_disagreement_with_an_l1_check():
+    h = _router_handler(ASTRA)
+
+    def run(path):
+        a = json.loads(o.route_decide("swe", has_l1=True, task_id="d1"))
+        assert a["evidence_pick"] == GLM and a["router_pick"] == ASTRA and a["serve"] == ASTRA
+        assert a["explore"] == {"run_both": [ASTRA, GLM]} and "task_id='d1'" in a["next"]
+        b = json.loads(o.route_decide("swe", has_l1=False, task_id="d2"))
+        assert b["explore"] is None and b["serve"] == ASTRA, \
+            "without an L1 check a head-to-head would only be Claude-judged, so it is not asked for"
+    _router_world(h, run)
+
+
+def test_route_decide_refuses_a_ruling_that_flips_with_the_option_order():
+    def run(path):
+        res = json.loads(o.route_decide("swe", has_l1=True))
+        assert res["order_consistent"] is False and res["accepted"] is False
+        assert res["serve"] == res["evidence_pick"] and "option order" in res["serve_why"]
+        assert res["explore"] is None, "a refused ruling grades nothing"
+    _router_world(_router_handler(None), run)
+
+
+def test_a_measured_leader_outranks_the_router_but_the_disagreement_is_still_graded():
+    def run(path):
+        _seed_outcomes(path, "swe", GLM, 10, 5)          # prior primary, measured 50%
+        _seed_outcomes(path, "swe", ASTRA, 10, 9)        # measured 90%: the measured leader
+        res = json.loads(o.route_decide("swe", has_l1=True))
+        assert res["evidence_pick"] == ASTRA and res["evidence_source"] == "measured"
+        assert res["router_pick"] == GLM and res["accepted"], res
+        assert res["serve"] == ASTRA and "MEASURED" in res["serve_why"], \
+            "an unproven router must not overrule measured outcomes"
+        assert res["explore"] == {"run_both": [GLM, ASTRA]}, "but it is still graded"
+    _router_world(_router_handler(GLM), run)
+
+
+def test_route_decide_refuses_a_ruling_below_the_acceptance_probability():
+    def weak(path):
+        res = json.loads(o.route_decide("swe"))
+        assert res["order_consistent"] and res["p_pick"] == 0.45 and res["accepted"] is False
+        assert res["serve"] == GLM and "below" in res["serve_why"]
+    _router_world(_router_handler(ASTRA, top=0.45), weak)
+
+    def firm(path):
+        res = json.loads(o.route_decide("swe"))
+        assert res["p_pick"] == 0.65 and res["accepted"] is True and res["serve"] == ASTRA
+    _router_world(_router_handler(ASTRA, top=0.65), firm)
+
+
+def test_route_decide_refuses_a_ruling_that_contradicts_its_own_negation():
+    def run(path):
+        res = json.loads(o.route_decide("swe"))
+        assert res["polarity_consistent"] is False and res["accepted"] is False
+        assert res["serve"] == GLM and "negation" in res["serve_why"]
+    _router_world(_router_handler(ASTRA, adequate=0.9, inadequate=0.9), run)
+
+
+def test_route_decide_shadow_mode_logs_the_ruling_but_the_evidence_pick_serves():
+    def shadow(path):
+        res = json.loads(o.route_decide("swe"))
+        assert res["mode"] == "shadow" and res["accepted"] and res["router_pick"] == ASTRA
+        assert res["serve"] == GLM and "shadow" in res["serve_why"]
+    _router_world(_router_handler(ASTRA), shadow, mode="shadow")
+
+    def junk(path):
+        res = json.loads(o.route_decide("swe"))
+        assert res["mode"] == "shadow" and "not active|shadow" in res["mode_note"], \
+            "an unrecognised mode must fail safe, not silently go active"
+    _router_world(_router_handler(ASTRA), junk, mode="activ")
+
+
+def _seed_head_to_head(path, n, router_right, basis="L1", rulings=True, tag="h"):
+    """n logged rulings that asked for both picks to run, graded: the router's pick was
+    right on `router_right` of them, the evidence pick on the rest."""
+    with open(path, "a", encoding="utf-8") as f:
+        for i in range(n):
+            tid = f"{tag}{i}"
+            if rulings:
+                f.write(json.dumps({"type": "route_ruling", "task_id": tid, "router_pick": ASTRA,
+                                    "evidence_pick": GLM, "accepted": True, "explore": True,
+                                    "mode": "active"}) + "\n")
+            for m, ok in ((ASTRA, i < router_right), (GLM, i >= router_right)):
+                f.write(json.dumps({"type": "outcome", "task_id": tid, "model": m,
+                                    "correctness": "CORRECT" if ok else "WRONG",
+                                    "basis": basis}) + "\n")
+
+
+def test_the_router_is_graded_and_loses_authority_when_it_falls_behind():
+    h = _router_handler(ASTRA)
+
+    def behind(path):
+        _seed_head_to_head(path, 12, router_right=2)
+        rec = o._router_record(o._read_log())
+        assert rec["state"] == "behind" and rec["router_wins"] == 2 and rec["evidence_wins"] == 10
+        res = json.loads(o.route_decide("swe"))
+        assert res["accepted"] and res["serve"] == GLM and "demoted" in res["serve_why"]
+    _router_world(h, behind)
+
+    def ahead(path):
+        _seed_head_to_head(path, 12, router_right=11)
+        assert o._router_record(o._read_log())["state"] == "ahead"
+        assert json.loads(o.route_decide("swe"))["serve"] == ASTRA
+    _router_world(h, ahead)
+
+    def thin(path):
+        _seed_head_to_head(path, 9, router_right=0)
+        assert o._router_record(o._read_log())["state"] == "unproven", \
+            "nine head-to-heads decide nothing, even all in one direction"
+        assert json.loads(o.route_decide("swe"))["serve"] == ASTRA
+    _router_world(h, thin)
+
+    def unverified(path):
+        _seed_head_to_head(path, 12, router_right=0, basis="JUDGED")
+        rec = o._router_record(o._read_log())
+        assert rec["state"] == "unproven" and rec["ungraded_unverified"] == 12
+        assert rec["evidence_wins"] == 0, "Claude-judged verdicts do not grade the router"
+    _router_world(h, unverified)
+
+    def ties(path):
+        _seed_head_to_head(path, 12, router_right=12)          # router right on all
+        with open(path, "a", encoding="utf-8") as f:
+            for i in range(12):                                 # ...and the evidence pick too
+                f.write(json.dumps({"type": "outcome", "task_id": f"h{i}", "model": GLM,
+                                    "correctness": "CORRECT", "basis": "L1"}) + "\n")
+        rec = o._router_record(o._read_log())
+        assert rec["ties"] == 12 and rec["router_wins"] == 0, "both right says nothing"
+    _router_world(h, ties)
+
+    def waiting(path):
+        _seed_head_to_head(path, 5, router_right=5)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "route_ruling", "task_id": "none-yet", "router_pick": ASTRA,
+                                "evidence_pick": GLM, "accepted": True, "explore": True}) + "\n")
+        assert o._router_record(o._read_log())["awaiting_verdicts"] == 1
+    _router_world(h, waiting)
+
+
+def test_route_decide_falls_down_the_bench_when_the_gatekeeper_is_down():
+    def one_down(path):
+        res = json.loads(o.route_decide("swe"))
+        assert res["router_model"] == DECIDER and o._GATEKEEPER in res["tried"], res
+        assert res["accepted"] and res["serve"] == GLM
+    _router_world(_router_handler(GLM, fail=(o._GATEKEEPER,)), one_down)
+
+    def all_down(path):
+        res = json.loads(o.route_decide("swe"))
+        assert res["error"].startswith("[ERROR]") and res["serve"] == GLM
+        assert set(res["tried"]) == set(o._ROUTER_CHAIN)
+    _router_world(_router_handler(GLM, fail=o._ROUTER_CHAIN), all_down)
+
+
+def test_route_decide_offers_only_models_that_may_do_the_job_and_have_keys():
+    h = _router_handler(ASTRA)
+
+    def offered(h):
+        picks = [b for _, b in h.seen if "pick" in b["questions"]]
+        return " ".join(picks[0]["questions"]["pick"]["criteria"].values())
+
+    def verifier(path):
+        o.route_decide("factual", role="verifier")
+        text = offered(h)
+        assert "deepseek-v4.1-flash" not in text and "meta/muse-spark-1.3" not in text, \
+            "models barred from factual roles are not candidates for them"
+        assert GLM in text and ASTRA in text
+    _router_world(h, verifier)
+
+    h2 = _router_handler(ASTRA)
+
+    def only_openrouter(path):
+        o.route_decide("swe")
+        text = offered(h2)
+        assert ASTRA in text and "meta/muse-spark-1.3" in text
+        assert GLM not in text and "deepseek-v4-pro" not in text, "no key, no candidacy"
+    _router_world(h2, only_openrouter, keys=("OPENROUTER_API_KEY",))
+
+    h3 = _router_handler(ASTRA)
+
+    def one_model(path):
+        res = json.loads(o.route_decide("swe"))
+        assert res["serve"] == GLM and res["router_pick"] is None and h3.seen == []
+    _router_world(h3, one_model, keys=("ZHIPU_API_KEY",))
+
+    def no_keys(path):
+        assert json.loads(o.route_decide("swe"))["error"].startswith("[SKIPPED]")
+    _router_world(_router_handler(ASTRA), no_keys, keys=())
+
+    def bad_input(path):
+        assert "work_type" in json.loads(o.route_decide("nonsense"))["error"]
+        assert "task_id" in json.loads(o.route_decide("swe", task_id="a b"))["error"]
+    _router_world(_router_handler(ASTRA), bad_input)
+
+
+def test_dispatch_tools_take_a_caller_supplied_task_id():
+    assert o._task_id_arg("") == ("", None) and o._task_id_arg(" ab-1.x ") == ("ab-1.x", None)
+    for bad in ("../x", "a b", "-lead", "x" * 65):
+        assert o._task_id_arg(bad)[1].startswith("[ERROR]"), bad
+    fleet = _FakeFleet({GLM: "A", ASTRA: "B"})
+    out = json.loads(_with_fake_fleet(fleet, lambda: o.orchestra_parallel(_brief(), task_id="rt-9")))
+    assert out["task_id"] == "rt-9" and len(fleet.calls) == 2
+    assert o.orchestra_parallel(_brief(), task_id="a b").startswith("[ERROR]")
+    assert json.loads(o.orchestra_start("model", _brief(), task_id="a b"))["status"] == "failed"
+    assert "task_id" in inspect.signature(o.orchestra_start).parameters
+
+
+def test_fleet_stats_reports_routing_and_the_routers_record():
+    def run(path):
+        o.route_decide("swe", has_l1=True)
+        r = json.loads(o.fleet_stats())["routing"]
+        assert r["rulings"] == 1 and r["accepted"] == 1 and r["both_picks_run"] == 1
+        assert r["router_record"]["state"] == "unproven" and r["by_mode"] == {"active": 1}
+    _router_world(_router_handler(ASTRA), run)
+
+    def unused(path):
+        _seed_outcomes(path, "swe", GLM, 1, 1)
+        assert "no routing rulings" in json.loads(o.fleet_stats())["routing"]
+    _router_world(_router_handler(ASTRA), unused)
+
 
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
