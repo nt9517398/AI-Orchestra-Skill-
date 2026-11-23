@@ -332,7 +332,7 @@ _MODELS = {
         # 128,000 max output / 1.05M context, $10 in / $50 out per 1M (OpenRouter
         # listing). Worst-case runaway at this budget is ~$6.40 per dispatch.
     "meta/muse-spark-1.3": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=640000, pin=None,
+        provider="openrouter", klass="US-CLOSED", max_out=640000, pin="Meta",
         exact_served=True),
         # Added 2026-10-05 at the operator's request as a plain core entry. Meta, closed
         # weights, released 2026-09-02; 1,048,576 context; $1.25 in / $4.25 out per 1M
@@ -354,8 +354,22 @@ _MODELS = {
         # Class US-CLOSED by the fleet's lab-lineage convention (country + openness). That
         # makes it same-class as GPT Astra: the two cannot cross-check each other. A prior,
         # not a measurement; give it its own class here if that pairing is wanted.
-        # Unpinned: default routing; the served host is logged on every dispatch.
+        # Pinned to Meta by the operator, 2026-11-23: the same slug was served by both Meta
+        # and Google, on different hosts, in one session.
         # Unvetted for factual roles: see _UNVETTED.
+    "meta/muse-ember": dict(
+        provider="openrouter", klass="US-CLOSED", max_out=128000, pin="Meta",
+        exact_served=True),
+        # Added 2026-11-23 (v21 plan). $0.10 in / $0.50 out per 1M; 1.05M context. For
+        # repeated tool calls, subtasks, extraction and first drafts. Same family as Muse
+        # Spark, so the two can never cross-check each other. Unvetted for factual roles.
+    "ibm-granite/granite-4.2-8b": dict(
+        provider="openrouter", klass="US-OW", max_out=64000, pin="CoreWeave",
+        exact_served=True),
+        # Added 2026-11-23 (v21 plan). $0.06 in / $0.15 out per 1M on CoreWeave; 131K
+        # context. For math and code where a deterministic check grades it. Class US-OW:
+        # OpenRouter lists a Hugging Face id, so open weights. A lineage prior, not a
+        # measured independence result. Unvetted for factual roles.
 }
 
 # Models that must never be the source of a factual PASS (fleet-card 'Verification
@@ -365,7 +379,20 @@ _NO_VERIFY = frozenset({"deepseek-v4.1-flash"})
 # generate, critique, extract and plan, but hold no factual role (verifier, memory keeper)
 # until their record earns one — fleet-card 'Verification eligibility': a model is not
 # added to the verifier column on novelty or index alone. Remove an id here to grant it.
-_UNVETTED = frozenset({"meta/muse-spark-1.3"})
+_UNVETTED = frozenset({"meta/muse-spark-1.3", "meta/muse-ember",
+                       "ibm-granite/granite-4.2-8b"})
+
+# v21 ROUTERS. OpenRouter picks the model at run time, so a router can never be a verifier:
+# cross-class checks need to know who answered BEFORE the call. Routers are deliberately
+# NOT in _MODELS, which keeps them out of parallel, adversarial, workflows, route_decide and
+# every factual role by construction. Only call_router reaches them. The allowlist and the
+# host list are enforced on the request AND checked on the response.
+_ROUTERS = {
+    "openrouter/auto": dict(
+        provider="openrouter", klass="ROUTER", max_out=64000,
+        allowed=("meta/muse-spark-1.3", "meta/muse-ember", "ibm-granite/granite-4.2-8b"),
+        hosts=("Meta", "CoreWeave")),
+}
 
 # ---------------------------------------------------------------------------
 # v16 DECISION BENCH — System One models. They do not generate text.
@@ -391,8 +418,11 @@ _DECIDERS = {
         klass="US-CLOSED", ctx=32_000, seat="gatekeeper", free=False),
         # $0.042/M in, $0 out. 0.14-0.32s measured by SIL. Best-calibrated of the
         # models SIL tested. Pinned build; ~typesafe/jev-latest floats.
-    "perplexity/pplx-decider-v1.1-27b": dict(
+    "perplexity/pplx-decider-v1.2": dict(
         klass="CN-OW", ctx=262_144, seat="screener", free=False),
+        # 2026-11-23: replaced v1.1-27b, whose decisions endpoint returned 404. v1.2 won a
+        # small bake-off over google/gemini-decision-1 (both 18/18 and 8/8; Brier 0.000 vs
+        # 0.002) and is the same API contract. Notes below were written for v1.1.
         # $0.02/M in (OpenRouter listing), $0 out; 262K context; ~187 ms listed. Replaced
         # the free Mercury Decide (rate-limited, ~200 req/day per a third-party listing;
         # training terms unconfirmed). Class by BASE lineage, an inference: BenchLM (third
@@ -410,7 +440,10 @@ _DECIDERS = {
 }
 _QTYPES = ("noul", "choice", "score")
 _GATEKEEPER = "typesafe/jev-1.13"
-_DEFAULT_PANEL = ("typesafe/jev-1.13", "upstage/solar-decide")   # cross-class by construction
+# 2026-11-23: Solar left the default panel. It misread inverted questions in live tests
+# (11/16 vs 16/16 for Jev and Decider v1.2; FINDINGS-2026-11-23.md, D10). It stays available
+# for states too large for the others: pass it explicitly, with positive-form questions.
+_DEFAULT_PANEL = ("typesafe/jev-1.13", "perplexity/pplx-decider-v1.2")   # cross-class by construction
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +832,11 @@ _load_extras()
 def _resolve(model: str) -> dict:
     """Single lookup point. Fails with a specific, actionable message — never a bare
     KeyError from a dict literal buried inside a calling function (the v13 defect)."""
+    if model in _ROUTERS:
+        m = dict(_ROUTERS[model])
+        m.update(_CONFIGS[m["provider"]])
+        m["key"] = os.environ.get(m["key_env"], "")
+        return m
     if model not in _MODELS:
         raise KeyError(f"{model!r} is not in _MODELS — add a registry entry before "
                        f"dispatch. Known models: {sorted(_MODELS)}")
@@ -830,6 +868,8 @@ def _provider_block(cfg: dict) -> dict:
     """
     if cfg["provider"] != "openrouter":
         return {}
+    if cfg.get("allowed"):                 # a router: only the approved hosts
+        return {"provider": {"only": list(cfg["hosts"]), "allow_fallbacks": False}}
     if cfg.get("order"):
         return {"provider": {"order": cfg["order"],
                              "allow_fallbacks": False,
@@ -852,6 +892,11 @@ def _served_tokens(model: str, cfg: dict) -> tuple:
     return (wire.lstrip("~").split("/")[-1].split(":")[0],)
 
 
+def _router_member(served: str, cfg: dict) -> Optional[str]:
+    """The allowlisted model this served name is (exact or a dated build), or None."""
+    return next((a for a in cfg["allowed"] if _served_ok(served, a)), None)
+
+
 def _check_provenance(body: dict, model: str, cfg: dict):
     """v14 — return a [SUBSTITUTED] string, or None when provenance is clean.
 
@@ -863,6 +908,14 @@ def _check_provenance(body: dict, model: str, cfg: dict):
     """
     served_model = (body.get("model") or "").strip()
     served_prov = (body.get("provider") or "").strip()
+    if cfg.get("allowed"):
+        if served_model and not _router_member(served_model, cfg):
+            return (f"[SUBSTITUTED] router {model!r} served {served_model!r}, which is not "
+                    f"on its allowlist {list(cfg['allowed'])} — discard this output")
+        if served_prov and served_prov.lower() not in {h.lower() for h in cfg["hosts"]}:
+            return (f"[SUBSTITUTED] router {model!r} used host {served_prov!r}, not one of "
+                    f"{list(cfg['hosts'])} — discard this output")
+        return None
     if served_model and not (_served_ok(served_model, cfg.get("api_id") or model)
                              if (cfg.get("extra") or cfg.get("exact_served")) else
                              any(t in served_model for t in _served_tokens(model, cfg))):
@@ -1207,6 +1260,8 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
     payload = {"model": cfg.get("api_id") or model, "messages": messages,
                "max_tokens": cfg["max_out"], "stream": True}
     payload.update(_provider_block(cfg))     # OpenRouter pin; no-op for direct APIs
+    if cfg.get("allowed"):
+        payload["plugins"] = [{"id": "auto-router", "allowed_models": list(cfg["allowed"])}]
     if provider == "glm":
         # GLM-5.3 cannot disable thinking; thinking.type="disabled" hard-FAILS.
         payload["thinking"] = {"type": "enabled"}
@@ -1276,7 +1331,7 @@ def _source(model: str) -> str:
 
 
 def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=None,
-                 work_type="", **call_kwargs):
+                 work_type="", meta_out=None, **call_kwargs):
     """Wrap the pure _call() so every user-facing dispatch appends EXACTLY ONE log row.
     Placed only at LEAF call sites — never around a path that itself calls _logged_call
     — so _call's internal timeout/429/5xx retries stay invisible and one logical
@@ -1293,17 +1348,22 @@ def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=Non
     dispatches would vanish from the log and it would look the most reliable."""
     t0 = time.time()
     out = None
-    meta = {}
+    meta = {} if meta_out is None else meta_out
     try:
         out = _call(model, messages, meta=meta, **call_kwargs)
         return out
     finally:
         tag = _outcome_tag(out) if isinstance(out, str) else "UNCAUGHT"
+        # A routed call is credited to the model that served it, so route_evidence and
+        # fleet_stats measure real models and never a moving target.
+        credited = (_router_member(meta.get("model", ""), _ROUTERS[model]) or model
+                    if model in _ROUTERS else model)
         _log_event({"type": "dispatch", "ts": _now(), "task_id": task_id,
-                    "model": model, "klass": _MODELS.get(model, {}).get("klass", "?"),
-                    "provider": _MODELS.get(model, {}).get("provider", "?"),
+                    "model": credited, "klass": _MODELS.get(credited, {}).get("klass", "?"),
+                    "provider": _MODELS.get(credited, {}).get("provider", "?"),
+                    **({"via": model} if model in _ROUTERS else {}),
                     "mode": mode, "role": role, "outcome": tag,
-                    "source": _source(model),
+                    "source": _source(credited),
                     "work_type": work_type,
                     "out_chars": len(out) if isinstance(out, str) else 0,
                     "served_model": meta.get("model", ""),
@@ -2428,6 +2488,43 @@ def check_job(job_id: str, wait_seconds: int = 25) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
+def call_router(brief: Union[dict, str], router: str = "openrouter/auto",
+                reasoning_effort: str = "low") -> str:
+    """Let OpenRouter pick the model for LOW-STAKES generator work, inside the approved
+    allowlist and hosts (list_fleet shows them). QUICK tasks only.
+
+    Generator role only: a router cannot verify, critique, extract or ratify, because who
+    answers is decided at run time. Context marked sensitive is refused. A reply from
+    outside the allowlist returns [SUBSTITUTED]. The dispatch is logged under the model
+    that served it; call log_outcome with `served_model`, never with the router's name.
+
+    Returns JSON {task_id, router, served_model, served_host, outcome, content}.
+    """
+    if router not in _ROUTERS:
+        return json.dumps({"error": f"[ERROR] unknown router {router!r} — known: "
+                                    f"{sorted(_ROUTERS)}"})
+    b, err = _validate_brief(brief, router)
+    if err:
+        return json.dumps({"error": f"[ERROR] invalid brief: {err}"})
+    if b["role"] != "generator":
+        return json.dumps({"error": f"[ERROR] {router} may only take the generator role, got "
+                                    f"{b['role']!r} — who answers is decided at run time, so "
+                                    f"it cannot hold a checking role"})
+    if any(i.get("sensitive") for i in b["context"]):
+        return json.dumps({"error": f"[ERROR] {router} may not receive context marked "
+                                    f"sensitive"})
+    task_id, meta = _new_task_id(), {}
+    out = _logged_call(router, _render_brief(b, task_id), task_id=task_id, role=b["role"],
+                       mode="router", contract=b["output_contract"],
+                       work_type=b.get("work_type", ""), reasoning_effort=reasoning_effort,
+                       meta_out=meta)
+    return json.dumps({"task_id": task_id, "router": router,
+                       "served_model": meta.get("model", ""),
+                       "served_host": meta.get("provider", ""),
+                       "outcome": _outcome_tag(out), "content": out}, ensure_ascii=False)
+
+
+@mcp.tool()
 def call_model(model: str, brief: Union[dict, str], reasoning_effort: str = "max") -> str:
     """Call ONE generator with a structured brief and WAIT. QUICK tasks only; for deep
     work use orchestra_start(mode="model", model=..., brief=...).
@@ -2505,7 +2602,7 @@ def decide(model: str, state: Union[dict, str], questions: dict) -> str:
     """Ask ONE decision model typed questions about a state. Returns calibrated
     probabilities, not text.
 
-    model: typesafe/jev-1.13 (gatekeeper, 32K), perplexity/pplx-decider-v1.1-27b
+    model: typesafe/jev-1.13 (gatekeeper, 32K), perplexity/pplx-decider-v1.2
       (screener, 262K, $0.02/M), upstage/solar-decide (long-context judge, 512K, slow) — or, with the dynamic fleet enabled (off by default), any OpenRouter
       decision model by author/name slug, which is looked up and tried as a guest.
     state: the facts, as named JSON fields (preferred) or a string. Reference fields in
@@ -2534,7 +2631,7 @@ def decide_panel(state: Union[dict, str], questions: dict,
     classes, concurrently, and report per-question cross-class agreement. This is how a
     process ruling (gate, route, stop) or a ratification check is CONFIRMED rather than
     taken from one model. Default panel: typesafe/jev-1.13 [US-CLOSED] +
-    upstage/solar-decide [KR-CLOSED]. Single-class panels are refused.
+    perplexity/pplx-decider-v1.2 [CN-OW]. Single-class panels are refused.
 
     Agreement is descriptive: noul agree = same side of 0.5 and within 0.25; choice
     agree = same pick; score agree = within 0.5 levels. What a disagreement means is
@@ -2552,9 +2649,9 @@ def decide_compare(instructions: str, candidate_a: str, candidate_b: str,
     two code fixes). Each model is asked in BOTH orders and the distributions are
     averaged, cancelling position bias; candidates carry no authorship, so a model
     cannot favour Claude's draft or its own lab's. Default judges: typesafe/jev-1.13 +
-    upstage/solar-decide (cross-class). Candidates too long for Jev's 32K context are
-    skipped for Jev automatically and Solar (512K) still judges — but a single judge is
-    not cross-class agreement, so agreed_winner stays null and Solar's verdict is
+    perplexity/pplx-decider-v1.2 (cross-class). Candidates too long for Jev's 32K context are
+    skipped for Jev automatically and the Decider (262K) still judges — but a single judge is
+    not cross-class agreement, so agreed_winner stays null and the Decider's verdict is
     advisory. To get a binding ruling on long candidates, compare them section by
     section under ~29K tokens.
 
@@ -2831,8 +2928,36 @@ def _check_decider(model: str) -> dict:
         return {**row, "status": "SKIPPED", "note": err[:160]}
     if err:
         return {**row, "status": "PROBLEM", "problems": [err[:240]]}
-    return {**row, "status": "OK", "served_model": res.get("served_model", ""),
-            "p_greeting": (res["answers"].get("greeting") or {}).get("noul")}
+    row.update(served_model=res.get("served_model", ""),
+               p_greeting=(res["answers"].get("greeting") or {}).get("noul"))
+    trouble = _polarity_canary(model)
+    if trouble and model in _DEFAULT_PANEL:
+        return {**row, "status": "PROBLEM", "problems": [trouble]}
+    return {**row, "status": "OK", "warnings": [trouble] if trouble else []}
+
+
+# Solar Decide once answered wording rather than meaning (FINDINGS-2026-11-23, D10). Each
+# case is true for `holds` and false for its inverted twin `fails`.
+_POLARITY_CANARY = (
+    ({"number": 4}, "Is `number` even?", "Is `number` odd?"),
+    ({"source": "3 of 8 runs crashed.", "summary": "Three runs crashed."},
+     "Is every claim in `summary` supported by `source`?",
+     "Does `summary` contain a claim that `source` does not support?"),
+)
+
+
+def _polarity_canary(model: str) -> str:
+    """'' when the model answers both wordings of each case correctly, else what failed."""
+    for state, holds, fails in _POLARITY_CANARY:
+        res = _decide_raw(model, state, {"holds": {"type": "noul", "instructions": holds},
+                                         "fails": {"type": "noul", "instructions": fails}})
+        if res.get("error"):
+            return f"polarity canary could not run: {res['error'][:160]}"
+        p, q = (float(res["answers"][k].get("noul", 0.5)) for k in ("holds", "fails"))
+        if p < 0.5 or q >= 0.5:
+            return (f"polarity canary failed on {holds!r}: P(true) {p:.2f}, inverted twin "
+                    f"{q:.2f} — do not use this model on inverted questions")
+    return ""
 
 
 @mcp.tool()
@@ -2974,6 +3099,9 @@ def list_fleet() -> str:
         "decision_bench": bench,
         "correlation_classes": classes,
         "bench_classes": sorted({d["klass"] for d in _DECIDERS.values()}),
+        "routers": {k: {"allowed": list(v["allowed"]), "hosts": list(v["hosts"]),
+                        "use": "call_router, generator role only; never a verifier"}
+                    for k, v in _ROUTERS.items()},
         "classes_reachable_now": reachable,
         "cross_class_verification_available": len(reachable) > 1,
         "bench_available": or_key,
@@ -3458,7 +3586,7 @@ def _route_evidence_data(work_type: str, role: str = "generator", last_n: int = 
 # task_id and fleet_stats counts who was right. A router that falls behind is demoted.
 # All thresholds below are PROVISIONAL policy, not measurements.
 # ---------------------------------------------------------------------------
-_ROUTER_CHAIN = (_GATEKEEPER, "perplexity/pplx-decider-v1.1-27b", "upstage/solar-decide")
+_ROUTER_CHAIN = (_GATEKEEPER, "perplexity/pplx-decider-v1.2", "upstage/solar-decide")
 _ROUTER_ACCEPT = 0.60         # averaged probability the winning option needs (provisional)
 _ROUTER_POLARITY = 0.25       # max gap between a noul and its negated twin (provisional)
 _ROUTER_MIN_DECISIVE = 10     # decisive verified head-to-heads before the record counts
@@ -3472,6 +3600,9 @@ _ROUTE_BLURB = {
     "deepseek-v4.1-flash": "cheapest; image input; for drafting and bulk work only",
     "meta/muse-spark-1.3": "candidate added at the operator's request; closed weights; "
                            "strong published coding-agent scores; unmeasured here",
+    "meta/muse-ember": "small and cheap; repeated tool calls, subtasks and drafts; unmeasured",
+    "ibm-granite/granite-4.2-8b": "very cheap open-weights 8B; math and code when a "
+                                  "deterministic check grades it; unmeasured",
 }
 
 
@@ -3787,6 +3918,9 @@ def log_outcome(task_id: str, model: str, correctness: str,
         return f"[ERROR] disposition must be one of {[x for x in _DISPOSITION if x]} or empty — got {disposition!r}"
     if not task_id.strip() or not model.strip():
         return "[ERROR] task_id and model are both required — per-model verdicts are the whole point"
+    if model.strip() in _ROUTERS:
+        return (f"[ERROR] {model.strip()} is a router: log the outcome under the model that "
+                f"served it (`served_model` in the call_router result)")
     bs = "L1" if c == "OVERTURNED_BY_L1" else basis.strip().upper()
     if bs not in _BASIS:
         return f"[ERROR] basis must be one of {list(_BASIS)} — got {basis!r}"
