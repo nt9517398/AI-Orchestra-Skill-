@@ -5,6 +5,14 @@
 - `orchestra.skill` is instructions. Upload it to claude.ai (Settings, Capabilities, Skills). It calls nothing.
 - `orchestra_mcp_server.py` does all the calling. It is a local MCP server: it runs on your machine under Claude Desktop (or a local Claude Code), not inside claude.ai and not inside a cloud session.
 
+## Install
+
+```
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` pins `mcp` below 2. mcp 2.x renamed `FastMCP`, so an unpinned `pip install mcp` makes the server fail at import; if that happens the error says so.
+
 ## Keys
 
 The server reads its keys from **its own process environment or from a `.env` file next to the script**, and from nowhere else. Claude Desktop's sign-in and its Developer Mode gateway settings are separate things and do not reach the server. A missing key shows up as `[SKIPPED] OPENROUTER_API_KEY not set` (or the `ZHIPU_` / `DEEPSEEK_` equivalent).
@@ -36,6 +44,10 @@ python orchestra_mcp_server.py --check
 ```
 
 It looks up each model's real limits and makes one tiny real call per model (about a cent in all). Exit 0: something was tested and nothing failed. Exit 1: a problem, with the fix printed. Exit 2: nothing could be tested because no keys are set; that is not a pass.
+
+## Saved results
+
+Every generator reply is saved to `results/<task_id>/` the moment it returns, and a `started` row is logged before each call, so a run that is killed keeps what finished. Read it back with the `recover_results` tool; `fleet_stats` lists calls that started and never finished. The folder holds model output: it is git-ignored, and `ORCHESTRA_SAVE_RESULTS=0` turns saving off.
 
 ## Cloud sessions (Claude Code on the web)
 

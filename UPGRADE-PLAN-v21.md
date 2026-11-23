@@ -1,6 +1,6 @@
 # Orchestra v21 upgrade plan: fleet-powered local workers
 
-Status: **draft for the owner's review. Nothing is implemented.** Evidence: `FINDINGS-2026-11-23.md`.
+Status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; Phases 2 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
 
 ## Objective
 
@@ -64,6 +64,8 @@ Why: on 2026-11-23 a two-model review lost a finished GPT Astra answer when a 59
 - The GLM 400 has a confirmed cause, and the same review either succeeds or fails with a clear message.
 - All tests pass.
 
+**Status (2026-11-23, v20.1).** Done offline and tested: items 1 to 3 (every generator call logs a `started` row and saves its reply at once; `recover_results` reads them back; provider error text is kept, redacted), and the measured-latency half of item 4 (`fleet_stats` per-model `elapsed_s`; the wrapper rule is in `dispatch-protocol.md`). **Not done:** item 5 needs live access and the saved v5.7 brief and diff, and `fleet.py` is not in this repository, so its non-zero exit cannot be fixed or tested here. One cause of the unexplained 400 is found: the error body was read after the stream had closed, so every provider error arrived with no text. That explains the missing text, not the 400 itself.
+
 ### Phase 2: Compatibility matrix
 
 **Do:** run the same small script for each fleet model through the Messages endpoint: forced tool call, multi-turn tool loop, parallel tools, streaming, caching, thinking blocks, a real Claude Code worker.
@@ -102,6 +104,8 @@ Every attempt must fail and the canary must appear in no output or provider requ
 - Seeded-bug tasks: the loop rejects a solution that passes tests but breaks the spec.
 - Two parallel workers produce no file conflicts and stay under a combined cap.
 - `route_evidence` shows the new outcomes.
+
+**Gap to close in this phase.** Workflow plans do not check classes: `_validate_workflow` has no class comparison, so a verifier step can read a same-class worker's output. The class rule is enforced for adversarial pairs and decision panels only. Add the check for the verifier role here.
 
 ### Phase 6: Benchmark and decision
 
@@ -220,3 +224,5 @@ All answered 2026-11-23:
 9. Fusion: **opt-in, public content only**. *Owner's reply was numbered 8 ("Opt-in"); read as this question, to be confirmed.*
 
 4. Spend limits during testing: **$2 per worker, $10 per day**. Enforced from OpenRouter's reported cost, and replaced with measured limits after the Phase 6 benchmark.
+
+10. Reviewer of Muse workers: **Astra** (answered 2026-11-23). Because the class rule would have refused a Muse and Astra pair, Meta models became their own class, `META-CLOSED` (v20.1). Muse Spark and Muse Ember share it and still cannot check each other.

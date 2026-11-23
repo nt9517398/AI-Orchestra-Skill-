@@ -6,6 +6,7 @@ Run:  python test_orchestra.py      (silence = pass)
 import inspect
 import json
 import os
+import uuid
 import zipfile
 
 import requests
@@ -43,6 +44,7 @@ def _no_net_post(*a, **k):
 requests.get, requests.post = _no_net_get, _no_net_post
 o._LOG_PATH = _TEST_DIR / "dispatch_log.jsonl"
 o._MEM_PATH = _TEST_DIR / "memory_bank.json"      # nor to the operator's memory bank
+o._RESULTS_DIR = _TEST_DIR / "results"            # nor saved model output to the repo
 
 
 def _server_code_without_changelog():
@@ -383,7 +385,8 @@ def test_removed_models_are_gone():
     assert len(o._MODELS) == 7, f"_MODELS should have 7 entries, got {len(o._MODELS)}"
     assert "meta/muse-spark-1.3" in o._MODELS
     classes = set(m["klass"] for m in o._MODELS.values())
-    assert classes == {"CN-OW", "US-CLOSED", "US-OW"}, f"unexpected classes: {classes}"
+    assert classes == {"CN-OW", "US-CLOSED", "US-OW", "META-CLOSED"}, \
+        f"unexpected classes: {classes}"
 
 
 def test_adversarial_default_pair_is_cross_class():
@@ -1158,6 +1161,8 @@ def test_workflow_enforces_access_lists_and_anonymises():
     assert res["waves"] == [["draft", "other"], ["review"]]
     assert res["dispatches"] == {"this_plan": 3, "task_total": 3, "ceiling": 6}
     rows = [json.loads(x) for x in open(o._LOG_PATH, encoding="utf-8") if "wf-access" in x]
+    assert [r["type"] for r in rows].count("started") == 3, "a started row precedes each call"
+    rows = [r for r in rows if r["type"] == "dispatch"]
     assert {r["mode"] for r in rows} == {"workflow"} and len(rows) == 3
     assert [r for r in rows if r["model"] == "glm-5.3"][0]["work_type"] == "swe"
 
@@ -1601,7 +1606,7 @@ def test_unknown_slug_is_admitted_as_a_guest_on_first_mention():
     assert _with_fake_get(handler, lambda: o._admit_model(GUEST)) is None
     e = o._MODELS[GUEST]
     assert e["extra"] and e["discovered"] and not e["persisted"] and not e["may_verify"]
-    assert e["klass"] == "US-CLOSED" and e["provider"] == "openrouter" and e["pin"] is None
+    assert e["klass"] == "META-CLOSED" and e["provider"] == "openrouter" and e["pin"] is None
     assert e["reasoning"] is True and e["max_out"] == 32_000
     assert e["worst_usd"] == round(32_000 * 4.25e-06, 4) and e["data_risk"] == ""
     assert _with_fake_get(handler, lambda: o._admit_model(GUEST)) is None
@@ -1609,7 +1614,7 @@ def test_unknown_slug_is_admitted_as_a_guest_on_first_mention():
     assert o._source(GUEST) == "guest" and o._source("glm-5.3") == "builtin"
     assert o._guest_class("z-ai/glm-5.4") == "CN-OW" and o._guest_class("openai/x") == "US-CLOSED"
     assert o._guest_class("acme/model-1") == "GUEST-acme", "an unknown lab gets its own class"
-    assert o._guest_class("meta/anything") == "US-CLOSED"
+    assert o._guest_class("meta/anything") == "META-CLOSED"
 
 
 @_fleet_sandbox
@@ -1735,14 +1740,14 @@ def test_a_guest_runs_end_to_end_with_no_setup():
         finally:
             requests.post = original
     out = _with_fake_get(handler, run)
-    assert out["outcome"] == "OK" and out["content"] == "ok" and out["class"] == "US-CLOSED"
+    assert out["outcome"] == "OK" and out["content"] == "ok" and out["class"] == "META-CLOSED"
     assert sent["model"] == GUEST and sent["max_tokens"] == 32_000 and sent["stream"] is True
     assert "provider" not in sent, "a guest is unpinned: default routing, served host logged"
     assert sent["reasoning"] == {"effort": "high"}
     assert sent["_url"].endswith("/v1/chat/completions")
     row = [json.loads(x) for x in open(o._LOG_PATH, encoding="utf-8") if out["task_id"] in x][-1]
     assert row["source"] == "guest" and row["work_type"] == "agentic"
-    assert row["served_provider"] == "Meta" and row["klass"] == "US-CLOSED"
+    assert row["served_provider"] == "Meta" and row["klass"] == "META-CLOSED"
     swapped = _with_fake_get(handler, lambda: run("meta/muse-spark-9-contributor"))
     assert swapped["outcome"] == "SUBSTITUTED", swapped
     assert swapped["content"].startswith("[SUBSTITUTED]") and "contributor" in swapped["content"]
@@ -1805,8 +1810,8 @@ def test_guests_work_in_workflows_councils_and_adversarial_pairs():
         return wf, par, adv, same
     wf, par, adv, same = _with_fake_get(handler, run)
     assert [st["model"] for st in wf["steps"]] == [GUEST, "openai/gpt-astra-latest"]
-    assert par["results"][GUEST]["class"] == "US-CLOSED"
-    assert json.loads(adv)["pair"] == {GUEST: "US-CLOSED", "glm-5.3": "CN-OW"}
+    assert par["results"][GUEST]["class"] == "META-CLOSED"
+    assert json.loads(adv)["pair"] == {GUEST: "META-CLOSED", "glm-5.3": "CN-OW"}
     assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
         "two guests from one lab are one class, so they cannot cross-check each other"
     assert any(c["model"] == GUEST for c in fleet.calls)
@@ -1821,7 +1826,7 @@ def test_fleet_probe_reports_without_registering_or_spending():
     out = json.loads(_with_fake_get(handler, lambda: o.fleet_probe(GUEST)))
     assert out["registered"] is False and out["usable_as_this_kind"] is True
     w = out["would_run_as"]
-    assert w["class"] == "US-CLOSED" and w["max_output_tokens"] == 32_000
+    assert w["class"] == "META-CLOSED" and w["max_output_tokens"] == 32_000
     assert w["roles_barred"] == ["verifier", "memory_keeper"] and w["reasoning_param_sent"] is True
     assert out["facts"]["price_out_per_m"] == 4.25 and out["facts"]["context_tokens"] == 1_048_576
     assert GUEST not in o._MODELS, "probing registers nothing"
@@ -1838,7 +1843,7 @@ def test_fleet_probe_reports_without_registering_or_spending():
 def test_fleet_add_persists_survives_a_restart_and_fleet_remove_undoes_it():
     handler = _get_by_slug({GUEST: _endpoints_body()})
     added = json.loads(_with_fake_get(handler, lambda: o.fleet_add(GUEST, note="trial")))
-    assert added["added"] == GUEST and added["class"] == "US-CLOSED"
+    assert added["added"] == GUEST and added["class"] == "META-CLOSED"
     assert added["may_verify_facts"] is False and "warning" not in added
     saved = json.load(open(o._EXTRA_PATH, encoding="utf-8"))
     assert saved["generators"][GUEST] == {"may_verify": False, "note": "trial"}
@@ -2091,15 +2096,22 @@ def test_muse_spark_is_a_plain_core_registry_entry():
     assert not m.get("extra"), "core, not a guest"
     assert m["max_out"] == 640_000 and not m.get("auto_ceiling"), \
         "v20: an operator-set fixed ceiling, not resolved live"
-    assert m["klass"] == o._MODELS["openai/gpt-astra-latest"]["klass"] == "US-CLOSED"
-    same = o._run_adversarial(BRIEF, model_a=MUSE_CORE, model_b="openai/gpt-astra-latest")
+    assert m["klass"] == "META-CLOSED" != o._MODELS["openai/gpt-astra-latest"]["klass"], \
+        "operator's decision, 2026-11-23: Meta is its own class, so Astra may review Muse"
+    astra = _with_fake_fleet(_FakeFleet({MUSE_CORE: "a", "openai/gpt-astra-latest": "b"}),
+                             lambda: o._run_adversarial(
+                                 BRIEF, model_a=MUSE_CORE, model_b="openai/gpt-astra-latest",
+                                 task_id="adv-muse-astra"))
+    assert json.loads(astra)["pair"] == {MUSE_CORE: "META-CLOSED",
+                                         "openai/gpt-astra-latest": "US-CLOSED"}
+    same = o._run_adversarial(BRIEF, model_a=MUSE_CORE, model_b="meta/muse-ember")
     assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
-        "same lab-lineage class as GPT Astra: the two cannot cross-check each other"
+        "Spark and Ember share a family and a class: neither may check the other"
     cross = _with_fake_fleet(_FakeFleet({MUSE_CORE: "a", "glm-5.3": "b"}),
                              lambda: o._run_adversarial(BRIEF, model_a=MUSE_CORE,
                                                         model_b="glm-5.3", task_id="adv-muse"))
-    assert json.loads(cross)["pair"] == {MUSE_CORE: "US-CLOSED", "glm-5.3": "CN-OW"}
-    assert o._guest_class("meta/muse-spark-9") == "US-CLOSED", "a later Meta model joins its class"
+    assert json.loads(cross)["pair"] == {MUSE_CORE: "META-CLOSED", "glm-5.3": "CN-OW"}
+    assert o._guest_class("meta/muse-spark-9") == "META-CLOSED", "a later Meta model joins its class"
 
 
 def test_muse_spark_provenance_is_exact_and_its_payload_is_plain():
@@ -2138,7 +2150,7 @@ def test_muse_spark_runs_as_a_core_model_and_rejects_the_contributor_tier():
     good = _with_fake_get(no_lookup, lambda: run("meta/muse-spark-1.3"))
     assert no_lookup.calls == [], "v20: a fixed ceiling needs no lookup"
     assert good["outcome"] == "OK" and good["contract"]["valid"] is True
-    assert good["class"] == "US-CLOSED"
+    assert good["class"] == "META-CLOSED"
     swapped = _with_fake_get(no_lookup, lambda: run("meta/muse-spark-1.3-contributor"))
     assert swapped["outcome"] == "SUBSTITUTED" and swapped["content"].startswith("[SUBSTITUTED]")
     assert "PASS" not in swapped["content"], "the other tier's text must not be returned"
@@ -2589,9 +2601,10 @@ def test_router_dispatch_is_credited_to_the_served_model():
     def run(path):
         res = json.loads(o.call_router(ROUTER_BRIEF))
         assert res["outcome"] == "OK" and res["served_model"].startswith("meta/muse-ember")
-        row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+        row = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()
+               if '"type": "dispatch"' in l][0]
         assert row["model"] == "meta/muse-ember" and row["via"] == ROUTER
-        assert row["klass"] == "US-CLOSED"
+        assert row["klass"] == "META-CLOSED"
         assert "router" in o.log_outcome(res["task_id"], ROUTER, "CORRECT")
     o._call = fake
     try:
@@ -2620,6 +2633,328 @@ def test_polarity_canary_blocks_panel_members_and_warns_on_others():
     assert panel["status"] == "PROBLEM" and "polarity canary" in panel["problems"][0]
     assert other["status"] == "OK" and "polarity canary" in other["warnings"][0]
     assert clean["status"] == "OK" and clean["warnings"] == []
+
+
+# ---------------------------------------------------------------------------
+# v20.1 — reliable runs: errors keep their text, finished results survive a kill
+# ---------------------------------------------------------------------------
+
+PLANTED = "sk-or-v1-PLANTEDSECRET0123456789abcdef"
+
+
+def _wait_until(cond, timeout=5.0):
+    import time as _t
+    end = _t.time() + timeout
+    while _t.time() < end:
+        if cond():
+            return True
+        _t.sleep(0.02)
+    return False
+
+
+def _with_temp_results(fn):
+    import tempfile
+    original = o._RESULTS_DIR
+    with tempfile.TemporaryDirectory() as d:
+        o._RESULTS_DIR = o.Path(d) / "results"
+        try:
+            return fn(o._RESULTS_DIR)
+        finally:
+            o._RESULTS_DIR = original
+
+
+def _log_and_results(fn):
+    return _with_temp_log(lambda path: _with_temp_results(lambda rdir: fn(path, rdir)))
+
+
+class _StreamResp:
+    """A streaming error response that, like a real one, has no body once the with-block
+    that opened it has closed it."""
+    def __init__(self, status, body):
+        self.status_code, self._body, self.closed, self.headers = status, body, False, {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+        return False
+
+    @property
+    def text(self):
+        return "" if self.closed else self._body
+
+    def raise_for_status(self):
+        raise requests.exceptions.HTTPError(
+            f"{self.status_code} Client Error: Bad Request for url: x", response=self)
+
+
+def test_a_providers_error_text_reaches_the_caller():
+    body = '{"error": {"message": "invalid parameter: thinking", "code": 1210}}'
+    original = requests.post
+    requests.post = lambda *a, **k: _StreamResp(400, body)
+    try:
+        out = _with_env(lambda: o._call("glm-5.3", [{"role": "user", "content": "x"}]),
+                        ZHIPU_API_KEY="k")
+    finally:
+        requests.post = original
+    assert out.startswith("[ERROR]") and "HTTP 400" in out
+    assert "invalid parameter: thinking" in out, \
+        "the body was read after the stream closed, so a provider's 400 arrived unexplained"
+
+
+def test_redact_removes_credentials_and_leaves_ordinary_text_alone():
+    def run():
+        for secret, text in (
+                (PLANTED, f"bad key {PLANTED} given"),
+                ("abcdef1234567890", "Authorization: Bearer abcdef1234567890"),
+                ("abcdef1234567890", '{"api_key": "abcdef1234567890"}'),
+                ("zhipu-value-123456.abcdef", "echo zhipu-value-123456.abcdef end")):
+            out = o._redact(text)
+            assert secret not in out and "[REDACTED]" in out, (text, out)
+        plain = "HTTP 400 Bad Request: max_tokens exceeded for task 4f3a21, model glm-5.3"
+        assert o._redact(plain) == plain
+    _with_env(run, ZHIPU_API_KEY="zhipu-value-123456.abcdef")
+
+
+def test_a_planted_key_never_reaches_the_log_or_the_saved_results():
+    zkey = "zk-12345678-secret"
+    body = f'{{"error": "echo {PLANTED} and {zkey} and Bearer tok_abcdefgh12345"}}'
+
+    def run(path, rdir):
+        original = requests.post
+        requests.post = lambda *a, **k: _StreamResp(400, body)
+        try:
+            out = _with_env(lambda: o._logged_call(
+                "glm-5.3", [{"role": "user", "content": "x"}], task_id="plant-1",
+                role="generator", mode="sync"), ZHIPU_API_KEY=zkey)
+        finally:
+            requests.post = original
+        blob = path.read_text(encoding="utf-8") + "".join(
+            p.read_text(encoding="utf-8") for p in rdir.rglob("*.json"))
+        for secret in (PLANTED, zkey, "tok_abcdefgh12345"):
+            assert secret not in out and secret not in blob, secret
+        row = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()
+               if '"type": "dispatch"' in x][0]
+        assert row["outcome"] == "ERROR" and "HTTP 400" in row["error_detail"]
+        assert "[REDACTED]" in row["error_detail"]
+    _log_and_results(run)
+
+
+def test_a_started_row_is_logged_before_the_call_and_listed_while_it_is_open():
+    import threading
+    gate, entered = threading.Event(), threading.Event()
+
+    def fake(model, messages, reasoning_effort="max", progress=None, meta=None):
+        entered.set()
+        assert gate.wait(10)
+        return "done"
+
+    def run(path, rdir):
+        original = o._call
+        o._call = fake
+        th = threading.Thread(target=lambda: o._logged_call(
+            "glm-5.3", [], task_id="fly-1", role="generator", mode="sync"))
+        th.start()
+        try:
+            assert entered.wait(5)
+            rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
+            assert [r["type"] for r in rows] == ["started"] and rows[0]["model"] == "glm-5.3"
+            stats = json.loads(o.fleet_stats())
+            assert stats["unfinished_calls"]["count"] == 1
+            assert "per_model" not in stats, "an open call is not a dispatch, success or failure"
+            gate.set()
+            th.join(5)
+        finally:
+            gate.set()
+            o._call = original
+        stats = json.loads(o.fleet_stats())
+        assert stats["unfinished_calls"]["count"] == 0
+        assert stats["per_model"]["glm-5.3"]["dispatches"] == 1
+    _log_and_results(run)
+
+
+def test_a_call_killed_before_it_finished_is_listed_and_recoverable():
+    def run(path, rdir):
+        o._log_event({"type": "started", "ts": "2026-10-01T00:00:00", "task_id": "d536dd8e",
+                      "call_id": "c1", "model": "glm-5.3", "mode": "parallel",
+                      "role": "critic"})
+        u = json.loads(o.fleet_stats())["unfinished_calls"]
+        assert u["count"] == 1 and u["latest"][0]["model"] == "glm-5.3"
+        assert u["latest"][0]["age_s"] > 86400
+        r = json.loads(o.recover_results("d536dd8e"))
+        assert r["saved"] == [] and r["unfinished"][0]["model"] == "glm-5.3"
+    _log_and_results(run)
+
+
+def test_a_finished_answer_is_on_disk_while_its_sibling_is_still_running():
+    import threading
+    gate = threading.Event()
+
+    def fake(model, messages, reasoning_effort="max", progress=None, meta=None):
+        if model == "deepseek-v4-pro":
+            assert gate.wait(10)
+            return "SLOW ANSWER"
+        return "FAST ANSWER " + "x" * 50
+
+    def run(path, rdir):
+        original, holder = o._call, {}
+        o._call = fake
+        th = threading.Thread(target=lambda: holder.update(out=o._run_parallel(
+            models=("glm-5.3", "deepseek-v4-pro"), brief=_brief(), task_id="kill-1")))
+        th.start()
+        try:
+            folder = rdir / "kill-1"
+            assert _wait_until(lambda: folder.is_dir() and any(folder.glob("glm-5.3-*.json")))
+            saved = json.loads(next(folder.glob("glm-5.3-*.json")).read_text(encoding="utf-8"))
+            assert saved["content"].startswith("FAST ANSWER") and saved["outcome"] == "OK"
+            assert not list(folder.glob("deepseek-v4-pro-*.json")), "the slow model wrote nothing"
+            assert not list(folder.glob("*.tmp")), "writes are atomic: no half-written file"
+            mid = json.loads(o.recover_results("kill-1"))
+            assert [s["model"] for s in mid["saved"]] == ["glm-5.3"]
+            assert [u["model"] for u in mid["unfinished"]] == ["deepseek-v4-pro"]
+            gate.set()
+            th.join(5)
+        finally:
+            gate.set()
+            o._call = original
+        end = json.loads(o.recover_results("kill-1"))
+        assert len(end["saved"]) == 2 and end["unfinished"] == []
+    _log_and_results(run)
+
+
+def test_saving_results_never_breaks_a_call_and_cannot_escape_its_folder():
+    def run(path, rdir):
+        brief = lambda tid: dict(task_id=tid, role="generator", mode="sync")
+        msgs = [{"role": "user", "content": "x"}]
+        fleet = _FakeFleet({"glm-5.3": "ok"})
+        blocker = rdir.parent / "blocked"
+        blocker.write_text("a file where a folder is needed")
+        o._RESULTS_DIR = blocker / "r"
+        before = o._RESULT_FAILURES
+        out = _with_fake_fleet(fleet, lambda: o._logged_call("glm-5.3", msgs, **brief("t-1")))
+        assert out == "ok" and o._RESULT_FAILURES == before + 1, \
+            "a failed save is counted and never changes the call's result"
+        assert json.loads(o.fleet_stats())["result_write_failures"] == before + 1
+        o._RESULTS_DIR = rdir
+        marker = "esc" + uuid.uuid4().hex[:8]          # unique, so a stale folder can't fool it
+        _with_fake_fleet(fleet, lambda: o._logged_call("glm-5.3", msgs,
+                                                       **brief(f"../../{marker}")))
+        files = list(rdir.rglob("*.json"))
+        assert len(files) == 1 and files[0].resolve().is_relative_to(rdir.resolve())
+        assert list(rdir.parent.glob("*.json")) == []
+        assert not (rdir.parent.parent / marker).exists(), "a task id must not escape the folder"
+        original = o._SAVE_RESULTS
+        o._SAVE_RESULTS = False
+        try:
+            _with_fake_fleet(fleet, lambda: o._logged_call("glm-5.3", msgs, **brief("t-off")))
+        finally:
+            o._SAVE_RESULTS = original
+        assert not (rdir / "t-off").exists(), "ORCHESTRA_SAVE_RESULTS=0 turns saving off"
+    _log_and_results(run)
+
+
+def test_recover_results_validates_its_input_and_reports_nothing_cleanly():
+    def run(path, rdir):
+        for bad in ("", "../x", "a b", "-lead"):
+            assert "error" in json.loads(o.recover_results(bad)), bad
+        r = json.loads(o.recover_results("never-ran"))
+        assert r["saved"] == [] and r["unfinished"] == []
+    _log_and_results(run)
+
+
+def test_fleet_stats_reports_latency_from_successful_calls_only():
+    def run(path, rdir):
+        for i, secs in enumerate((10, 20, 30, 40, 100)):
+            o._log_event({"type": "dispatch", "task_id": f"l{i}", "model": "glm-5.3",
+                          "klass": "CN-OW", "mode": "sync", "outcome": "OK", "elapsed_s": secs})
+        o._log_event({"type": "dispatch", "task_id": "lx", "model": "glm-5.3",
+                      "klass": "CN-OW", "mode": "sync", "outcome": "ERROR", "elapsed_s": 999})
+        e = json.loads(o.fleet_stats())["per_model"]["glm-5.3"]["elapsed_s"]
+        assert e == {"n": 5, "median": 30.0, "p90": 100.0, "max": 100.0}, e
+    _log_and_results(run)
+
+
+def test_fleet_check_rows_keep_the_providers_error_text_without_secrets():
+    _reset_lookups()
+    msg = f"[ERROR] glm/glm-5.3: HTTP 400 — Bad Request {PLANTED} Bearer tok_abcdefgh12345"
+    res, _ = _run_check(_healthy_world({"glm-5.3": msg}))
+    row = [r for r in res["rows"] if r["model"] == "glm-5.3"][0]
+    assert row["status"] == "PROBLEM" and "HTTP 400" in row["error_text"]
+    blob = json.dumps(res)
+    assert PLANTED not in blob and "tok_abcdefgh12345" not in blob
+
+
+def test_only_meta_models_are_in_the_meta_class():
+    metas = {m for m, e in o._MODELS.items() if e["klass"] == "META-CLOSED"}
+    assert metas == {"meta/muse-spark-1.3", "meta/muse-ember"}
+    assert o._MODELS["openai/gpt-astra-latest"]["klass"] == "US-CLOSED"
+    assert o._LAB_CLASS["meta"] == "META-CLOSED"
+
+
+def test_requirements_pin_mcp_below_2_and_the_setup_notes_agree():
+    here = os.path.dirname(os.path.abspath(o.__file__))
+    req = open(os.path.join(here, "requirements.txt"), encoding="utf-8").read()
+    flat = req.lower().replace(" ", "")
+    assert "mcp[cli]" in flat and "<2" in flat, "mcp 2.x renamed FastMCP and breaks the import"
+    for name in ("python-dotenv", "requests"):
+        assert name in flat, name
+    setup = open(os.path.join(here, "SETUP.md"), encoding="utf-8").read()
+    assert "pip install -r requirements.txt" in setup
+    src = open(o.__file__, encoding="utf-8").read()
+    assert 'pip install "mcp[cli]" python-dotenv requests' not in src, "unpinned install advice"
+    assert "needs mcp below 2.0" in src, "the import failure must say why"
+    ignored = open(os.path.join(here, ".gitignore"), encoding="utf-8").read().split()
+    for pattern in (".env", "results/", "_archive*/", "_backup*/"):
+        assert pattern in ignored, f".gitignore lacks {pattern}"
+
+
+def _packaged_docs():
+    here = os.path.dirname(os.path.abspath(o.__file__))
+    with zipfile.ZipFile(os.path.join(here, "orchestra.skill")) as z:
+        return {n.split("orchestra/", 1)[1]: z.read(n).decode("utf-8") for n in z.namelist()}
+
+
+def test_the_package_points_only_at_files_inside_it():
+    for name, text in _packaged_docs().items():
+        for outside in ("UPGRADE-PLAN", "FINDINGS-20", "SETUP.md", ".env.example"):
+            assert outside not in text, f"{name} points at {outside}, which is not in the package"
+
+
+def test_the_always_loaded_skill_names_no_retired_model():
+    skill = _packaged_docs()["SKILL.md"].lower()
+    for dead in ("mercury", "pplx-decider-v1.1", "kimi", "grok", "gemini", "ox-alpha",
+                 "glm-5.3-prime"):
+        assert dead not in skill, f"SKILL.md still names {dead}"
+
+
+def test_every_registry_model_has_a_seat_in_the_skill_and_in_governance():
+    docs = _packaged_docs()
+    for model in list(o._MODELS) + list(o._DECIDERS) + list(o._ROUTERS):
+        for doc in ("SKILL.md", "references/governance.md"):
+            assert f"`{model}`" in docs[doc], f"`{model}` has no seat in {doc}"
+
+
+def test_the_docs_describe_the_servers_default_ratification_panel():
+    docs = _packaged_docs()
+    names = {"typesafe/jev-1.13": "Jev", "perplexity/pplx-decider-v1.2": "Decider",
+             "upstage/solar-decide": "Solar"}
+    assert set(names) == set(o._DECIDERS), "a decision model was added: name it here"
+    line = next(x for x in docs["SKILL.md"].splitlines()
+                if x.startswith("No synthesis ships until a cross-class panel"))
+    for model, short in names.items():
+        assert (short in line) == (model in o._DEFAULT_PANEL), \
+            f"SKILL.md's ratification line disagrees with _DEFAULT_PANEL about {short}"
+    if "upstage/solar-decide" not in o._DEFAULT_PANEL:
+        for doc, text in docs.items():
+            assert "every ratification panel" not in text, doc
+            assert "decorrelates every panel" not in text, doc
+
+
+def test_the_fleet_card_lists_every_class_in_use():
+    card = _packaged_docs()["references/fleet-card.md"]
+    for klass in {e["klass"] for e in list(o._MODELS.values()) + list(o._DECIDERS.values())}:
+        assert f"**{klass}**" in card, f"the fleet card does not list the class {klass}"
 
 
 if __name__ == "__main__":

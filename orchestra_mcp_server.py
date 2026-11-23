@@ -1,6 +1,22 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v20.1 — REPAIR + RELIABLE RUNS  (2026-11-23; no new capability for the fleet)
+------------------------------------------------------------------------------
+  1. mcp is pinned below 2 (requirements.txt). mcp 2.x renamed FastMCP, so a fresh
+     `pip install "mcp[cli]"` made this file fail at import; the import now says why.
+  2. Meta models are their own correlation class, META-CLOSED, at the operator's
+     direction, so GPT Astra can review Muse Spark. Spark and Ember share a class and
+     still cannot check each other. A lineage prior, not a measurement: fleet_stats
+     co-failure is what would test it.
+  3. A killed run keeps what finished. Every generator call writes a `started` row before
+     it runs and its reply to results/<task_id>/ the moment it returns; recover_results
+     reads them back and fleet_stats lists started calls with no finish.
+  4. Provider errors keep their text. The error body was read after the stream had
+     closed, so it was always empty; it is now read first. Error text goes to the log
+     and to fleet_check rows with keys and bearer tokens removed (_redact).
+  5. fleet_stats reports per-model latency (median, p90, max) to size wrapper timeouts.
+
 v20 — A DECISION MODEL TAKES PART IN ROUTING; MERCURY DECIDE REPLACED  (2026-10-10)
 ------------------------------------------------------------------------------------
   1. route_decide: Jev rules on every fleet routing choice (a `choice` over the eligible
@@ -144,7 +160,7 @@ CRITICAL (stdio transport): never print() / write to stdout — it corrupts JSON
 Every function RETURNS its result.
 
 Setup:
-    pip install "mcp[cli]" python-dotenv requests
+    pip install -r requirements.txt     # pins mcp below 2: 2.x renamed FastMCP
     # API keys in a .env next to this script (see .env.example). Never hardcode.
     # OPENROUTER_API_KEY is required; missing it removes GPT Astra, the whole decision
     # bench, and the only non-CN-OW generator class, US-CLOSED.
@@ -246,7 +262,12 @@ from typing import Optional, Union
 
 import requests
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ModuleNotFoundError as _e:           # mcp 2.x renamed FastMCP to MCPServer
+    sys.stderr.write("orchestra: cannot import FastMCP — this server needs mcp below 2.0. "
+                     "Run: pip install -r requirements.txt  (or: pip install 'mcp[cli]<2')\n")
+    raise
 
 # v14: load the .env sitting NEXT TO THIS FILE, not relative to the process CWD.
 # Claude Desktop launches this server with an unpredictable working directory, so a
@@ -332,7 +353,7 @@ _MODELS = {
         # 128,000 max output / 1.05M context, $10 in / $50 out per 1M (OpenRouter
         # listing). Worst-case runaway at this budget is ~$6.40 per dispatch.
     "meta/muse-spark-1.3": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=640000, pin="Meta",
+        provider="openrouter", klass="META-CLOSED", max_out=640000, pin="Meta",
         exact_served=True),
         # Added 2026-10-05 at the operator's request as a plain core entry. Meta, closed
         # weights, released 2026-09-02; 1,048,576 context; $1.25 in / $4.25 out per 1M
@@ -351,14 +372,15 @@ _MODELS = {
         # terms where prompts and outputs may be used to improve Meta's products. This
         # entry is the STANDARD tier, and exact_served=True makes provenance exact: the
         # default substring test would accept the contributor tier's reply for this one.
-        # Class US-CLOSED by the fleet's lab-lineage convention (country + openness). That
-        # makes it same-class as GPT Astra: the two cannot cross-check each other. A prior,
-        # not a measurement; give it its own class here if that pairing is wanted.
+        # Class META-CLOSED (2026-11-23, operator's decision): Meta is its own lineage, so GPT
+        # Astra (US-CLOSED) may review Muse Spark. Spark and Ember share the class and can
+        # never check each other. A lineage prior, not a measurement: US labs' models are
+        # unlikely to be independent, and fleet_stats co-failure is what would show it.
         # Pinned to Meta by the operator, 2026-11-23: the same slug was served by both Meta
         # and Google, on different hosts, in one session.
         # Unvetted for factual roles: see _UNVETTED.
     "meta/muse-ember": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=128000, pin="Meta",
+        provider="openrouter", klass="META-CLOSED", max_out=128000, pin="Meta",
         exact_served=True),
         # Added 2026-11-23 (v21 plan). $0.10 in / $0.50 out per 1M; 1.05M context. For
         # repeated tool calls, subtasks, extraction and first drafts. Same family as Muse
@@ -518,7 +540,7 @@ _GUEST_UNPRICED_OUT = 16_000     # budget when OpenRouter lists no usable price
 _LAB_CLASS = {"deepseek": "CN-OW", "z-ai": "CN-OW", "moonshotai": "CN-OW",
               "qwen": "CN-OW", "minimax": "CN-OW",
               "openai": "US-CLOSED", "anthropic": "US-CLOSED", "google": "US-CLOSED",
-              "x-ai": "US-CLOSED", "upstage": "KR-CLOSED", "typesafe": "US-CLOSED", "meta": "US-CLOSED",
+              "x-ai": "US-CLOSED", "upstage": "KR-CLOSED", "typesafe": "US-CLOSED", "meta": "META-CLOSED",
               "inception": "US-CLOSED", "perplexity": "US-CLOSED"}
 
 
@@ -1183,6 +1205,68 @@ def _log_event(rec: dict) -> None:
             _LOG_FAILURES += 1
 
 
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{8,}"),
+)
+_SECRET_KV = re.compile(r"(?i)((?:api[_-]?key|authorization|token|secret)[\"']?\s*[:=]\s*"
+                        r"[\"']?)[A-Za-z0-9._\-]{8,}")
+
+
+def _redact(text) -> str:
+    """Remove credentials from text bound for the log, a saved result or a check row: the
+    value of every configured API key, `sk-...` tokens, `Bearer ...` and key=value pairs
+    that look like credentials. A provider's error body is untrusted text and may echo
+    what it was sent."""
+    s = str(text)
+    for cfg in _CONFIGS.values():
+        v = os.environ.get(cfg["key_env"], "")
+        if len(v) >= 8:
+            s = s.replace(v, "[REDACTED]")
+    for pat in _SECRET_PATTERNS:
+        s = pat.sub("[REDACTED]", s)
+    return _SECRET_KV.sub(lambda m: m.group(1) + "[REDACTED]", s)
+
+
+# v20.1 — every finished generator call is written to disk at once, so a run that is killed
+# (a wrapper timeout, Desktop closing, a crash) loses only the calls still running.
+_RESULTS_DIR = Path(os.environ.get("ORCHESTRA_RESULTS_DIR")
+                    or Path(__file__).with_name("results"))
+_SAVE_RESULTS = os.environ.get("ORCHESTRA_SAVE_RESULTS", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+_RESULT_FAILURES = 0
+
+
+def _safe_name(x) -> str:
+    return (re.sub(r"[^A-Za-z0-9_.-]", "_", str(x))[:64].lstrip(".")) or "_"
+
+
+def _save_result(task_id, call_id, model, out, tag, meta, mode, role) -> None:
+    """results/<task_id>/<model>-<call_id>.json, written atomically (temp file, then
+    rename) so a kill mid-write leaves no half file. Never raises; failures are counted
+    and shown by fleet_stats. Failed calls are saved too, with their error text redacted."""
+    global _RESULT_FAILURES
+    if not _SAVE_RESULTS:
+        return
+    try:
+        d = _RESULTS_DIR / _safe_name(task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        text = out if isinstance(out, str) else None
+        if text is not None and tag != "OK":
+            text = _redact(text)
+        final = d / f"{_safe_name(model)}-{call_id}.json"
+        tmp = final.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "task_id": task_id, "call_id": call_id, "model": model, "mode": mode,
+            "role": role, "outcome": tag, "ts": _now(),
+            "served_model": meta.get("model", ""), "served_host": meta.get("provider", ""),
+            "content": text}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, final)
+    except Exception:
+        with _LOG_LOCK:
+            _RESULT_FAILURES += 1
+
+
 def _new_task_id() -> str:
     return str(uuid.uuid4())[:8]
 
@@ -1290,7 +1374,17 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
                 json=payload, stream=True,
                 timeout=(_CONNECT_SECONDS, _SILENCE_SECONDS),
             ) as resp:
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as e:
+                    # Read the provider's error body NOW, while the stream is open: the
+                    # with-block closes it on the way out and .text is then empty, which
+                    # is how a provider's 400 reached the log with no explanation.
+                    try:
+                        e.provider_body = _redact((resp.text or "")[:500])
+                    except Exception:
+                        e.provider_body = ""
+                    raise
                 return _consume_stream(resp.iter_lines(), model, cfg, progress, meta)
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
@@ -1302,14 +1396,15 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
             if attempt == 0 and 500 <= status < 600:
                 time.sleep(5)
                 continue
-            body_text = ""
-            try:
-                if e.response is not None:
-                    body_text = e.response.text[:300] if e.response.text else ""
-            except Exception:
-                pass  # Never raise from error handling
-            return f"[ERROR] {provider}/{model}: HTTP {status} — {e}" + \
-                   (f" {body_text}" if body_text else "")
+            body_text = getattr(e, "provider_body", "")
+            if not body_text:
+                try:
+                    if e.response is not None:
+                        body_text = _redact(e.response.text[:500]) if e.response.text else ""
+                except Exception:
+                    pass  # Never raise from error handling
+            return _redact(f"[ERROR] {provider}/{model}: HTTP {status} — {e}" +
+                           (f" {body_text}" if body_text else ""))
         except _STREAM_DEATH as e:
             # Raised before the first chunk (connect timeout / refused). A death DURING
             # the stream is caught inside _consume_stream, which keeps the partial text.
@@ -1349,6 +1444,12 @@ def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=Non
     t0 = time.time()
     out = None
     meta = {} if meta_out is None else meta_out
+    call_id = uuid.uuid4().hex[:12]
+    # v20.1: written BEFORE the call. A call that is killed never reaches the dispatch row
+    # below, and without this row it would leave no trace. fleet_stats lists started rows
+    # that have no matching dispatch row, and never counts them as successes.
+    _log_event({"type": "started", "ts": _now(), "task_id": task_id, "call_id": call_id,
+                "model": model, "mode": mode, "role": role, "work_type": work_type})
     try:
         out = _call(model, messages, meta=meta, **call_kwargs)
         return out
@@ -1358,11 +1459,17 @@ def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=Non
         # fleet_stats measure real models and never a moving target.
         credited = (_router_member(meta.get("model", ""), _ROUTERS[model]) or model
                     if model in _ROUTERS else model)
-        _log_event({"type": "dispatch", "ts": _now(), "task_id": task_id,
+        # Saved before the row is logged: a kill between the two leaves the answer on disk
+        # and the call listed as unfinished, which is recoverable; the reverse is not.
+        _save_result(task_id, call_id, credited, out, tag, meta, mode, role)
+        _log_event({"type": "dispatch", "ts": _now(), "task_id": task_id, "call_id": call_id,
                     "model": credited, "klass": _MODELS.get(credited, {}).get("klass", "?"),
                     "provider": _MODELS.get(credited, {}).get("provider", "?"),
                     **({"via": model} if model in _ROUTERS else {}),
                     "mode": mode, "role": role, "outcome": tag,
+                    **({"error_detail": _redact(out[:600] if isinstance(out, str)
+                                                else "uncaught exception")}
+                       if tag != "OK" else {}),
                     "source": _source(credited),
                     "work_type": work_type,
                     "out_chars": len(out) if isinstance(out, str) else 0,
@@ -1795,6 +1902,7 @@ def _logged_decide(model: str, state, questions: dict, *, task_id: str,
                     "provider": "openrouter-decisions", "mode": mode, "role": role,
                     "source": _source(model),
                     "outcome": _outcome_tag(err) if err else "OK",
+                    **({"error_detail": _redact(err[:500])} if err else {}),
                     "questions": len(questions) if isinstance(questions, dict) else 0,
                     "served_model": (res or {}).get("served_model", "")
                     if isinstance(res, dict) else "",
@@ -2912,7 +3020,9 @@ def _check_generator(model: str) -> dict:
             f"model, widen its provenance rule (served_as / exact_served); if it is a "
             f"different tier, the rejection is correct")
     else:
-        row["problems"].append(f"the test call returned {tag}: {out.strip()[:220]}")
+        row["problems"].append(f"the test call returned {tag}: "
+                               f"{_redact(out.strip()[:600])}")
+        row["error_text"] = _redact(out.strip()[:600])
     row["status"] = "PROBLEM" if row["problems"] else "OK"
     return row
 
@@ -2927,7 +3037,7 @@ def _check_decider(model: str) -> dict:
     if err.startswith("[SKIPPED]"):
         return {**row, "status": "SKIPPED", "note": err[:160]}
     if err:
-        return {**row, "status": "PROBLEM", "problems": [err[:240]]}
+        return {**row, "status": "PROBLEM", "problems": [_redact(err[:600])]}
     row.update(served_model=res.get("served_model", ""),
                p_greeting=(res["answers"].get("greeting") or {}).get("noul"))
     trouble = _polarity_canary(model)
@@ -3122,8 +3232,10 @@ def list_fleet() -> str:
         "note": "Verifier.class must differ from Worker.class (SKILL.md 'Verification "
                 "ladder'). Classes are a lab-lineage prior, not a measurement — "
                 "fleet_stats() replaces the guess once it has enough paired verdicts. "
-                "Only one generator (openai/gpt-astra-latest) is outside CN-OW, so it is "
-                "the only cross-class partner for the other three.",
+                "Generators outside CN-OW: " + ", ".join(
+                    sorted(m for m, e in _MODELS.items() if e["klass"] != "CN-OW"))
+                + " — the cross-class partners for the CN-OW models. Models of the same "
+                "class cannot check each other.",
     }, indent=2)
 
 
@@ -3934,7 +4046,7 @@ def _read_log(last_n: int = 1000) -> dict:
     """Parse the last `last_n` log lines into dispatch / outcome / override rows.
     Shared by fleet_stats and route_evidence so the two can never disagree."""
     out = {"lines": 0, "dispatches": [], "outcomes": [], "overrides": [], "rulings": [],
-           "malformed": 0, "error": None}
+           "starts": [], "malformed": 0, "error": None}
     lines = []
     try:
         with _LOG_LOCK:
@@ -3947,7 +4059,7 @@ def _read_log(last_n: int = 1000) -> dict:
     lines = lines[-max(1, last_n):]
     out["lines"] = len(lines)
     bucket = {"dispatch": "dispatches", "outcome": "outcomes", "override": "overrides",
-              "route_ruling": "rulings"}
+              "route_ruling": "rulings", "started": "starts"}
     for ln in lines:
         ln = ln.strip()
         if not ln:
@@ -4007,6 +4119,65 @@ def _rate(cell: dict, min_n: int = _MIN_ROUTE_SAMPLES) -> tuple:
 
 
 @mcp.tool()
+def recover_results(task_id: str) -> str:
+    """Read back what a task left on disk: every call that finished (its reply, outcome,
+    served model and host) and every call that started and never did. Use it after a
+    wrapper timeout, a closed Desktop or a crash, or to re-read a result without
+    re-running it. Replies are cut at 20,000 characters here; `path` is the full file.
+
+    Results live in results/<task_id>/ next to the server (ORCHESTRA_RESULTS_DIR moves
+    them; ORCHESTRA_SAVE_RESULTS=0 turns saving off). They hold model output, so treat the
+    folder like the memory bank: local, and never committed.
+    """
+    tid, err = _task_id_arg(task_id)
+    if err or not tid:
+        return json.dumps({"error": err or "[ERROR] task_id is required"})
+    d = _RESULTS_DIR / _safe_name(tid)
+    saved = []
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            saved.append({"path": str(p), "error": "unreadable"})
+            continue
+        text = rec.get("content")
+        saved.append({**{k: rec.get(k) for k in ("model", "mode", "role", "outcome", "ts",
+                                                 "served_model", "served_host")},
+                      "chars": len(text) if isinstance(text, str) else 0,
+                      "truncated": isinstance(text, str) and len(text) > 20000,
+                      "content": text[:20000] if isinstance(text, str) else None,
+                      "path": str(p)})
+    log = _read_log(5000)
+    finished = {x.get("call_id") for x in log["dispatches"] if x.get("call_id")}
+    open_calls = [{"model": s.get("model"), "mode": s.get("mode"), "started": s.get("ts")}
+                  for s in log["starts"]
+                  if s.get("task_id") == tid and s.get("call_id") not in finished]
+    return json.dumps({"task_id": tid, "saved": saved, "unfinished": open_calls,
+                       "results_dir": str(d),
+                       "note": "unfinished = started, no finish logged: killed, hung or "
+                               "still running"}, ensure_ascii=False, indent=2)
+
+
+def _unfinished_report(log: dict) -> dict:
+    """Started calls with no dispatch row: killed, hung, or still running in another
+    process. Listed with their age and never counted as successes or as failures."""
+    finished = {d.get("call_id") for d in log["dispatches"] if d.get("call_id")}
+    open_calls = [s for s in log["starts"] if s.get("call_id") not in finished]
+    now, rows = time.time(), []
+    for s in open_calls[-20:]:
+        try:
+            age = round(now - time.mktime(time.strptime(s["ts"], "%Y-%m-%dT%H:%M:%S")))
+        except Exception:
+            age = None
+        rows.append({"task_id": s.get("task_id"), "model": s.get("model"),
+                     "mode": s.get("mode"), "started": s.get("ts"), "age_s": age})
+    return {"count": len(open_calls), "latest": rows,
+            "note": "a call that has been open longer than its model's p90 latency "
+                    "(per_model.elapsed_s) was probably killed; recover_results(task_id) "
+                    "returns whatever the same task finished"}
+
+
+@mcp.tool()
 def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
     """Read the dispatch log and report what the fleet has actually DONE — the measured
     counterpart to fleet-card.md's ASSUMED routing priors, and the answer to list_fleet's
@@ -4029,7 +4200,9 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
          above is stale; a silent dead flywheel is the worst case, so it is loud here.
       6. (v16) claude_overrides_of_bench and the builds a floating alias served.
       7. (v17) by_work_type — per (work type, model) verdict counts and correct rates,
-         verified (L1/L2) verdicts preferred. route_evidence reads the same table."""
+         verified (L1/L2) verdicts preferred. route_evidence reads the same table.
+      8. (v20.1) unfinished_calls — started calls with no finish, and per_model latency
+         (elapsed_s: median, p90, max over OK calls) for sizing a caller's time limit."""
     log = _read_log(last_n)
     if log["error"]:
         return json.dumps({"error": log["error"], "log_path": str(_LOG_PATH)})
@@ -4041,6 +4214,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
 
     if not dispatches:
         return json.dumps({"note": "no dispatches in window — nothing measured yet",
+                           "unfinished_calls": _unfinished_report(log),
                            "log_path": str(_LOG_PATH), "lines_scanned": n_lines,
                            "malformed_lines_skipped": malformed,
                            "log_write_failures": _LOG_FAILURES}, indent=2)
@@ -4050,7 +4224,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
         outcome_by[(o.get("task_id"), o.get("model"))] = o
 
     per = defaultdict(lambda: {"dispatches": 0, "infra_fail": 0, "skipped": 0, "klass": "?",
-                               "served": set()})
+                               "served": set(), "elapsed": []})
     mode_by, klass_by, dispatched_pairs = {}, {}, set()
     for d in dispatches:
         m = d.get("model"); key = (d.get("task_id"), m)
@@ -4063,6 +4237,8 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
             p["skipped"] += 1
         elif tag != "OK":
             p["infra_fail"] += 1
+        if tag == "OK" and isinstance(d.get("elapsed_s"), (int, float)):
+            p["elapsed"].append(float(d["elapsed_s"]))
         mode_by[key] = d.get("mode"); klass_by[key] = d.get("klass", "?")
         dispatched_pairs.add(key)
 
@@ -4079,6 +4255,11 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
             per_model[m]["source"] = p["source"]       # a guest or added model
         if p["served"]:
             per_model[m]["served_models"] = sorted(p["served"])
+        if p["elapsed"]:
+            e, n = sorted(p["elapsed"]), len(p["elapsed"])
+            per_model[m]["elapsed_s"] = {
+                "n": n, "median": round(e[n // 2] if n % 2 else (e[n // 2 - 1] + e[n // 2]) / 2, 1),
+                "p90": round(e[max(0, math.ceil(0.9 * n) - 1)], 1), "max": round(e[-1], 1)}
 
     covered = sum(1 for pr in dispatched_pairs if pr in outcome_by)
     outstanding = len(dispatched_pairs) - covered
@@ -4131,6 +4312,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
                              "Claude-judged — a weak signal until L1-verified outcomes "
                              "dominate. The fleet_stats() / SKILL.md 'Outcome log' seed, not the finished result.",
         "worst_recent": worst,
+        "unfinished_calls": _unfinished_report(log),
         "claude_overrides_of_bench": override_counts or "none logged",
         "routing": _routing_report(log["rulings"], _router_record(log))
                    or "no routing rulings yet — route_decide has not been used",
@@ -4139,6 +4321,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
                          for wt, models in _work_type_table(all_dispatches, outcomes).items()}
                         or "no adjudicated dispatches carry a work_type yet",
         "log_write_failures": _LOG_FAILURES,
+        "result_write_failures": _RESULT_FAILURES,
         "log_path": str(_LOG_PATH),
     }, indent=2, ensure_ascii=False)
 
