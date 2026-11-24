@@ -385,7 +385,7 @@ def test_removed_models_are_gone():
     assert len(o._MODELS) == 11, f"_MODELS should have 11 entries, got {len(o._MODELS)}"
     assert "meta/muse-spark-1.3" in o._MODELS
     classes = set(m["klass"] for m in o._MODELS.values())
-    assert classes == {"CN-OW", "US-CLOSED", "US-OW", "META-CLOSED", "GOOGLE-CLOSED",
+    assert classes == {"CN-OW", "US-CLOSED", "META-CLOSED", "GOOGLE-CLOSED",
                        "XAI-CLOSED"}, \
         f"unexpected classes: {classes}"
 
@@ -715,11 +715,11 @@ def test_flash_cannot_be_briefed_as_verifier():
     assert err and "may not act as a verifier" in err, err
     _, err = o._validate_brief(vb, "glm-5.3")
     assert err is None, err
-    _, err = o._validate_brief(vb, "openai/gpt-sol-latest")
+    _, err = o._validate_brief(vb, "openai/gpt-terra-latest")
     assert err and "unvetted" in err, "Sol is a candidate: it reviews as a critic, not a verifier"
     cb = {"role": "critic", "instruction": "Find defects.",
           "output_contract": {"name": "critic_v1"}}
-    _, err = o._validate_brief(cb, "openai/gpt-sol-latest")
+    _, err = o._validate_brief(cb, "openai/gpt-terra-latest")
     assert err is None, err
     out = o.call_model("deepseek-v4.1-flash", vb)
     assert "may not act as a verifier" in out, out
@@ -769,13 +769,13 @@ def test_check_contract():
 
 @_fixed_ceilings
 def test_provenance_accepts_alias_builds_and_rejects_other_families():
-    """~openai/gpt-sol-latest floats to dated builds; any Sol build is clean,
+    """~openai/gpt-terra-latest floats to dated builds; any Sol build is clean,
     any other family is a substitution."""
-    cfg = o._resolve("openai/gpt-sol-latest")
-    assert o._check_provenance({"model": "openai/gpt-6.2-sol-20261120",
-                                "provider": "OpenAI"}, "openai/gpt-sol-latest", cfg) is None
+    cfg = o._resolve("openai/gpt-terra-latest")
+    assert o._check_provenance({"model": "openai/gpt-6.2-terra-20261120",
+                                "provider": "OpenAI"}, "openai/gpt-terra-latest", cfg) is None
     bad = o._check_provenance({"model": "openai/gpt-6.2-mini"},
-                              "openai/gpt-sol-latest", cfg)
+                              "openai/gpt-terra-latest", cfg)
     assert bad and bad.startswith("[SUBSTITUTED]")
     flash = o._resolve("deepseek-v4.1-flash")
     assert o._check_provenance({"model": "deepseek-flash"}, "deepseek-v4.1-flash", flash) is None
@@ -784,12 +784,12 @@ def test_provenance_accepts_alias_builds_and_rejects_other_families():
 @_fixed_ceilings
 def test_served_model_is_captured_for_the_log():
     meta = {}
-    lines = [_sse({"model": "openai/gpt-6.2-sol-20261120", "provider": "OpenAI",
+    lines = [_sse({"model": "openai/gpt-6.2-terra-20261120", "provider": "OpenAI",
                    "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]})]
-    out = o._consume_stream(lines, "openai/gpt-sol-latest",
-                            o._resolve("openai/gpt-sol-latest"), meta=meta)
+    out = o._consume_stream(lines, "openai/gpt-terra-latest",
+                            o._resolve("openai/gpt-terra-latest"), meta=meta)
     assert out == "hi"
-    assert meta == {"model": "openai/gpt-6.2-sol-20261120", "provider": "OpenAI"}
+    assert meta == {"model": "openai/gpt-6.2-terra-20261120", "provider": "OpenAI"}
 
 
 def _capture_payload(model, key_env, **call_kwargs):
@@ -824,10 +824,10 @@ def test_wire_ids_and_openrouter_payload():
     real = o._live_ceiling
     o._live_ceiling = lambda model, fallback, slug=None: (fallback, "fallback")
     try:
-        s = _capture_payload("openai/gpt-sol-latest", "OPENROUTER_API_KEY")
+        s = _capture_payload("openai/gpt-terra-latest", "OPENROUTER_API_KEY")
     finally:
         o._live_ceiling = real
-    assert s["model"] == "~openai/gpt-sol-latest", "a floating alias goes out under its wire id"
+    assert s["model"] == "~openai/gpt-terra-latest", "a floating alias goes out under its wire id"
     assert "provider" not in s, "an unpinned alias sends no host restriction"
     assert "thinking" not in p, "the direct-Zhipu thinking payload must not reach OpenRouter"
 
@@ -933,15 +933,15 @@ def test_decide_flags_substitution_and_missing_answers():
 
 
 def test_decide_skips_states_that_overflow_context():
-    big = {"doc": "x" * 200_000}          # ~50k tokens: too big for Jev, fine for Solar
+    big = {"doc": "x" * 200_000}          # ~50k tokens: too big for Jev, fine for the Decider
 
     def handler(url, **kw):
         return _FakeResp(200, {"model": kw["json"]["model"],
                                "answers": {"needs_fleet": {"noul": 0.5}}})
     jev = _with_fake_decisions(handler, lambda: o._decide_raw("typesafe/jev-1.13", big, Q))
-    assert jev["error"].startswith("[SKIPPED]") and "solar" in jev["error"]
-    solar = _with_fake_decisions(handler, lambda: o._decide_raw("upstage/solar-decide", big, Q))
-    assert "answers" in solar
+    assert jev["error"].startswith("[SKIPPED]") and "trim the state" in jev["error"]
+    decider = _with_fake_decisions(handler, lambda: o._decide_raw("perplexity/pplx-decider-latest", big, Q))
+    assert "answers" in decider, "the 262K Decider takes the long state"
 
 
 def test_decide_without_key_is_skipped_not_raised():
@@ -1013,13 +1013,13 @@ def test_overrides_are_logged_and_counted():
             o.log_override("t2", "gate", "answer directly p=0.9", "dispatched",
                            "user explicitly asked for the fleet")
             o._log_event({"type": "dispatch", "ts": "x", "task_id": "t2",
-                          "model": "openai/gpt-sol-latest", "klass": "US-CLOSED",
+                          "model": "openai/gpt-terra-latest", "klass": "US-CLOSED",
                           "mode": "sync", "outcome": "OK",
-                          "served_model": "openai/gpt-6.2-sol-20261120"})
+                          "served_model": "openai/gpt-6.2-terra-20261120"})
             stats = json.loads(o.fleet_stats())
             assert stats["claude_overrides_of_bench"] == {"gate": 1, "ratify": 1}
-            assert stats["per_model"]["openai/gpt-sol-latest"]["served_models"] == \
-                ["openai/gpt-6.2-sol-20261120"]
+            assert stats["per_model"]["openai/gpt-terra-latest"]["served_models"] == \
+                ["openai/gpt-6.2-terra-20261120"]
         finally:
             o._LOG_PATH = original
 
@@ -1042,10 +1042,10 @@ def test_skill_names_every_registry_model():
     assert "glm-5.3-prime" not in card.split("## History", 1)[0].lower(), \
         "GLM-5.3-Prime was reverted in v17; only the history section may mention it"
     routing = card.split("## Routing", 1)[1].split("\n## ", 1)[0]
-    for dead in ("Kimi", "Grok 4.6", "grok-4.6", "Gemini 3.7", "gemini-3.7"):
+    for dead in ("Kimi K3 ", "Grok 4.6", "grok-4.6", "Gemini 3.7", "gemini-3.7"):
         assert dead not in routing, f"{dead} still appears in the routing table"
     head = skill.split("---", 2)[1]
-    for dead in ("Kimi", "Grok 4.6", "grok-4.6", "Gemini 3.7", "gemini-3.7"):
+    for dead in ("Kimi K3 ", "Grok 4.6", "grok-4.6", "Gemini 3.7", "gemini-3.7"):
         assert dead not in head, f"SKILL.md frontmatter still names {dead}"
 
 
@@ -1060,9 +1060,9 @@ def test_call_model_end_to_end_with_structured_brief():
         def __exit__(self, *a): return False
         def raise_for_status(self): pass
         def iter_lines(self):
-            yield _sse({"model": "openai/gpt-6.2-sol-20261120", "provider": "OpenAI",
+            yield _sse({"model": "openai/gpt-6.2-terra-20261120", "provider": "OpenAI",
                         "choices": [{"delta": {"content": '{"verdict": "FAIL", '}}]})
-            yield _sse({"model": "openai/gpt-6.2-sol-20261120", "provider": "OpenAI",
+            yield _sse({"model": "openai/gpt-6.2-terra-20261120", "provider": "OpenAI",
                         "choices": [{"delta": {"content": '"defects": []}'},
                                      "finish_reason": "stop"}]})
             yield b"data: [DONE]"
@@ -1074,14 +1074,14 @@ def test_call_model_end_to_end_with_structured_brief():
              "context": [{"id": "design", "content": "x"}],
              "output_contract": {"name": "critic_v1"}}
     out = json.loads(_with_fake_decisions(fake_post, lambda: o.call_model(
-        "openai/gpt-sol-latest", brief)))
+        "openai/gpt-terra-latest", brief)))
     assert out["outcome"] == "OK" and out["contract"]["valid"] is True, out
     assert json.loads(out["content"]) == {"verdict": "FAIL", "defects": []}
     assert sent["messages"][0]["role"] == "system"
     assert sent["messages"][1]["content"].startswith("<orchestra_brief")
     rows = [json.loads(x) for x in open(o._LOG_PATH, encoding="utf-8")
             if out["task_id"] in x]
-    assert rows and rows[-1]["served_model"] == "openai/gpt-6.2-sol-20261120"
+    assert rows and rows[-1]["served_model"] == "openai/gpt-6.2-terra-20261120"
     assert rows[-1]["contract_valid"] is True
 
 
@@ -1136,7 +1136,7 @@ def _brief(role="generator", access=(), contract=None, **extra):
 
 def test_workflow_validation():
     good = {"steps": [{"id": "s1", "model": "glm-5.3", "brief": _brief()},
-                      {"id": "s2", "model": "openai/gpt-sol-latest",
+                      {"id": "s2", "model": "openai/gpt-terra-latest",
                        "brief": _brief("critic", ["s1"], {"name": "critic_v1"})}]}
     p, err = o._validate_workflow(good)
     assert err is None and [st["id"] for st in p["steps"]] == ["s1", "s2"], err
@@ -1166,7 +1166,7 @@ def test_workflow_waves_group_independent_steps():
     p, _ = o._validate_workflow({"steps": [
         {"id": "a", "model": "glm-5.3", "brief": _brief()},
         {"id": "b", "model": "deepseek-v4-pro", "brief": _brief()},
-        {"id": "c", "model": "openai/gpt-sol-latest", "brief": _brief(access=["a", "b"])},
+        {"id": "c", "model": "openai/gpt-terra-latest", "brief": _brief(access=["a", "b"])},
         {"id": "d", "model": "glm-5.3", "brief": _brief(access=["a"])}]})
     assert [[st["id"] for st in w] for w in o._waves(p["steps"])] == [["a", "b"], ["c", "d"]]
 
@@ -1176,14 +1176,14 @@ def test_workflow_enforces_access_lists_and_anonymises():
     by the model that wrote them — and nothing else."""
     fleet = _FakeFleet({"glm-5.3": "GLM_SECRET_DRAFT",
                         "deepseek-v4-pro": "PRO_UNRELATED",
-                        "openai/gpt-sol-latest": '{"verdict": "PASS", "defects": []}'})
+                        "openai/gpt-terra-latest": '{"verdict": "PASS", "defects": []}'})
     plan, _ = o._validate_workflow({"goal": "g", "steps": [
         {"id": "draft", "model": "glm-5.3", "brief": _brief(work_type="swe")},
         {"id": "other", "model": "deepseek-v4-pro", "brief": _brief()},
-        {"id": "review", "model": "openai/gpt-sol-latest",
+        {"id": "review", "model": "openai/gpt-terra-latest",
          "brief": _brief("critic", ["draft"], {"name": "critic_v1"})}]})
     res = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(plan, "wf-access")))
-    review = [c for c in fleet.calls if c["model"] == "openai/gpt-sol-latest"][0]["brief"]
+    review = [c for c in fleet.calls if c["model"] == "openai/gpt-terra-latest"][0]["brief"]
     assert "GLM_SECRET_DRAFT" in review and 'id="draft" kind="prior_output"' in review
     assert "PRO_UNRELATED" not in review, "a step must not see steps outside its access list"
     assert "glm-5.3" not in review, "prior outputs must not reveal which model wrote them"
@@ -1200,11 +1200,11 @@ def test_workflow_enforces_access_lists_and_anonymises():
 
 def test_workflow_fault_barrier_skips_downstream():
     fleet = _FakeFleet({"glm-5.3": "[ERROR] glm/glm-5.3: HTTP 502",
-                        "openai/gpt-sol-latest": "fine"})
+                        "openai/gpt-terra-latest": "fine"})
     plan, _ = o._validate_workflow({"steps": [
         {"id": "a", "model": "glm-5.3", "brief": _brief()},
-        {"id": "b", "model": "openai/gpt-sol-latest", "brief": _brief(access=["a"])},
-        {"id": "c", "model": "openai/gpt-sol-latest", "brief": _brief(access=["b"])}]})
+        {"id": "b", "model": "openai/gpt-terra-latest", "brief": _brief(access=["a"])},
+        {"id": "c", "model": "openai/gpt-terra-latest", "brief": _brief(access=["b"])}]})
     res = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(plan, "wf-fault")))
     steps = {st["step"]: st for st in res["steps"]}
     assert steps["a"]["outcome"] == "ERROR"
@@ -1350,9 +1350,9 @@ def test_log_outcome_records_basis():
 def test_route_evidence_needs_a_measured_margin_to_override_the_prior():
     def run(path):
         _seed_outcomes(path, "swe", "glm-5.3", 10, 5)                   # prior primary 50%
-        _seed_outcomes(path, "swe", "openai/gpt-sol-latest", 10, 9)   # measured 90%
+        _seed_outcomes(path, "swe", "openai/gpt-terra-latest", 10, 9)   # measured 90%
         r = json.loads(o.route_evidence("swe"))
-        assert r["recommendation"]["model"] == "openai/gpt-sol-latest"
+        assert r["recommendation"]["model"] == "openai/gpt-terra-latest"
         assert r["recommendation"]["source"] == "measured"
         assert r["measured"]["glm-5.3"]["rate_source"] == "verified"
         assert "deepseek-v4-pro" in r["explore"]
@@ -1360,17 +1360,17 @@ def test_route_evidence_needs_a_measured_margin_to_override_the_prior():
 
     def close_race(path):
         _seed_outcomes(path, "swe", "glm-5.3", 10, 8)
-        _seed_outcomes(path, "swe", "openai/gpt-sol-latest", 10, 8)
+        _seed_outcomes(path, "swe", "openai/gpt-terra-latest", 10, 8)
         r = json.loads(o.route_evidence("swe"))
         assert r["recommendation"] == {"model": "glm-5.3", "source": "prior",
                                        "why": r["recommendation"]["why"]}
     _with_temp_log(close_race)
 
     def thin(path):
-        _seed_outcomes(path, "swe", "openai/gpt-sol-latest", 9, 9)    # below the minimum
+        _seed_outcomes(path, "swe", "openai/gpt-terra-latest", 9, 9)    # below the minimum
         r = json.loads(o.route_evidence("swe"))
         assert r["recommendation"]["source"] == "prior"
-        assert r["measured"]["openai/gpt-sol-latest"]["rate"] is None
+        assert r["measured"]["openai/gpt-terra-latest"]["rate"] is None
     _with_temp_log(thin)
 
 
@@ -1570,7 +1570,7 @@ GUEST = "meta/muse-spark-9"
 
 
 def test_slug_shapes():
-    for ok in ("meta/muse-spark-9", "openai/gpt-sol-latest", "~openai/gpt-sol-latest",
+    for ok in ("meta/muse-spark-9", "openai/gpt-terra-latest", "~openai/gpt-terra-latest",
                "inception/mercury-decide:free", "z-ai/glm-5.3-prime", "meta/muse-spark-9-contributor"):
         assert o._SLUG.match(ok), ok
     for bad in ("deepseek-v4-pro", "glm-5.3", "", "meta/", "/muse", "Meta Muse/spark",
@@ -1682,8 +1682,8 @@ def test_guest_provenance_demands_the_requested_model_not_a_lookalike():
         "the contributor tier is a different product on different data terms"
     assert not ok("meta/muse-spark-1.2", GUEST) and not ok("other/muse-spark-1.3", GUEST)
     assert ok("muse-spark-9", GUEST), "a tail-only served name is accepted"
-    assert ok("openai/gpt-6.2-sol-20261120", "~openai/gpt-sol-latest")
-    assert not ok("anthropic/claude-x", "~openai/gpt-sol-latest")
+    assert ok("openai/gpt-6.2-terra-20261120", "~openai/gpt-terra-latest")
+    assert not ok("anthropic/claude-x", "~openai/gpt-terra-latest")
     assert ok("inception/mercury-decide", "inception/mercury-decide:free")
     cfg = {"extra": True, "provider": "openrouter", "api_id": None}
     bad = o._check_provenance({"model": "meta/muse-spark-9-contributor"}, GUEST, cfg)
@@ -1809,8 +1809,8 @@ def test_reasoning_param_is_sent_only_when_the_model_supports_it():
     sent2 = {}
     try:
         os.environ["OPENROUTER_API_KEY"] = "k"
-        requests.post = _stream_post("hi", "openai/gpt-6.2-sol-20261120", sent2)
-        o._call("openai/gpt-sol-latest", [{"role": "user", "content": "t"}])
+        requests.post = _stream_post("hi", "openai/gpt-6.2-terra-20261120", sent2)
+        o._call("openai/gpt-terra-latest", [{"role": "user", "content": "t"}])
     finally:
         requests.post = original_post
         if original_key is None:
@@ -1825,12 +1825,12 @@ def test_guests_work_in_workflows_councils_and_adversarial_pairs():
     table = {GUEST: _endpoints_body(), "meta/other-model": _endpoints_body("meta/other-model")}
     handler = _get_by_slug(table)
     fleet = _FakeFleet({"glm-5.3": "from glm", GUEST: "from muse",
-                        "openai/gpt-sol-latest": '{"verdict": "PASS", "defects": []}'})
+                        "openai/gpt-terra-latest": '{"verdict": "PASS", "defects": []}'})
 
     def run():
         plan, err = o._validate_workflow({"steps": [
             {"id": "draft", "model": GUEST, "brief": _brief(work_type="agentic")},
-            {"id": "review", "model": "openai/gpt-sol-latest",
+            {"id": "review", "model": "openai/gpt-terra-latest",
              "brief": _brief("critic", ["draft"], {"name": "critic_v1"})}]})
         assert err is None, err
         wf = json.loads(_with_fake_fleet(fleet, lambda: o._run_workflow(plan, "wf-guest")))
@@ -1841,7 +1841,7 @@ def test_guests_work_in_workflows_councils_and_adversarial_pairs():
         same = o._run_adversarial(_brief(), model_a=GUEST, model_b="meta/other-model")
         return wf, par, adv, same
     wf, par, adv, same = _with_fake_get(handler, run)
-    assert [st["model"] for st in wf["steps"]] == [GUEST, "openai/gpt-sol-latest"]
+    assert [st["model"] for st in wf["steps"]] == [GUEST, "openai/gpt-terra-latest"]
     assert par["results"][GUEST]["class"] == "META-CLOSED"
     assert json.loads(adv)["pair"] == {GUEST: "META-CLOSED", "glm-5.3": "CN-OW"}
     assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
@@ -1906,9 +1906,9 @@ def test_fleet_add_persists_survives_a_restart_and_fleet_remove_undoes_it():
 
 @_fleet_sandbox
 def test_core_fleet_is_fixed_and_fleet_add_validates():
-    for core in ("glm-5.3", "deepseek-v4-pro", "openai/gpt-sol-latest", "typesafe/jev-1.13"):
+    for core in ("glm-5.3", "deepseek-v4-pro", "openai/gpt-terra-latest", "typesafe/jev-1.13"):
         assert "core fleet member" in json.loads(o.fleet_remove(core))["error"]
-    assert "already a core" in json.loads(o.fleet_add("openai/gpt-sol-latest"))["error"]
+    assert "already a core" in json.loads(o.fleet_add("openai/gpt-terra-latest"))["error"]
     assert "not an OpenRouter slug" in json.loads(o.fleet_add("glm-5.3-prime"))["error"]
     assert json.loads(_with_fake_get(_get_by_slug({}), lambda: o.fleet_add("meta/nope")))["error"]
     no_key = json.loads(_with_fake_get(_get_by_slug({GUEST: _endpoints_body()}),
@@ -1972,7 +1972,7 @@ def test_decision_model_guests_join_the_bench_by_name():
     e = o._DECIDERS["typesafe/jev-9"]
     assert e["extra"] and e["ctx"] == 64_000 and e["klass"] == "US-CLOSED" and e["seat"] == "guest"
     assert o._source("typesafe/jev-9") == "guest"
-    assert o._check_panel(["typesafe/jev-9", "upstage/solar-decide"]) is None, "cross-class"
+    assert o._check_panel(["typesafe/jev-9", "perplexity/pplx-decider-latest"]) is None, "cross-class"
     assert "single-class" in o._check_panel(["typesafe/jev-9", "typesafe/jev-1.13"])
     assert json.loads(o.fleet_remove("typesafe/jev-9"))["as"] == ["decider"]
     assert "typesafe/jev-9" not in o._DECIDERS
@@ -2128,14 +2128,14 @@ def test_muse_spark_is_a_plain_core_registry_entry():
     assert not m.get("extra"), "core, not a guest"
     assert m["max_out"] == 640_000 and not m.get("auto_ceiling"), \
         "v20: an operator-set fixed ceiling, not resolved live"
-    assert m["klass"] == "META-CLOSED" != o._MODELS["openai/gpt-sol-latest"]["klass"], \
+    assert m["klass"] == "META-CLOSED" != o._MODELS["openai/gpt-terra-latest"]["klass"], \
         "operator's decision, 2026-11-23: Meta is its own class, so Astra may review Muse"
-    astra = _with_fake_fleet(_FakeFleet({MUSE_CORE: "a", "openai/gpt-sol-latest": "b"}),
+    astra = _with_fake_fleet(_FakeFleet({MUSE_CORE: "a", "openai/gpt-terra-latest": "b"}),
                              lambda: o._run_adversarial(
-                                 BRIEF, model_a=MUSE_CORE, model_b="openai/gpt-sol-latest",
+                                 BRIEF, model_a=MUSE_CORE, model_b="openai/gpt-terra-latest",
                                  task_id="adv-muse-astra"))
     assert json.loads(astra)["pair"] == {MUSE_CORE: "META-CLOSED",
-                                         "openai/gpt-sol-latest": "US-CLOSED"}
+                                         "openai/gpt-terra-latest": "US-CLOSED"}
     same = o._run_adversarial(BRIEF, model_a=MUSE_CORE, model_b="meta/muse-ember")
     assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
         "Spark and Ember share a family and a class: neither may check the other"
@@ -2340,9 +2340,10 @@ def test_a_recovered_lookup_replaces_the_fallback():
 @_with_muse_auto_ceiling
 def test_resolve_applies_the_live_ceiling_only_to_flagged_entries():
     _reset_lookups()
-    aliases = {"openai/gpt-sol-latest": ("~openai/gpt-sol-latest", 128_000, 128_000),
+    aliases = {"openai/gpt-terra-latest": ("~openai/gpt-terra-latest", 128_000, 128_000),
                "x-ai/grok-latest": ("~x-ai/grok-latest", 450_000, 128_000),
-               "google/gemini-pro-latest": ("~google/gemini-pro-latest", 65_536, 65_536),
+               "google/gemini-flash-latest": ("~google/gemini-flash-latest", 65_536, 65_536),
+               "moonshotai/kimi-k3.1": ("moonshotai/kimi-k3.1", 64_000, 64_000),
                "qwen/qwen4-max": ("qwen/qwen4-max", 65_536, 65_536),
                "tencent/hy4": ("tencent/hy4", 32_768, 32_768)}
     handler = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718),
@@ -2415,14 +2416,14 @@ def _healthy_world(overrides=None, ember_declared=943_718, served=None):
     overrides, served = overrides or {}, served or {}
     table = {MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718),
              "meta/muse-ember": _endpoints_body("meta/muse-ember", out=ember_declared),
-             "ibm-granite/granite-4.2-8b": _endpoints_body("ibm-granite/granite-4.2-8b",
+             "moonshotai/kimi-k3.1": _endpoints_body("moonshotai/kimi-k3.1",
                                                            out=117_964),
-             "~openai/gpt-sol-latest": _endpoints_body("~openai/gpt-sol-latest",
+             "~openai/gpt-terra-latest": _endpoints_body("~openai/gpt-terra-latest",
                                                          out=128_000),
              "qwen/qwen4-max": _endpoints_body("qwen/qwen4-max", out=65_536),
              "tencent/hy4": _endpoints_body("tencent/hy4", out=32_768),
              "~x-ai/grok-latest": _endpoints_body("~x-ai/grok-latest", out=450_000),
-             "~google/gemini-pro-latest": _endpoints_body("~google/gemini-pro-latest",
+             "~google/gemini-flash-latest": _endpoints_body("~google/gemini-flash-latest",
                                                           out=65_536)}
     get = _get_by_slug(table)
     calls = []
@@ -2455,7 +2456,7 @@ def _run_check(world, call=lambda: o.fleet_check(), **env):
 def test_fleet_check_passes_a_healthy_fleet():
     _reset_lookups()
     res, calls = _run_check(_healthy_world())
-    assert res["ok"] is True and res["problems"] == [] and res["checked"] == 14
+    assert res["ok"] is True and res["problems"] == [] and res["checked"] == 13
     assert {r["status"] for r in res["rows"]} == {"OK"}
     muse = [r for r in res["rows"] if r["model"] == MUSE_CORE][0]
     assert muse["budget"] == 128_000 and muse["declared_ceiling"] == 943_718
@@ -2463,7 +2464,7 @@ def test_fleet_check_passes_a_healthy_fleet():
     assert muse["price_out_per_m"] == 4.25 and muse["served_model"] == MUSE_CORE
     assert {m for m, _ in calls} == set(o._BUILTIN), "one tiny call per generator"
     assert {e for _, e in calls} == {"low"}, "the check never asks for deep reasoning"
-    assert [r["kind"] for r in res["rows"]].count("decider") == 3
+    assert [r["kind"] for r in res["rows"]].count("decider") == 2
     assert res["warnings"] == []
 
 
@@ -2480,7 +2481,7 @@ def test_fleet_check_reports_a_substitution_with_the_served_name_and_the_fix():
     assert row["served_model"] == "meta/muse-spark-1.3-0902" and row["served_host"] == "Meta"
     assert "meta/muse-spark-1.3-0902" in res["problems"][0]["what"]
     assert "legitimate alias" in res["problems"][0]["what"]
-    assert [r["status"] for r in res["rows"] if r["model"] != MUSE_CORE] == ["OK"] * 13
+    assert [r["status"] for r in res["rows"] if r["model"] != MUSE_CORE] == ["OK"] * 12
 
 
 def test_fleet_check_flags_a_budget_above_the_declared_ceiling():
@@ -2498,16 +2499,16 @@ def test_fleet_check_skips_providers_with_no_key_without_failing():
     res, calls = _run_check(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None)
     assert res["ok"] is True
     assert sorted(res["skipped"]) == ["deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3"]
-    assert {m for m, _ in calls} == {MUSE_CORE, "openai/gpt-sol-latest", "meta/muse-ember",
-                                      "ibm-granite/granite-4.2-8b", "x-ai/grok-latest",
-                                      "google/gemini-pro-latest", "qwen/qwen4-max",
+    assert {m for m, _ in calls} == {MUSE_CORE, "openai/gpt-terra-latest", "meta/muse-ember",
+                                      "moonshotai/kimi-k3.1", "x-ai/grok-latest",
+                                      "google/gemini-flash-latest", "qwen/qwen4-max",
                                       "tencent/hy4"}
     skipped = [r for r in res["rows"] if r["status"] == "SKIPPED"][0]
     assert "is not set" in skipped["note"]
-    assert res["tested"] == 11 and res["verdict"].startswith("OK — 11 of 14"), res["verdict"]
+    assert res["tested"] == 10 and res["verdict"].startswith("OK — 10 of 13"), res["verdict"]
     nothing, _ = _run_check(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None,
                             OPENROUTER_API_KEY=None)
-    assert nothing["checked"] == 14 and len(nothing["skipped"]) == 14 and nothing["problems"] == []
+    assert nothing["checked"] == 13 and len(nothing["skipped"]) == 13 and nothing["problems"] == []
     assert nothing["tested"] == 0 and nothing["ok"] is False, \
         "nothing tested must never read as healthy"
     assert nothing["verdict"].startswith("NOTHING WAS TESTED")
@@ -2519,10 +2520,10 @@ def test_fleet_check_treats_an_unlisted_alias_as_a_warning_not_a_failure():
     get = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)})   # alias 404s
     res, _ = _run_check((get, fake_call, post, calls))
     assert res["ok"] is True
-    row = [r for r in res["rows"] if r["model"] == "openai/gpt-sol-latest"][0]
+    row = [r for r in res["rows"] if r["model"] == "openai/gpt-terra-latest"][0]
     assert row["status"] == "OK" and row["warnings"], "still passes: the real call succeeded"
     assert "could not compare" in row["warnings"][0]
-    assert "openai/gpt-sol-latest" in [w["model"] for w in res["warnings"]]
+    assert "openai/gpt-terra-latest" in [w["model"] for w in res["warnings"]]
 
 
 def test_fleet_check_reports_failed_calls_and_unknown_models():
@@ -2581,7 +2582,7 @@ def test_the_command_line_check_prints_a_table_and_sets_the_exit_code():
     assert code == 0 and len(rows) == 1 and rows[0].split()[1] == "glm-5.3"
     assert MUSE_CORE not in text, "only the model asked for is checked"
     code, text = run(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None)
-    assert code == 0 and "not tested (no API key)" in text and "FLEET OK — 11 of 14" in text
+    assert code == 0 and "not tested (no API key)" in text and "FLEET OK — 10 of 13" in text
     _reset_lookups()
     code, text = run(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None,
                      OPENROUTER_API_KEY=None)
@@ -2593,8 +2594,9 @@ def test_the_command_line_check_prints_a_table_and_sets_the_exit_code():
 # ---------------------------------------------------------------------------
 def test_new_members_are_pinned_and_hold_no_factual_role():
     assert o._MODELS["meta/muse-ember"]["pin"] == "Meta"
-    assert o._MODELS["ibm-granite/granite-4.2-8b"]["pin"] == "CoreWeave"
-    for m in ("meta/muse-ember", "ibm-granite/granite-4.2-8b"):
+    assert o._MODELS["moonshotai/kimi-k3.1"]["pin"] is None, "Kimi K3.1's host is not known yet"
+    assert o._MODELS["moonshotai/kimi-k3.1"]["klass"] == "CN-OW", "Moonshot is CN-OW (_LAB_CLASS)"
+    for m in ("meta/muse-ember", "moonshotai/kimi-k3.1"):
         _, err = o._validate_brief({"role": "verifier", "instruction": "x",
                                     "output_contract": {"name": "verifier_v1"}}, m)
         assert err and "may not act as a verifier" in err, m
@@ -2635,7 +2637,7 @@ def test_every_generator_has_its_seat_in_code_and_in_the_docs():
                         if x.startswith("|") and f"`{model}`" in x)
             assert seat in line, f"{doc} gives `{model}` a different seat from the code ({seat})"
     assert o._SEATS["meta/muse-spark-1.3"] != o._SEATS["meta/muse-ember"]
-    for unmeasured in ("meta/muse-spark-1.3", "meta/muse-ember", "ibm-granite/granite-4.2-8b"):
+    for unmeasured in ("meta/muse-spark-1.3", "meta/muse-ember", "moonshotai/kimi-k3.1"):
         assert unmeasured in o._UNVETTED, "a seat is a prior: it grants no factual role"
         assert unmeasured not in [p for pair in o._ROUTING_PRIOR.values() for p in pair[:1]], \
             "...and no routing primary until route_evidence has measured it"
@@ -2653,7 +2655,8 @@ def test_polarity_canary_blocks_panel_members_and_warns_on_others():
     requests.post = _canary_post(0.95, 0.90)     # says yes to a claim and to its inverse
     try:
         panel = _with_env(lambda: o._check_decider("typesafe/jev-1.13"), OPENROUTER_API_KEY="k")
-        other = _with_env(lambda: o._check_decider("upstage/solar-decide"), OPENROUTER_API_KEY="k")
+        other = _with_temp_decider("typesafe/jev-aux", "US-CLOSED", lambda: _with_env(
+            lambda: o._check_decider("typesafe/jev-aux"), OPENROUTER_API_KEY="k"))
         requests.post = _canary_post(0.95, 0.05)
         clean = _with_env(lambda: o._check_decider("typesafe/jev-1.13"), OPENROUTER_API_KEY="k")
     finally:
@@ -2916,7 +2919,7 @@ def test_fleet_check_rows_keep_the_providers_error_text_without_secrets():
 def test_only_meta_models_are_in_the_meta_class():
     metas = {m for m, e in o._MODELS.items() if e["klass"] == "META-CLOSED"}
     assert metas == {"meta/muse-spark-1.3", "meta/muse-ember"}
-    assert o._MODELS["openai/gpt-sol-latest"]["klass"] == "US-CLOSED"
+    assert o._MODELS["openai/gpt-terra-latest"]["klass"] == "US-CLOSED"
     assert o._LAB_CLASS["meta"] == "META-CLOSED"
 
 
@@ -2951,7 +2954,7 @@ def test_the_package_points_only_at_files_inside_it():
 
 def test_the_always_loaded_skill_names_no_retired_model():
     skill = _packaged_docs()["SKILL.md"].lower()
-    for dead in ("mercury", "pplx-decider-v1.1", "kimi", "ox-alpha", "glm-5.3-prime",
+    for dead in ("mercury", "pplx-decider-v1.1", "kimi k3 ", "ox-alpha", "glm-5.3-prime", "solar",
                  "grok-4.6", "gemini-3.7"):
         assert dead not in skill, f"SKILL.md still names {dead}"
 
@@ -2965,18 +2968,15 @@ def test_every_registry_model_has_a_seat_in_the_skill_and_in_governance():
 
 def test_the_docs_describe_the_servers_default_ratification_panel():
     docs = _packaged_docs()
-    names = {"typesafe/jev-1.13": "Jev", "perplexity/pplx-decider-v1.2": "Decider",
-             "upstage/solar-decide": "Solar"}
+    names = {"typesafe/jev-1.13": "Jev", "perplexity/pplx-decider-latest": "Decider"}
     assert set(names) == set(o._DECIDERS), "a decision model was added: name it here"
     line = next(x for x in docs["SKILL.md"].splitlines()
                 if x.startswith("No synthesis ships until a cross-class panel"))
     for model, short in names.items():
         assert (short in line) == (model in o._DEFAULT_PANEL), \
             f"SKILL.md's ratification line disagrees with _DEFAULT_PANEL about {short}"
-    if "upstage/solar-decide" not in o._DEFAULT_PANEL:
-        for doc, text in docs.items():
-            assert "every ratification panel" not in text, doc
-            assert "decorrelates every panel" not in text, doc
+    for doc, text in docs.items():
+        assert "decorrelates every panel" not in text, doc
 
 
 def test_the_fleet_card_lists_every_class_in_use():
@@ -3294,11 +3294,11 @@ def test_compat_report_is_built_from_the_logs_alone():
 # v20.3 — floating "latest" aliases: GPT Sol, Grok, Gemini Pro
 # ---------------------------------------------------------------------------
 
-LATEST = {"openai/gpt-sol-latest": "~openai/gpt-sol-latest",
+LATEST = {"openai/gpt-terra-latest": "~openai/gpt-terra-latest",
           "x-ai/grok-latest": "~x-ai/grok-latest",
-          "google/gemini-pro-latest": "~google/gemini-pro-latest"}
-LATEST_CLASS = {"openai/gpt-sol-latest": "US-CLOSED", "x-ai/grok-latest": "XAI-CLOSED",
-                "google/gemini-pro-latest": "GOOGLE-CLOSED"}
+          "google/gemini-flash-latest": "~google/gemini-flash-latest"}
+LATEST_CLASS = {"openai/gpt-terra-latest": "US-CLOSED", "x-ai/grok-latest": "XAI-CLOSED",
+                "google/gemini-flash-latest": "GOOGLE-CLOSED"}
 
 
 def test_the_latest_aliases_float_and_hold_no_factual_role():
@@ -3326,15 +3326,15 @@ def test_alias_provenance_accepts_the_family_and_rejects_anything_else():
         cfg = {**o._MODELS[key], **o._CONFIGS["openrouter"]}
         return o._check_provenance({"model": served}, key, cfg)
     for key, good, bad in (
-            ("openai/gpt-sol-latest",
-             ("openai/gpt-6.1-sol-20260929", "openai/gpt-5.6-sol", "openai/gpt-5.6-sol-pro-20260709"),
+            ("openai/gpt-terra-latest",
+             ("openai/gpt-6.1-terra-20260929", "openai/gpt-5.6-terra", "openai/gpt-5.6-terra-pro-20260709"),
              ("openai/gpt-6.2-mini", "anthropic/claude-opus-5.5")),
             ("x-ai/grok-latest",
              ("x-ai/grok-4.6-20260810", "x-ai/grok-4.20-20260309"),
              ("openai/gpt-6.1-sol-20260929", "google/gemini-3.1-pro-preview")),
-            ("google/gemini-pro-latest",
-             ("google/gemini-3.1-pro-preview", "google/gemini-3.8-pro-20261101"),
-             ("google/gemini-3.1-flash", "x-ai/grok-4.6"))):
+            ("google/gemini-flash-latest",
+             ("google/gemini-3.1-flash-preview", "google/gemini-3.8-flash-20261101"),
+             ("google/gemini-3.1-pro", "x-ai/grok-4.6"))):
         for served in good:
             assert check(key, served) is None, (key, served)
         for served in bad:
@@ -3343,9 +3343,9 @@ def test_alias_provenance_accepts_the_family_and_rejects_anything_else():
 
 def test_an_alias_ceiling_is_looked_up_by_its_wire_id_with_a_64k_fallback():
     _reset_lookups()
-    wire = "~google/gemini-pro-latest"
+    wire = "~google/gemini-flash-latest"
     found = _get_by_slug({wire: _endpoints_body(wire, out=65_536)})
-    cfg = _with_fake_get(found, lambda: o._resolve("google/gemini-pro-latest"))
+    cfg = _with_fake_get(found, lambda: o._resolve("google/gemini-flash-latest"))
     assert found.calls == [wire], "a ~alias is listed under its own name, not its registry key"
     assert cfg["max_out"] == 65_536 and cfg["ceiling_source"] == "live lookup"
     _reset_lookups()
@@ -3354,7 +3354,7 @@ def test_an_alias_ceiling_is_looked_up_by_its_wire_id_with_a_64k_fallback():
 
 
 def test_the_latest_aliases_cross_check_by_lab_class():
-    sol, grok, gem = "openai/gpt-sol-latest", "x-ai/grok-latest", "google/gemini-pro-latest"
+    sol, grok, gem = "openai/gpt-terra-latest", "x-ai/grok-latest", "google/gemini-flash-latest"
     same = o._run_adversarial(BRIEF, model_a=sol, model_b=sol)
     assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
         "one lab, one class: Sol cannot check Sol"
@@ -3375,16 +3375,16 @@ def test_the_latest_aliases_cross_check_by_lab_class():
 
 NEW_WORKERS = ("qwen/qwen4-max", "tencent/hy4")
 SEAT_TABLE = {
-    "openai/gpt-sol-latest": "Chief reviewer (code and logic)",
-    "google/gemini-pro-latest": "Second reviewer and generator",
+    "openai/gpt-terra-latest": "Chief reviewer (code and logic)",
+    "google/gemini-flash-latest": "Second reviewer and generator",
     "x-ai/grok-latest": "Worker and generator",
     "qwen/qwen4-max": "Lead worker (reasoning and coding)",
     "tencent/hy4": "Worker (drafts and bulk)",
     "meta/muse-spark-1.3": "Lead long-context worker",
     "meta/muse-ember": "Efficient worker",
-    "ibm-granite/granite-4.2-8b": "Math and code, only where a check grades it",
+    "moonshotai/kimi-k3.1": "Math and code, only where a check grades it",
 }
-CANDIDATES = ("openai/gpt-sol-latest", "google/gemini-pro-latest", "x-ai/grok-latest",
+CANDIDATES = ("openai/gpt-terra-latest", "google/gemini-flash-latest", "x-ai/grok-latest",
               "qwen/qwen4-max", "tencent/hy4")
 
 
@@ -3430,12 +3430,12 @@ def test_qwen_and_tencent_are_cn_ow_unpinned_workers_with_a_live_ceiling():
     for model in NEW_WORKERS:
         out = o._run_adversarial(BRIEF, model_a=model, model_b="glm-5.3")
         assert out.startswith("[ERROR]") and "cross-class" in out.lower(), model
-    ok = _with_fake_fleet(_FakeFleet({"qwen/qwen4-max": "a", "openai/gpt-sol-latest": "b"}),
+    ok = _with_fake_fleet(_FakeFleet({"qwen/qwen4-max": "a", "openai/gpt-terra-latest": "b"}),
                           lambda: o._run_adversarial(BRIEF, model_a="qwen/qwen4-max",
-                                                     model_b="openai/gpt-sol-latest",
+                                                     model_b="openai/gpt-terra-latest",
                                                      task_id="adv-qwen-sol"))
     assert json.loads(ok)["pair"] == {"qwen/qwen4-max": "CN-OW",
-                                      "openai/gpt-sol-latest": "US-CLOSED"}
+                                      "openai/gpt-terra-latest": "US-CLOSED"}
 
 
 def test_google_and_xai_are_their_own_classes_so_sol_and_gemini_review_each_other():
@@ -3443,11 +3443,11 @@ def test_google_and_xai_are_their_own_classes_so_sol_and_gemini_review_each_othe
     assert o._guest_class("x-ai/grok-x") == "XAI-CLOSED"
     assert o._guest_class("openai/gpt-x") == "US-CLOSED"
     assert len({o._MODELS[m]["klass"] for m in
-                ("openai/gpt-sol-latest", "google/gemini-pro-latest", "x-ai/grok-latest")}) == 3
+                ("openai/gpt-terra-latest", "google/gemini-flash-latest", "x-ai/grok-latest")}) == 3
 
 
 def test_with_astra_gone_the_prior_is_glm_and_deepseek_with_no_partner():
-    assert set(o._DEFAULT_PAIR) == {"glm-5.3", "openai/gpt-sol-latest"}
+    assert set(o._DEFAULT_PAIR) == {"glm-5.3", "openai/gpt-terra-latest"}
     assert o._MODELS[o._DEFAULT_PAIR[0]]["klass"] != o._MODELS[o._DEFAULT_PAIR[1]]["klass"]
     for work_type, (primary, partner) in o._ROUTING_PRIOR.items():
         assert primary in ("glm-5.3", "deepseek-v4-pro", "deepseek-v4.1-flash"), work_type

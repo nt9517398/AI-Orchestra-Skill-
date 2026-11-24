@@ -1,6 +1,15 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v20.5 — SIMPLER FLEET  (2026-11-24, operator's decision)
+------------------------------------------------------------
+  1. GPT Sol -> ~openai/gpt-terra-latest; Gemini Pro -> ~google/gemini-flash-latest;
+     IBM Granite -> moonshotai/kimi-k3.1 (CN-OW, same seat). Grok, Muse Spark, Muse Ember,
+     Tencent HY4 and Qwen 4 Max unchanged. Slugs for Terra, Gemini Flash and Kimi K3.1 were
+     not checked against OpenRouter: run fleet_check.
+  2. Solar Decide is removed. The bench is Jev + the Perplexity Decider, now a floating
+     alias (~perplexity/pplx-decider-latest). Long states go to the Decider (262K context).
+
 v20.4 — ASTRA REMOVED; NEW SEATS  (2026-11-24, operator's decision)
 ------------------------------------------------------------------
   1. openai/gpt-astra-latest is removed from the fleet: registry entry, seat, routing prior,
@@ -22,7 +31,7 @@ v20.4 — ASTRA REMOVED; NEW SEATS  (2026-11-24, operator's decision)
 
 v20.3 — THREE FLOATING "LATEST" ALIASES  (2026-11-24, operator's instruction)
 -----------------------------------------------------------------------------
-  Added ~openai/gpt-sol-latest, ~x-ai/grok-latest and ~google/gemini-pro-latest as generators,
+  Added ~openai/gpt-terra-latest, ~x-ai/grok-latest and ~google/gemini-flash-latest as generators,
   by alias rather than by version number (GPT Astra was one until v20.4). Each follows its lab's
   newest model in the family, so: the served model is logged on every dispatch (provenance
   accepts the family and rejects anything else), a verdict belongs to the alias and not to
@@ -417,23 +426,16 @@ _MODELS = {
         # Added 2026-11-23 (v21 plan). $0.10 in / $0.50 out per 1M; 1.05M context. For
         # repeated tool calls, subtasks, extraction and first drafts. Same family as Muse
         # Spark, so the two can never cross-check each other. Unvetted for factual roles.
-    "ibm-granite/granite-4.2-8b": dict(
-        provider="openrouter", klass="US-OW", max_out=64000, pin="CoreWeave",
-        exact_served=True),
-        # Added 2026-11-23 (v21 plan). $0.06 in / $0.15 out per 1M on CoreWeave; 131K
-        # context. For math and code where a deterministic check grades it. Class US-OW:
-        # OpenRouter lists a Hugging Face id, so open weights. A lineage prior, not a
-        # measured independence result. Unvetted for factual roles.
-    "openai/gpt-sol-latest": dict(
+    "moonshotai/kimi-k3.1": dict(
+        provider="openrouter", klass="CN-OW", max_out=64000, auto_ceiling=True, pin=None),
+        # Added 2026-11-24, replacing IBM Granite in the same seat (math and code, only where a
+        # deterministic check grades it). Moonshot is CN-OW (_LAB_CLASS). Slug and specs NOT
+        # checked against OpenRouter; ceiling resolved live (64,000 fallback). Unpinned, unvetted.
+    "openai/gpt-terra-latest": dict(
         provider="openrouter", klass="US-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
-        api_id="~openai/gpt-sol-latest", served_as=("-sol",)),
-        # Added 2026-11-24 at the operator's request, as a FLOATING alias (OpenRouter: it
-        # always redirects to the newest GPT Sol model). Listing, via a search summary:
-        # 1.05M context, 128,000 max output, $2 in / $10 out per 1M. The ceiling is resolved
-        # live (auto_ceiling; 64,000 if the lookup fails). Same lab and class as the
-        # other OpenAI models. served_as=("-sol",) accepts any Sol build.
-        # Unpinned: the host that serves a ~alias is not known yet; the served host is logged
-        # and the pin is a decision for after fleet_check has shown it. Unvetted.
+        api_id="~openai/gpt-terra-latest", served_as=("-terra",)),
+        # Replaces GPT Sol (2026-11-24, operator's decision), as a floating alias. Same lab and
+        # class as the other OpenAI models. served_as accepts any Terra build. Unpinned, unvetted.
     "x-ai/grok-latest": dict(
         provider="openrouter", klass="XAI-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
         api_id="~x-ai/grok-latest", served_as=("grok",)),
@@ -441,14 +443,11 @@ _MODELS = {
         # $6 out per 1M up to 200K input and $4 / $12 above it; max output reported as both
         # 450,000 and 1,000,000, so it is resolved live (64,000 fallback), not typed in.
         # Class XAI-CLOSED (operator, 2026-11-24): xAI is its own lineage. Unpinned, unvetted.
-    "google/gemini-pro-latest": dict(
+    "google/gemini-flash-latest": dict(
         provider="openrouter", klass="GOOGLE-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
-        api_id="~google/gemini-pro-latest", served_as=("-pro",)),
-        # Added 2026-11-24, floating. Listing, via search summaries: 1,048,576 context, 65,536
-        # max output (so the 64,000 fallback fits), $2 in / $12 out per 1M. served_as=("-pro",)
-        # accepts any Pro build and rejects a Flash build served by mistake. Class GOOGLE-CLOSED
-        # (operator, 2026-11-24): Google is its own lineage, so Sol and Gemini can review each
-        # other. Unpinned, unvetted.
+        api_id="~google/gemini-flash-latest", served_as=("-flash",)),
+        # Replaces Gemini Pro (2026-11-24), as a floating alias. GOOGLE-CLOSED: Terra may review it
+        # and it may review Terra. served_as accepts any Flash build. Unpinned, unvetted.
     "qwen/qwen4-max": dict(
         provider="openrouter", klass="CN-OW", max_out=64000, auto_ceiling=True, pin=None),
         # Added 2026-11-24 at the operator's request (seat: lead worker, reasoning and coding).
@@ -470,8 +469,8 @@ _NO_VERIFY = frozenset({"deepseek-v4.1-flash"})
 # until their record earns one — fleet-card 'Verification eligibility': a model is not
 # added to the verifier column on novelty or index alone. Remove an id here to grant it.
 _UNVETTED = frozenset({"meta/muse-spark-1.3", "meta/muse-ember",
-                       "ibm-granite/granite-4.2-8b", "openai/gpt-sol-latest",
-                       "x-ai/grok-latest", "google/gemini-pro-latest",
+                       "moonshotai/kimi-k3.1", "openai/gpt-terra-latest",
+                       "x-ai/grok-latest", "google/gemini-flash-latest",
                        "qwen/qwen4-max", "tencent/hy4"})
 
 # Seats (UPGRADE-PLAN-v21.md 'Target roles', revised 2026-11-24). A seat is the role a model is
@@ -482,14 +481,14 @@ _SEATS = {
     "deepseek-v4-pro": "Algorithmist",
     "deepseek-v4.1-flash": "Drafter",
     "glm-5.3": "Lead engineer & memory keeper",
-    "openai/gpt-sol-latest": "Chief reviewer (code and logic)",
-    "google/gemini-pro-latest": "Second reviewer and generator",
+    "openai/gpt-terra-latest": "Chief reviewer (code and logic)",
+    "google/gemini-flash-latest": "Second reviewer and generator",
     "x-ai/grok-latest": "Worker and generator",
     "qwen/qwen4-max": "Lead worker (reasoning and coding)",
     "tencent/hy4": "Worker (drafts and bulk)",
     "meta/muse-spark-1.3": "Lead long-context worker",
     "meta/muse-ember": "Efficient worker",
-    "ibm-granite/granite-4.2-8b": "Math and code, only where a check grades it",
+    "moonshotai/kimi-k3.1": "Math and code, only where a check grades it",
 }
 
 # ---------------------------------------------------------------------------
@@ -516,32 +515,20 @@ _DECIDERS = {
         klass="US-CLOSED", ctx=32_000, seat="gatekeeper", free=False),
         # $0.042/M in, $0 out. 0.14-0.32s measured by SIL. Best-calibrated of the
         # models SIL tested. Pinned build; ~typesafe/jev-latest floats.
-    "perplexity/pplx-decider-v1.2": dict(
-        klass="CN-OW", ctx=262_144, seat="screener", free=False),
-        # 2026-11-23: replaced v1.1-27b, whose decisions endpoint returned 404. v1.2 won a
-        # small bake-off over google/gemini-decision-1 (both 18/18 and 8/8; Brier 0.000 vs
-        # 0.002) and is the same API contract. Notes below were written for v1.1.
-        # $0.02/M in (OpenRouter listing), $0 out; 262K context; ~187 ms listed. Replaced
-        # the free Mercury Decide (rate-limited, ~200 req/day per a third-party listing;
-        # training terms unconfirmed). Class by BASE lineage, an inference: BenchLM (third
-        # party) reports a Qwen3.8-27B base, which puts it with DeepSeek and GLM rather
-        # than with Jev, so it is not an independent check on those two. Quality evidence
-        # is thin: one BenchLM-verified row (Decision Index 0.3, 62.8) and Perplexity's
-        # own panel (85.71% vs Jev 84.51%, provider-reported, not rerun). Same wire id
-        # style as Jev: the version is pinned, a dated build (-20261006) is accepted.
-    "upstage/solar-decide": dict(
-        klass="KR-CLOSED", ctx=512_000, seat="long-context judge", free=False),
-        # $0.05/M in while 50% off (list price presumably $0.10), $0 out. Solar Mini 4.
-        # 6-15s and ~1k tokens of per-request overhead (SIL). The only bench member
-        # that can take a whole document or a full candidate set as state, and the
-        # only one outside US-CLOSED.
+    "perplexity/pplx-decider-latest": dict(
+        klass="CN-OW", ctx=262_144, seat="screener", free=False,
+        api_id="~perplexity/pplx-decider-latest", served_prefix="perplexity/pplx-decider"),
+        # Replaces perplexity/pplx-decider-v1.2 (2026-11-24, operator's decision), as a floating
+        # alias. The served check accepts any build with the family prefix. $0.02/M in,
+        # 262K context. Class CN-OW by base lineage (an inference, kept from v1.2's notes). Whether
+        # the decisions endpoint accepts a ~alias is UNVERIFIED: fleet_check will show it.
 }
 _QTYPES = ("noul", "choice", "score")
 _GATEKEEPER = "typesafe/jev-1.13"
 # 2026-11-23: Solar left the default panel. It misread inverted questions in live tests
 # (11/16 vs 16/16 for Jev and Decider v1.2; FINDINGS-2026-11-23.md, D10). It stays available
 # for states too large for the others: pass it explicitly, with positive-form questions.
-_DEFAULT_PANEL = ("typesafe/jev-1.13", "perplexity/pplx-decider-v1.2")   # cross-class by construction
+_DEFAULT_PANEL = ("typesafe/jev-1.13", "perplexity/pplx-decider-latest")   # cross-class by construction
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +603,7 @@ _GUEST_UNPRICED_OUT = 16_000     # budget when OpenRouter lists no usable price
 _LAB_CLASS = {"deepseek": "CN-OW", "z-ai": "CN-OW", "moonshotai": "CN-OW",
               "qwen": "CN-OW", "minimax": "CN-OW", "tencent": "CN-OW",
               "openai": "US-CLOSED", "anthropic": "US-CLOSED", "google": "GOOGLE-CLOSED",
-              "x-ai": "XAI-CLOSED", "upstage": "KR-CLOSED", "typesafe": "US-CLOSED", "meta": "META-CLOSED",
+              "x-ai": "XAI-CLOSED", "typesafe": "US-CLOSED", "meta": "META-CLOSED",
               "inception": "US-CLOSED", "perplexity": "US-CLOSED"}
 
 
@@ -1046,7 +1033,7 @@ def _consume_stream(lines, model: str, cfg: dict, progress=None, meta=None) -> s
 
     v16: `meta`, when given, receives the served `model`/`provider` of the first chunk
     that declares them (after that chunk passes provenance). A floating alias like
-    ~openai/gpt-sol-latest resolves to a dated build; the log must record which.
+    ~openai/gpt-terra-latest resolves to a dated build; the log must record which.
     """
     parts, reasoning, finish, n = [], [], None, 0
     try:
@@ -1853,7 +1840,7 @@ def _next_step(task_id: str) -> str:
 # v16 DECISION BENCH transport — POST /api/alpha/decisions. Never raises; every
 # result is a dict with either "answers" or a tagged "error".
 # ---------------------------------------------------------------------------
-_DECIDE_READ_SECONDS = 90     # Solar Decide measured 6-15s; Jev 0.14-0.32s.
+_DECIDE_READ_SECONDS = 90     # the bench answers in well under 1s; the cap is for outages.
 
 
 def _validate_questions(questions) -> Optional[str]:
@@ -1881,7 +1868,7 @@ def _validate_questions(questions) -> Optional[str]:
 
 def _est_tokens(*objs) -> int:
     """Rough size: ~4 chars per token plus ~1k tokens of per-request overhead (the
-    larger of the measured overheads, Solar's)."""
+    larger of the measured overheads)."""
     return sum(len(json.dumps(o, ensure_ascii=False)) for o in objs) // 4 + 1000
 
 
@@ -1899,9 +1886,8 @@ def _decide_raw(model: str, state, questions: dict) -> dict:
     est, ctx = _est_tokens(state, questions), _DECIDERS[model]["ctx"]
     if est > ctx * 0.9:
         return {"error": f"[SKIPPED] state+questions ~{est:,} tokens would overflow "
-                         f"{model}'s ~{ctx:,}-token context — use upstage/solar-decide "
-                         f"or trim the state"}
-    body = {"model": model, "state": state, "questions": questions}
+                         f"{model}'s ~{ctx:,}-token context — trim the state"}
+    body = {"model": _DECIDERS[model].get("api_id", model), "state": state, "questions": questions}
     for attempt in (0, 1):
         try:
             resp = requests.post(_DECISIONS_URL,
@@ -1927,7 +1913,8 @@ def _decide_raw(model: str, state, questions: dict) -> dict:
         if not isinstance(data, dict):
             return {"error": f"[ERROR] decisions/{model}: response was not an object"}
         served = str(data.get("model") or "")
-        if served and not served.startswith(model.split(":")[0]):
+        prefix = _DECIDERS[model].get("served_prefix", model.split(":")[0])
+        if served and not served.lstrip("~").startswith(prefix):
             return {"error": f"[SUBSTITUTED] requested {model!r} but {served!r} answered "
                              f"— discard these probabilities"}
         answers = data.get("answers")
@@ -1994,7 +1981,7 @@ def _check_panel(models) -> Optional[str]:
         return "[ERROR] a panel needs at least two distinct decision models"
     if len({_DECIDERS[m]["klass"] for m in models}) < 2:
         return (f"[ERROR] panel {models} is single-class — include a model from another "
-                f"class (the core bench spans US-CLOSED, KR-CLOSED and CN-OW). Same-class "
+                f"class (the core bench spans US-CLOSED and CN-OW). Same-class "
                 f"agreement is not confirmation (SKILL.md 'Verification ladder').")
     return None
 
@@ -2085,7 +2072,7 @@ def _compare_one(model: str, instructions: str, cand_a: str, cand_b: str,
 # Shared mode logic — used by BOTH the sync tools and the job workers, so the
 # two paths can't drift apart (the v9 "hand-synced copies" complaint, fixed).
 # ---------------------------------------------------------------------------
-_DEFAULT_PAIR = ("glm-5.3", "openai/gpt-sol-latest")   # CN-OW x US-CLOSED
+_DEFAULT_PAIR = ("glm-5.3", "openai/gpt-terra-latest")   # CN-OW x US-CLOSED
 
 
 def _run_parallel(models=_DEFAULT_PAIR, brief: Optional[dict] = None,
@@ -2503,7 +2490,7 @@ def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v
                           looked up and tried as a guest — no setup needed — when the dynamic
                           fleet is enabled (ORCHESTRA_DYNAMIC_FLEET=1; off by default).
           "parallel"    — the same brief to two models (`model_a`/`model_b`, default
-                          glm-5.3 [CN-OW] + openai/gpt-sol-latest
+                          glm-5.3 [CN-OW] + openai/gpt-terra-latest
                           [US-CLOSED]). Capped at 2 by design.
           "adversarial" — 2 rounds, 4 dispatches; `model_a`/`model_b` MUST be from
                           different correlation classes. Same-class pairs are REJECTED.
@@ -2655,8 +2642,8 @@ def call_model(model: str, brief: Union[dict, str], reasoning_effort: str = "max
     work use orchestra_start(mode="model", model=..., brief=...).
 
     Fleet ids: deepseek-v4-pro, deepseek-v4.1-flash, glm-5.3,
-    openai/gpt-sol-latest, x-ai/grok-latest, google/gemini-pro-latest, qwen/qwen4-max,
-    tencent/hy4, meta/muse-spark-1.3, meta/muse-ember, ibm-granite/granite-4.2-8b. With the dynamic fleet enabled
+    openai/gpt-terra-latest, x-ai/grok-latest, google/gemini-flash-latest, qwen/qwen4-max,
+    tencent/hy4, meta/muse-spark-1.3, meta/muse-ember, moonshotai/kimi-k3.1. With the dynamic fleet enabled
     (ORCHESTRA_DYNAMIC_FLEET=1; off by default) ANY other OpenRouter author/name slug is
     looked up and tried as a guest on first mention; otherwise it is refused. Call list_fleet() for classes, seats and budgets. The brief
     shape is documented on orchestra_start.
@@ -2689,7 +2676,7 @@ def orchestra_parallel(brief: Union[dict, str], model_a: str = _DEFAULT_PAIR[0],
     """Send ONE structured brief to two generators concurrently and WAIT. QUICK briefs
     only — for anything substantial use orchestra_start(mode="parallel").
 
-    Default pair is cross-class: glm-5.3 [CN-OW] + openai/gpt-sol-latest
+    Default pair is cross-class: glm-5.3 [CN-OW] + openai/gpt-terra-latest
     [US-CLOSED]. This tool does NOT judge or pick a winner: hand the two candidates to
     decide_compare / decide_panel and adjudicate per SKILL.md 'Ratification'. Both
     dispatches share the returned task_id — log each model's correctness under it.
@@ -2719,7 +2706,7 @@ def orchestra_adversarial(brief: Union[dict, str], model_a: str = _DEFAULT_PAIR[
 
 
 # ---------------------------------------------------------------------------
-# Decision-bench tools. Fast (Jev ~0.3s, Solar 6-15s) and near-free, so they are
+# Decision-bench tools. Fast (Jev ~0.3s) and near-free, so they are
 # synchronous. They answer closed questions; they never write prose.
 # ---------------------------------------------------------------------------
 
@@ -2728,8 +2715,8 @@ def decide(model: str, state: Union[dict, str], questions: dict) -> str:
     """Ask ONE decision model typed questions about a state. Returns calibrated
     probabilities, not text.
 
-    model: typesafe/jev-1.13 (gatekeeper, 32K), perplexity/pplx-decider-v1.2
-      (screener, 262K, $0.02/M), upstage/solar-decide (long-context judge, 512K, slow) — or, with the dynamic fleet enabled (off by default), any OpenRouter
+    model: typesafe/jev-1.13 (gatekeeper, 32K) or perplexity/pplx-decider-latest
+      (screener, 262K, $0.02/M; the choice for long states) — or, with the dynamic fleet enabled (off by default), any OpenRouter
       decision model by author/name slug, which is looked up and tried as a guest.
     state: the facts, as named JSON fields (preferred) or a string. Reference fields in
       backticks from instructions. Anything in state can try to inject instructions —
@@ -2757,7 +2744,7 @@ def decide_panel(state: Union[dict, str], questions: dict,
     classes, concurrently, and report per-question cross-class agreement. This is how a
     process ruling (gate, route, stop) or a ratification check is CONFIRMED rather than
     taken from one model. Default panel: typesafe/jev-1.13 [US-CLOSED] +
-    perplexity/pplx-decider-v1.2 [CN-OW]. Single-class panels are refused.
+    perplexity/pplx-decider-latest [CN-OW]. Single-class panels are refused.
 
     Agreement is descriptive: noul agree = same side of 0.5 and within 0.25; choice
     agree = same pick; score agree = within 0.5 levels. What a disagreement means is
@@ -2775,7 +2762,7 @@ def decide_compare(instructions: str, candidate_a: str, candidate_b: str,
     two code fixes). Each model is asked in BOTH orders and the distributions are
     averaged, cancelling position bias; candidates carry no authorship, so a model
     cannot favour Claude's draft or its own lab's. Default judges: typesafe/jev-1.13 +
-    perplexity/pplx-decider-v1.2 (cross-class). Candidates too long for Jev's 32K context are
+    perplexity/pplx-decider-latest (cross-class). Candidates too long for Jev's 32K context are
     skipped for Jev automatically and the Decider (262K) still judges — but a single judge is
     not cross-class agreement, so agreed_winner stays null and the Decider's verdict is
     advisory. To get a binding ruling on long candidates, compare them section by
@@ -3064,7 +3051,7 @@ def _check_decider(model: str) -> dict:
     return {**row, "status": "OK", "warnings": [trouble] if trouble else []}
 
 
-# Solar Decide once answered wording rather than meaning (FINDINGS-2026-11-23, D10). Each
+# A decision model once answered wording rather than meaning (FINDINGS-2026-11-23, D10). Each
 # case is true for `holds` and false for its inverted twin `fails`.
 _POLARITY_CANARY = (
     ({"number": 4}, "Is `number` even?", "Is `number` odd?"),
@@ -3714,7 +3701,7 @@ def _route_evidence_data(work_type: str, role: str = "generator", last_n: int = 
 # task_id and fleet_stats counts who was right. A router that falls behind is demoted.
 # All thresholds below are PROVISIONAL policy, not measurements.
 # ---------------------------------------------------------------------------
-_ROUTER_CHAIN = (_GATEKEEPER, "perplexity/pplx-decider-v1.2", "upstage/solar-decide")
+_ROUTER_CHAIN = (_GATEKEEPER, "perplexity/pplx-decider-latest")
 _ROUTER_ACCEPT = 0.60         # averaged probability the winning option needs (provisional)
 _ROUTER_POLARITY = 0.25       # max gap between a noul and its negated twin (provisional)
 _ROUTER_MIN_DECISIVE = 10     # decisive verified head-to-heads before the record counts
@@ -3727,14 +3714,13 @@ _ROUTE_BLURB = {
     "meta/muse-spark-1.3": "candidate added at the operator's request; closed weights; "
                            "strong published coding-agent scores; unmeasured here",
     "meta/muse-ember": "small and cheap; repeated tool calls, subtasks and drafts; unmeasured",
-    "ibm-granite/granite-4.2-8b": "very cheap open-weights 8B; math and code when a "
-                                  "deterministic check grades it; unmeasured",
-    "openai/gpt-sol-latest": "chief reviewer (code and logic) by the operator's decision; "
-                             "floating alias; 1.05M context; the build changes; unmeasured",
+    "moonshotai/kimi-k3.1": "Kimi K3.1 (replaces Granite): math and code where a deterministic check grades it; CN-OW; unmeasured",
+    "openai/gpt-terra-latest": "chief reviewer (code and logic) by the operator's decision; "
+                               "floating alias; the build changes; unmeasured",
     "x-ai/grok-latest": "worker and generator; floating alias; own class; 500K context; "
                         "the build changes; unmeasured",
-    "google/gemini-pro-latest": "second reviewer and generator; floating alias; own class, so "
-                                "Sol can review it; the build changes; unmeasured",
+    "google/gemini-flash-latest": "second reviewer and generator; floating alias; own class; "
+                                  "unmeasured",
     "qwen/qwen4-max": "lead worker for reasoning and coding by the operator's decision; "
                       "CN-OW; unmeasured",
     "tencent/hy4": "worker for drafts and bulk by the operator's decision; CN-OW; unmeasured",
