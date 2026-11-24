@@ -1,6 +1,6 @@
 # Orchestra v21 upgrade plan: fleet-powered local workers
 
-Status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; Phase 2 is started: the harness is built and tested and the Claude Code output-cap check is measured; the live model matrix has not been run. Phases 3 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
+Status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; v20.2 (2026-11-24) removed the routers and applied the fleet seats in code. Phase 2 is started: the harness is built and tested and the Claude Code output-cap check is measured; the live model matrix has not been run. Phases 3 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
 
 ## Objective
 
@@ -127,7 +127,7 @@ Every attempt must fail and the canary must appear in no output or provider requ
 
 ## Fleet redesign (added 2026-11-23)
 
-Proposed, not implemented. Live checks on 2026-11-23 were one small call per route, so they show availability, not quality.
+Roles applied in code and docs on 2026-11-24 (v20.2); routers removed the same day. Live checks on 2026-11-23 were one small call per route, so they show availability, not quality.
 
 ### Live check
 
@@ -136,21 +136,18 @@ Proposed, not implemented. Live checks on 2026-11-23 were one small call per rou
 | `meta/muse-spark-1.3` | 1.25 / 4.25 | 1.05M | Pass | Hosts: Google, Meta |
 | `meta/muse-ember` | 0.10 / 0.50 | 1.05M | Pass | Hosts: Google, Meta |
 | `ibm-granite/granite-4.2-8b` | 0.06 / 0.15 (CoreWeave) | 131K | Pass | Hosts: CoreWeave, DeepInfra |
-| `openrouter/auto` | Served model's price | 2M | Pass | Honoured a Muse/Granite allowlist 3 of 3 times |
-| `openrouter/auto-code` | Served model's price | 2M | Pass unrestricted | **503 with the Muse/Granite allowlist**; unrestricted it chose `openai/gpt-6.2-sol` |
-| `openrouter/fusion` | Varies | 1M | **Fail (400)**; listed without tools | Chat call was answered by `anthropic/claude-opus-5.5` |
 | GPT Astra (current) | 8 / 40 listed | 1.05M | Not retested | The registry comment still says $10 / $50 |
 
-### Decision (accepted 2026-11-23): routers assist Astra; they do not replace it yet
+### Decision (2026-11-24): no routers
 
-Orchestra's verification depends on knowing **which model answered and that it differs in class from the worker**. A router chooses that at run time, so:
+The owner removed the routers. `openrouter/auto` is out of the fleet and `call_router` is deleted (v20.2); `openrouter/auto-code` and `openrouter/fusion` were never wired in and are dropped from the plan. This replaces the 2026-11-23 decision that routers would assist Astra. The reasons recorded then still describe what the routers would have cost: Orchestra's verification depends on knowing **which model answered and that it differs in class from the worker**, and a router chooses that at run time, so:
 
 - it can pick the worker's own family, silently voiding a cross-class check;
 - the `[SUBSTITUTED]` provenance guard cannot tell a legitimate route from a wrong model unless it checks against an allowlist;
 - `route_evidence` learns nothing about a moving target unless each result is logged under the served model;
 - Fusion can answer with Claude, so it is not independent of a Claude-authored synthesis, and it uses web search on the prompt.
 
-### Target roles
+### Target roles (applied 2026-11-24: `_SEATS` in code, `list_fleet`, and the seat tables in `SKILL.md` and `governance.md`)
 
 | Seat | Model | Rule |
 |---|---|---|
@@ -159,9 +156,6 @@ Orchestra's verification depends on knowing **which model answered and that it d
 | Efficient worker | Muse Ember | Repeated tool calls, subtasks, extraction, first drafts |
 | Math / code specialist candidate | Granite 4.2 8B | Only where a deterministic check grades it. Possible new correlation class, to be confirmed from its lineage |
 | Chief reviewer | **GPT Astra, for now** | Verifier and high-stakes review |
-| Everyday router | `openrouter/auto` **with an allowlist** | Low-stakes generator work only, never verification |
-| Coding router | `openrouter/auto-code` | Disabled until it works with an approved allowlist, or for public code only |
-| Optional second opinion | `openrouter/fusion` | Explicit request, public content only. Never a verifier or worker |
 
 Muse Spark and Ember share a family, so neither may verify the other. Neither takes a factual or verifier role until measured.
 
@@ -179,16 +173,9 @@ Astra stays as the fallback until all five hold.
 
 ### Added work
 
-- **Phase 1:** register Ember and Granite as unvetted; add a `router` entry type with an allowlist; log the served model and host for every routed call; refuse any router in a verifier, ratification or factual role.
-- **Phase 2:** add Ember, Granite and both routers to the worker compatibility matrix.
-- **Phase 4:** a worker may use `openrouter/auto` only with an allowlist.
-- **Phase 6:** add arms for Spark, Ember, Granite, allowlisted Auto, and Spark + Astra review.
-
-**Verify:**
-- A router result from outside the allowlist returns `[SUBSTITUTED]`.
-- A request for a router as verifier is refused by the server, in tests.
-- 20 routed calls all log a served model inside the allowlist.
-- `route_evidence` credits the served model, never the router's name.
+- **Phase 1:** register Ember and Granite as unvetted. (Done. The router work that was listed here was removed.)
+- **Phase 2:** add Ember and Granite to the worker compatibility matrix.
+- **Phase 6:** add arms for Spark, Ember, Granite, and Spark + Astra review.
 
 ## Release gates
 
@@ -199,7 +186,6 @@ v21 ships only when all are true:
 - [ ] Budget caps hold against OpenRouter's billing record
 - [ ] Every failure mode returns a tag, never false success
 - [ ] Benchmark report written, including negative results
-- [ ] No router can occupy a verifier, ratification or factual seat
 - [ ] A killed multi-model run keeps every finished result
 - [ ] Lab rules intact: no fleet worker on search, quotes, citations or gate words
 
@@ -224,8 +210,8 @@ All answered 2026-11-23:
 5. Code leaving the machine: **test and public projects only** at first.
 6. Commit v20 as baseline once `.gitignore` is restored: **yes**.
 7. Astra stays reviewer until Muse earns promotion: **yes**.
-8. `openrouter/auto`: **allowlist only**. *Owner's reply was numbered 7 ("Yes"); read as this question, to be confirmed.*
-9. Fusion: **opt-in, public content only**. *Owner's reply was numbered 8 ("Opt-in"); read as this question, to be confirmed.*
+8. `openrouter/auto`: **allowlist only**. *Superseded 2026-11-24: the routers were removed.*
+9. Fusion: **opt-in, public content only**. *Superseded 2026-11-24: Fusion is out of the plan.*
 
 4. Spend limits during testing: **$2 per worker, $10 per day**. Enforced from OpenRouter's reported cost, and replaced with measured limits after the Phase 6 benchmark.
 

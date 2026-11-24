@@ -47,17 +47,12 @@ DEFAULT_BASE = "https://openrouter.ai/api"
 FEATURES = ("basic", "pin", "forced_tool", "tool_loop", "parallel_tools", "streaming",
             "caching", "thinking", "claude_code_worker")
 GATES = ("tool_loop", "claude_code_worker")
-ROUTER_ALLOW = ("meta/muse-spark-1.3", "meta/muse-ember", "ibm-granite/granite-4.2-8b")
 # Mirrors orchestra_mcp_server.py (a test fails if the two drift apart).
 MODELS = {
     "meta/muse-spark-1.3": {"wire": "meta/muse-spark-1.3", "pin": "Meta"},
     "meta/muse-ember": {"wire": "meta/muse-ember", "pin": "Meta"},
     "ibm-granite/granite-4.2-8b": {"wire": "ibm-granite/granite-4.2-8b", "pin": "CoreWeave"},
     "openai/gpt-astra-latest": {"wire": "~openai/gpt-astra-latest", "pin": "OpenAI"},
-    "openrouter/auto": {
-        "wire": "openrouter/auto", "pin": None,
-        "extra": {"plugins": [{"id": "auto-router", "allowed_models": list(ROUTER_ALLOW)}],
-                  "provider": {"only": ["Meta", "CoreWeave"], "allow_fallbacks": False}}},
 }
 TOOLS = [
     {"name": "add", "description": "Add two integers.",

@@ -2540,12 +2540,8 @@ def test_the_command_line_check_prints_a_table_and_sets_the_exit_code():
     assert "NOTHING WAS TESTED" in text and "FLEET OK" not in text
 
 # ---------------------------------------------------------------------------
-# v21 Phase 1 — routers, new fleet members, polarity canary
+# v21 Phase 1 — new fleet members, polarity canary
 # ---------------------------------------------------------------------------
-ROUTER = "openrouter/auto"
-ROUTER_BRIEF = {"role": "generator", "instruction": "x", "output_contract": {"format": "text"}}
-
-
 def test_new_members_are_pinned_and_hold_no_factual_role():
     assert o._MODELS["meta/muse-ember"]["pin"] == "Meta"
     assert o._MODELS["ibm-granite/granite-4.2-8b"]["pin"] == "CoreWeave"
@@ -2555,62 +2551,45 @@ def test_new_members_are_pinned_and_hold_no_factual_role():
         assert err and "may not act as a verifier" in err, m
 
 
-def test_router_request_carries_the_allowlist_and_hosts():
-    p = _capture_payload(ROUTER, "OPENROUTER_API_KEY", reasoning_effort="low")
-    assert p["model"] == ROUTER
-    assert p["plugins"] == [{"id": "auto-router",
-                             "allowed_models": list(o._ROUTERS[ROUTER]["allowed"])}]
-    assert p["provider"] == {"only": ["Meta", "CoreWeave"], "allow_fallbacks": False}
-
-
-def test_router_rejects_a_model_or_host_outside_its_allowlist():
-    cfg = o._resolve(ROUTER)
-    check = lambda m, h: o._check_provenance({"model": m, "provider": h}, ROUTER, cfg)
-    assert check("meta/muse-ember", "Meta") is None
-    assert check("meta/muse-spark-1.3-20260902", "Meta") is None
-    assert check("ibm-granite/granite-4.2-8b", "CoreWeave") is None
-    for model, host in (("openai/gpt-6-luna", "OpenAI"),
-                        ("meta/muse-spark-1.3-contributor", "Meta"),
-                        ("meta/muse-ember", "Google")):
-        assert check(model, host).startswith("[SUBSTITUTED]"), (model, host)
-
-
-def test_router_cannot_hold_a_checking_role_or_enter_cross_class_modes():
-    for role, contract in (("verifier", {"name": "verifier_v1"}), ("critic", {"name": "critic_v1"}),
-                           ("extractor", {"name": "extractor_v1"}),
-                           ("synthesizer", {"name": "synthesis_v1"})):
-        res = json.loads(o.call_router({"role": role, "instruction": "x",
-                                        "output_contract": contract}))
-        assert "error" in res and "generator role" in res["error"], role
-    sensitive = dict(ROUTER_BRIEF, context=[{"id": "a", "content": "x", "sensitive": True}])
-    assert "sensitive" in json.loads(o.call_router(sensitive))["error"]
-    assert ROUTER not in o._MODELS, "a router in _MODELS could reach parallel and verifiers"
-    assert "unknown model" in json.loads(o.call_model(ROUTER, ROUTER_BRIEF))["error"]
-    assert "unknown model" in o._run_adversarial(ROUTER_BRIEF, model_a=ROUTER, model_b="glm-5.3")
-    assert "unknown model" in o._run_parallel([ROUTER, "glm-5.3"], ROUTER_BRIEF)
-    assert ROUTER not in json.loads(o.route_evidence("drafting"))["measured"]
-
-
-def test_router_dispatch_is_credited_to_the_served_model():
-    original = o._call
-
-    def fake(model, messages, reasoning_effort="max", progress=None, meta=None):
-        meta.update(model="meta/muse-ember-20261101", provider="Meta")
-        return "done"
-
-    def run(path):
-        res = json.loads(o.call_router(ROUTER_BRIEF))
-        assert res["outcome"] == "OK" and res["served_model"].startswith("meta/muse-ember")
-        row = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()
-               if '"type": "dispatch"' in l][0]
-        assert row["model"] == "meta/muse-ember" and row["via"] == ROUTER
-        assert row["klass"] == "META-CLOSED"
-        assert "router" in o.log_outcome(res["task_id"], ROUTER, "CORRECT")
-    o._call = fake
+def test_the_routers_are_gone():
+    import asyncio
+    for name in ("_ROUTERS", "call_router", "_router_member"):
+        assert not hasattr(o, name), f"{name} should have been removed with the routers"
+    tools = {t.name for t in asyncio.run(o.mcp.list_tools())}
+    assert "call_router" not in tools and "route_decide" in tools, \
+        "the decision-model router (route_decide) is a different thing and stays"
     try:
-        _with_temp_log(run)
-    finally:
-        o._call = original
+        o._resolve("openrouter/auto")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("openrouter/auto still resolves")
+    brief = {"role": "generator", "instruction": "x", "output_contract": {"format": "text"}}
+    assert "unknown model" in json.loads(o.call_model("openrouter/auto", brief))["error"]
+    assert "routers" not in json.loads(o.list_fleet())
+    assert "openrouter/auto" not in _compat().MODELS
+    for doc, text in _packaged_docs().items():
+        for line in text.splitlines():
+            if line.startswith("- **20"):          # a dated changelog line may record the removal
+                continue
+            assert "call_router" not in line and "openrouter/auto" not in line, (doc, line[:80])
+
+
+def test_every_generator_has_its_seat_in_code_and_in_the_docs():
+    docs = _packaged_docs()
+    assert set(o._SEATS) == set(o._MODELS), "every core generator needs a seat, and no other"
+    rows = {r["model"]: r["seat"] for r in json.loads(o.list_fleet())["fleet"]}
+    assert rows == o._SEATS, "list_fleet must report the seats"
+    for model, seat in o._SEATS.items():
+        for doc in ("SKILL.md", "references/governance.md"):
+            line = next(x for x in docs[doc].splitlines()
+                        if x.startswith("|") and f"`{model}`" in x)
+            assert seat in line, f"{doc} gives `{model}` a different seat from the code ({seat})"
+    assert o._SEATS["meta/muse-spark-1.3"] != o._SEATS["meta/muse-ember"]
+    for unmeasured in ("meta/muse-spark-1.3", "meta/muse-ember", "ibm-granite/granite-4.2-8b"):
+        assert unmeasured in o._UNVETTED, "a seat is a prior: it grants no factual role"
+        assert unmeasured not in [p for pair in o._ROUTING_PRIOR.values() for p in pair[:1]], \
+            "...and no routing primary until route_evidence has measured it"
 
 
 def _canary_post(holds, fails):
@@ -2930,7 +2909,7 @@ def test_the_always_loaded_skill_names_no_retired_model():
 
 def test_every_registry_model_has_a_seat_in_the_skill_and_in_governance():
     docs = _packaged_docs()
-    for model in list(o._MODELS) + list(o._DECIDERS) + list(o._ROUTERS):
+    for model in list(o._MODELS) + list(o._DECIDERS):
         for doc in ("SKILL.md", "references/governance.md"):
             assert f"`{model}`" in docs[doc], f"`{model}` has no seat in {doc}"
 
@@ -3162,15 +3141,10 @@ def test_compat_parses_server_sent_events():
 def test_compat_defaults_match_the_server_registry():
     ac = _compat()
     for label, spec in ac.MODELS.items():
-        if label in o._ROUTERS:
-            r = o._ROUTERS[label]
-            assert spec["extra"]["plugins"][0]["allowed_models"] == list(r["allowed"])
-            assert spec["extra"]["provider"]["only"] == list(r["hosts"])
-            continue
         assert label in o._MODELS, f"{label} is not in the registry"
         assert spec["pin"] == o._MODELS[label]["pin"], label
         assert spec["wire"] == (o._MODELS[label].get("api_id") or label), label
-    assert set(ac.MODELS) - set(o._ROUTERS) == {
+    assert set(ac.MODELS) == {
         m for m, e in o._MODELS.items() if e["provider"] == "openrouter"}, \
         "an OpenRouter model is missing from the compatibility harness"
 

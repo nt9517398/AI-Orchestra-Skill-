@@ -1,6 +1,18 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v20.2 — SEATS IN CODE; THE ROUTERS ARE REMOVED  (2026-11-24, operator's instruction)
+-------------------------------------------------------------------------------------
+  1. openrouter/auto and call_router are gone, with everything that supported them (the
+     router registry, its allowlist and host checks, credit-to-served-model logging, the
+     log_outcome router guard, the list_fleet `routers` key). The plan's coding router and
+     Fusion were never wired in and are dropped from it. The decision-model router behind
+     route_decide (_ROUTER_CHAIN, router_record) is a different thing and stays.
+  2. The fleet roles of UPGRADE-PLAN-v21.md 'Target roles' are applied in code: _SEATS names
+     each generator's seat, list_fleet reports it, and a test keeps it identical to the seat
+     tables in SKILL.md and governance.md. A seat is a prior: it grants no routing primary
+     (route_evidence needs measured verdicts) and no factual role (_UNVETTED).
+
 v20.1 — REPAIR + RELIABLE RUNS  (2026-11-23; no new capability for the fleet)
 ------------------------------------------------------------------------------
   1. mcp is pinned below 2 (requirements.txt). mcp 2.x renamed FastMCP, so a fresh
@@ -404,16 +416,18 @@ _NO_VERIFY = frozenset({"deepseek-v4.1-flash"})
 _UNVETTED = frozenset({"meta/muse-spark-1.3", "meta/muse-ember",
                        "ibm-granite/granite-4.2-8b"})
 
-# v21 ROUTERS. OpenRouter picks the model at run time, so a router can never be a verifier:
-# cross-class checks need to know who answered BEFORE the call. Routers are deliberately
-# NOT in _MODELS, which keeps them out of parallel, adversarial, workflows, route_decide and
-# every factual role by construction. Only call_router reaches them. The allowlist and the
-# host list are enforced on the request AND checked on the response.
-_ROUTERS = {
-    "openrouter/auto": dict(
-        provider="openrouter", klass="ROUTER", max_out=64000,
-        allowed=("meta/muse-spark-1.3", "meta/muse-ember", "ibm-granite/granite-4.2-8b"),
-        hosts=("Meta", "CoreWeave")),
+# Seats (UPGRADE-PLAN-v21.md 'Target roles', applied 2026-11-24). A seat is the role a model is
+# a PRIOR for. It grants no routing primary (route_evidence needs measured verdicts) and no
+# factual role (_UNVETTED, _NO_VERIFY). The names are the ones in the seat tables of SKILL.md
+# and governance.md; a test keeps the three in step.
+_SEATS = {
+    "deepseek-v4-pro": "Algorithmist",
+    "deepseek-v4.1-flash": "Drafter",
+    "glm-5.3": "Lead engineer & memory keeper",
+    "openai/gpt-astra-latest": "Chief reviewer & research author",
+    "meta/muse-spark-1.3": "Lead worker candidate",
+    "meta/muse-ember": "Efficient worker",
+    "ibm-granite/granite-4.2-8b": "Math and code candidate",
 }
 
 # ---------------------------------------------------------------------------
@@ -854,11 +868,6 @@ _load_extras()
 def _resolve(model: str) -> dict:
     """Single lookup point. Fails with a specific, actionable message — never a bare
     KeyError from a dict literal buried inside a calling function (the v13 defect)."""
-    if model in _ROUTERS:
-        m = dict(_ROUTERS[model])
-        m.update(_CONFIGS[m["provider"]])
-        m["key"] = os.environ.get(m["key_env"], "")
-        return m
     if model not in _MODELS:
         raise KeyError(f"{model!r} is not in _MODELS — add a registry entry before "
                        f"dispatch. Known models: {sorted(_MODELS)}")
@@ -890,8 +899,6 @@ def _provider_block(cfg: dict) -> dict:
     """
     if cfg["provider"] != "openrouter":
         return {}
-    if cfg.get("allowed"):                 # a router: only the approved hosts
-        return {"provider": {"only": list(cfg["hosts"]), "allow_fallbacks": False}}
     if cfg.get("order"):
         return {"provider": {"order": cfg["order"],
                              "allow_fallbacks": False,
@@ -914,11 +921,6 @@ def _served_tokens(model: str, cfg: dict) -> tuple:
     return (wire.lstrip("~").split("/")[-1].split(":")[0],)
 
 
-def _router_member(served: str, cfg: dict) -> Optional[str]:
-    """The allowlisted model this served name is (exact or a dated build), or None."""
-    return next((a for a in cfg["allowed"] if _served_ok(served, a)), None)
-
-
 def _check_provenance(body: dict, model: str, cfg: dict):
     """v14 — return a [SUBSTITUTED] string, or None when provenance is clean.
 
@@ -930,14 +932,6 @@ def _check_provenance(body: dict, model: str, cfg: dict):
     """
     served_model = (body.get("model") or "").strip()
     served_prov = (body.get("provider") or "").strip()
-    if cfg.get("allowed"):
-        if served_model and not _router_member(served_model, cfg):
-            return (f"[SUBSTITUTED] router {model!r} served {served_model!r}, which is not "
-                    f"on its allowlist {list(cfg['allowed'])} — discard this output")
-        if served_prov and served_prov.lower() not in {h.lower() for h in cfg["hosts"]}:
-            return (f"[SUBSTITUTED] router {model!r} used host {served_prov!r}, not one of "
-                    f"{list(cfg['hosts'])} — discard this output")
-        return None
     if served_model and not (_served_ok(served_model, cfg.get("api_id") or model)
                              if (cfg.get("extra") or cfg.get("exact_served")) else
                              any(t in served_model for t in _served_tokens(model, cfg))):
@@ -1344,8 +1338,6 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
     payload = {"model": cfg.get("api_id") or model, "messages": messages,
                "max_tokens": cfg["max_out"], "stream": True}
     payload.update(_provider_block(cfg))     # OpenRouter pin; no-op for direct APIs
-    if cfg.get("allowed"):
-        payload["plugins"] = [{"id": "auto-router", "allowed_models": list(cfg["allowed"])}]
     if provider == "glm":
         # GLM-5.3 cannot disable thinking; thinking.type="disabled" hard-FAILS.
         payload["thinking"] = {"type": "enabled"}
@@ -1426,7 +1418,7 @@ def _source(model: str) -> str:
 
 
 def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=None,
-                 work_type="", meta_out=None, **call_kwargs):
+                 work_type="", **call_kwargs):
     """Wrap the pure _call() so every user-facing dispatch appends EXACTLY ONE log row.
     Placed only at LEAF call sites — never around a path that itself calls _logged_call
     — so _call's internal timeout/429/5xx retries stay invisible and one logical
@@ -1443,7 +1435,7 @@ def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=Non
     dispatches would vanish from the log and it would look the most reliable."""
     t0 = time.time()
     out = None
-    meta = {} if meta_out is None else meta_out
+    meta = {}
     call_id = uuid.uuid4().hex[:12]
     # v20.1: written BEFORE the call. A call that is killed never reaches the dispatch row
     # below, and without this row it would leave no trace. fleet_stats lists started rows
@@ -1455,22 +1447,17 @@ def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=Non
         return out
     finally:
         tag = _outcome_tag(out) if isinstance(out, str) else "UNCAUGHT"
-        # A routed call is credited to the model that served it, so route_evidence and
-        # fleet_stats measure real models and never a moving target.
-        credited = (_router_member(meta.get("model", ""), _ROUTERS[model]) or model
-                    if model in _ROUTERS else model)
         # Saved before the row is logged: a kill between the two leaves the answer on disk
         # and the call listed as unfinished, which is recoverable; the reverse is not.
-        _save_result(task_id, call_id, credited, out, tag, meta, mode, role)
+        _save_result(task_id, call_id, model, out, tag, meta, mode, role)
         _log_event({"type": "dispatch", "ts": _now(), "task_id": task_id, "call_id": call_id,
-                    "model": credited, "klass": _MODELS.get(credited, {}).get("klass", "?"),
-                    "provider": _MODELS.get(credited, {}).get("provider", "?"),
-                    **({"via": model} if model in _ROUTERS else {}),
+                    "model": model, "klass": _MODELS.get(model, {}).get("klass", "?"),
+                    "provider": _MODELS.get(model, {}).get("provider", "?"),
                     "mode": mode, "role": role, "outcome": tag,
                     **({"error_detail": _redact(out[:600] if isinstance(out, str)
                                                 else "uncaught exception")}
                        if tag != "OK" else {}),
-                    "source": _source(credited),
+                    "source": _source(model),
                     "work_type": work_type,
                     "out_chars": len(out) if isinstance(out, str) else 0,
                     "served_model": meta.get("model", ""),
@@ -2596,43 +2583,6 @@ def check_job(job_id: str, wait_seconds: int = 25) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def call_router(brief: Union[dict, str], router: str = "openrouter/auto",
-                reasoning_effort: str = "low") -> str:
-    """Let OpenRouter pick the model for LOW-STAKES generator work, inside the approved
-    allowlist and hosts (list_fleet shows them). QUICK tasks only.
-
-    Generator role only: a router cannot verify, critique, extract or ratify, because who
-    answers is decided at run time. Context marked sensitive is refused. A reply from
-    outside the allowlist returns [SUBSTITUTED]. The dispatch is logged under the model
-    that served it; call log_outcome with `served_model`, never with the router's name.
-
-    Returns JSON {task_id, router, served_model, served_host, outcome, content}.
-    """
-    if router not in _ROUTERS:
-        return json.dumps({"error": f"[ERROR] unknown router {router!r} — known: "
-                                    f"{sorted(_ROUTERS)}"})
-    b, err = _validate_brief(brief, router)
-    if err:
-        return json.dumps({"error": f"[ERROR] invalid brief: {err}"})
-    if b["role"] != "generator":
-        return json.dumps({"error": f"[ERROR] {router} may only take the generator role, got "
-                                    f"{b['role']!r} — who answers is decided at run time, so "
-                                    f"it cannot hold a checking role"})
-    if any(i.get("sensitive") for i in b["context"]):
-        return json.dumps({"error": f"[ERROR] {router} may not receive context marked "
-                                    f"sensitive"})
-    task_id, meta = _new_task_id(), {}
-    out = _logged_call(router, _render_brief(b, task_id), task_id=task_id, role=b["role"],
-                       mode="router", contract=b["output_contract"],
-                       work_type=b.get("work_type", ""), reasoning_effort=reasoning_effort,
-                       meta_out=meta)
-    return json.dumps({"task_id": task_id, "router": router,
-                       "served_model": meta.get("model", ""),
-                       "served_host": meta.get("provider", ""),
-                       "outcome": _outcome_tag(out), "content": out}, ensure_ascii=False)
-
-
-@mcp.tool()
 def call_model(model: str, brief: Union[dict, str], reasoning_effort: str = "max") -> str:
     """Call ONE generator with a structured brief and WAIT. QUICK tasks only; for deep
     work use orchestra_start(mode="model", model=..., brief=...).
@@ -3188,6 +3138,7 @@ def list_fleet() -> str:
             **({"budget_source": (_CEILING_STATE[mid]["source"] if mid in _CEILING_STATE
                                   else "registry fallback — resolved live on first use")}
                if m.get("auto_ceiling") else {}),
+            "seat": _SEATS.get(mid, "guest" if m.get("extra") else "unassigned"),
             "may_verify_facts": _verify_bar(mid) is None,
             "api_key_present": key_present,
             "source": _source(mid),
@@ -3209,9 +3160,6 @@ def list_fleet() -> str:
         "decision_bench": bench,
         "correlation_classes": classes,
         "bench_classes": sorted({d["klass"] for d in _DECIDERS.values()}),
-        "routers": {k: {"allowed": list(v["allowed"]), "hosts": list(v["hosts"]),
-                        "use": "call_router, generator role only; never a verifier"}
-                    for k, v in _ROUTERS.items()},
         "classes_reachable_now": reachable,
         "cross_class_verification_available": len(reachable) > 1,
         "bench_available": or_key,
@@ -4030,9 +3978,6 @@ def log_outcome(task_id: str, model: str, correctness: str,
         return f"[ERROR] disposition must be one of {[x for x in _DISPOSITION if x]} or empty — got {disposition!r}"
     if not task_id.strip() or not model.strip():
         return "[ERROR] task_id and model are both required — per-model verdicts are the whole point"
-    if model.strip() in _ROUTERS:
-        return (f"[ERROR] {model.strip()} is a router: log the outcome under the model that "
-                f"served it (`served_model` in the call_router result)")
     bs = "L1" if c == "OVERTURNED_BY_L1" else basis.strip().upper()
     if bs not in _BASIS:
         return f"[ERROR] basis must be one of {list(_BASIS)} — got {basis!r}"
