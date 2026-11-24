@@ -903,26 +903,26 @@ def test_decide_posts_system_one_body_to_decisions_endpoint():
 
     def handler(url, **kw):
         seen["url"], seen["json"] = url, kw["json"]
-        return _FakeResp(200, {"model": "typesafe/jev-1.13-20260917", "provider": "TypeSafe",
+        return _FakeResp(200, {"model": "typesafe/jev-latest-20260917", "provider": "TypeSafe",
                                "answers": {"needs_fleet": {"type": "noul", "noul": 0.91}},
                                "usage": {"cost": 1e-05}})
     res = _with_fake_decisions(handler, lambda: o._decide_raw(
-        "typesafe/jev-1.13", {"task": "prove it"}, Q))
+        "typesafe/jev-latest", {"task": "prove it"}, Q))
     assert seen["url"].endswith("/api/alpha/decisions")
     assert set(seen["json"]) == {"model", "state", "questions"}, \
         "decision models take no sampling or chat parameters"
     assert res["answers"]["needs_fleet"]["noul"] == 0.91
-    assert res["served_model"] == "typesafe/jev-1.13-20260917"
+    assert res["served_model"] == "typesafe/jev-latest-20260917"
 
 
 def test_decide_flags_substitution_and_missing_answers():
     sub = _with_fake_decisions(
         lambda url, **kw: _FakeResp(200, {"model": "someone/else", "answers": {}}),
-        lambda: o._decide_raw("typesafe/jev-1.13", "s", Q))
+        lambda: o._decide_raw("typesafe/jev-latest", "s", Q))
     assert sub["error"].startswith("[SUBSTITUTED]")
     miss = _with_fake_decisions(
-        lambda url, **kw: _FakeResp(200, {"model": "typesafe/jev-1.13", "answers": {}}),
-        lambda: o._decide_raw("typesafe/jev-1.13", "s", Q))
+        lambda url, **kw: _FakeResp(200, {"model": "typesafe/jev-latest", "answers": {}}),
+        lambda: o._decide_raw("typesafe/jev-latest", "s", Q))
     assert miss["error"].startswith("[ERROR]") and "needs_fleet" in miss["error"]
     free = _with_temp_decider("inception/mercury-decide:free", "US-CLOSED",
         lambda: _with_fake_decisions(
@@ -938,7 +938,7 @@ def test_decide_skips_states_that_overflow_context():
     def handler(url, **kw):
         return _FakeResp(200, {"model": kw["json"]["model"],
                                "answers": {"needs_fleet": {"noul": 0.5}}})
-    jev = _with_fake_decisions(handler, lambda: o._decide_raw("typesafe/jev-1.13", big, Q))
+    jev = _with_fake_decisions(handler, lambda: o._decide_raw("typesafe/jev-latest", big, Q))
     assert jev["error"].startswith("[SKIPPED]") and "trim the state" in jev["error"]
     decider = _with_fake_decisions(handler, lambda: o._decide_raw("perplexity/pplx-decider-latest", big, Q))
     assert "answers" in decider, "the 262K Decider takes the long state"
@@ -947,7 +947,7 @@ def test_decide_skips_states_that_overflow_context():
 def test_decide_without_key_is_skipped_not_raised():
     key = os.environ.pop("OPENROUTER_API_KEY", None)
     try:
-        assert o._decide_raw("typesafe/jev-1.13", "s", Q)["error"].startswith("[SKIPPED]")
+        assert o._decide_raw("typesafe/jev-latest", "s", Q)["error"].startswith("[SKIPPED]")
     finally:
         if key is not None:
             os.environ["OPENROUTER_API_KEY"] = key
@@ -964,7 +964,7 @@ def _with_temp_decider(slug, klass, fn):
 
 def test_panel_refuses_single_class():
     err = _with_temp_decider("typesafe/jev-same-class", "US-CLOSED",
-                             lambda: o._check_panel(["typesafe/jev-1.13", "typesafe/jev-same-class"]))
+                             lambda: o._check_panel(["typesafe/jev-latest", "typesafe/jev-same-class"]))
     assert err and "single-class" in err
     assert o._check_panel(list(o._DEFAULT_PANEL)) is None
 
@@ -985,7 +985,7 @@ def test_compare_cancels_position_bias():
             "type": "choice", "choice": "a",
             "probabilities": {"a": 0.9, "b": 0.1, "tie": 0.0}}}})
     r = _with_fake_decisions(biased, lambda: o._compare_one(
-        "typesafe/jev-1.13", "Which is right?", "AAA", "BBB", "", "t"))
+        "typesafe/jev-latest", "Which is right?", "AAA", "BBB", "", "t"))
     assert r["p_a"] == r["p_b"] == 0.5
     assert r["order_consistent"] is False
 
@@ -996,7 +996,7 @@ def test_compare_cancels_position_bias():
             "probabilities": {"a": 0.8, "b": 0.2, "tie": 0.0} if a_is_good
             else {"a": 0.2, "b": 0.8, "tie": 0.0}}}})
     r = _with_fake_decisions(honest, lambda: o._compare_one(
-        "typesafe/jev-1.13", "Which is right?", "BAD", "GOOD", "", "t"))
+        "typesafe/jev-latest", "Which is right?", "BAD", "GOOD", "", "t"))
     assert r["winner"] == "b" and r["p_b"] == 0.8 and r["order_consistent"] is True
 
 
@@ -1087,14 +1087,14 @@ def test_call_model_end_to_end_with_structured_brief():
 
 def test_panel_end_to_end_reports_cross_class_agreement():
     def handler(url, **kw):
-        p = 0.92 if kw["json"]["model"] == "typesafe/jev-1.13" else 0.88
+        p = 0.92 if kw["json"]["model"] == "typesafe/jev-latest" else 0.88
         return _FakeResp(200, {"model": kw["json"]["model"],
                                "answers": {"needs_fleet": {"noul": p}}})
     res = json.loads(_with_fake_decisions(handler, lambda: o.decide_panel(
         {"task": "x"}, Q)))
     assert res["agreement"]["needs_fleet"]["cross_class_agree"] is True, res
     bad = json.loads(_with_temp_decider("typesafe/jev-same-class", "US-CLOSED",
-        lambda: o.decide_panel({"task": "x"}, Q, ["typesafe/jev-1.13", "typesafe/jev-same-class"])))
+        lambda: o.decide_panel({"task": "x"}, Q, ["typesafe/jev-latest", "typesafe/jev-same-class"])))
     assert "single-class" in bad["error"]
 
 
@@ -1906,7 +1906,7 @@ def test_fleet_add_persists_survives_a_restart_and_fleet_remove_undoes_it():
 
 @_fleet_sandbox
 def test_core_fleet_is_fixed_and_fleet_add_validates():
-    for core in ("glm-5.3", "deepseek-v4-pro", "openai/gpt-terra-latest", "typesafe/jev-1.13"):
+    for core in ("glm-5.3", "deepseek-v4-pro", "openai/gpt-terra-latest", "typesafe/jev-latest"):
         assert "core fleet member" in json.loads(o.fleet_remove(core))["error"]
     assert "already a core" in json.loads(o.fleet_add("openai/gpt-terra-latest"))["error"]
     assert "not an OpenRouter slug" in json.loads(o.fleet_add("glm-5.3-prime"))["error"]
@@ -1973,7 +1973,7 @@ def test_decision_model_guests_join_the_bench_by_name():
     assert e["extra"] and e["ctx"] == 64_000 and e["klass"] == "US-CLOSED" and e["seat"] == "guest"
     assert o._source("typesafe/jev-9") == "guest"
     assert o._check_panel(["typesafe/jev-9", "perplexity/pplx-decider-latest"]) is None, "cross-class"
-    assert "single-class" in o._check_panel(["typesafe/jev-9", "typesafe/jev-1.13"])
+    assert "single-class" in o._check_panel(["typesafe/jev-9", "typesafe/jev-latest"])
     assert json.loads(o.fleet_remove("typesafe/jev-9"))["as"] == ["decider"]
     assert "typesafe/jev-9" not in o._DECIDERS
 
@@ -2009,7 +2009,7 @@ def test_history_of_unregistered_models_still_counts_toward_ceilings_and_stats()
                                     "klass": "US-CLOSED", "mode": "workflow",
                                     "outcome": "OK", "work_type": "swe"}) + "\n")
             f.write(json.dumps({"type": "dispatch", "task_id": "wf-hist",
-                                "model": "typesafe/jev-1.13", "provider": "openrouter-decisions",
+                                "model": "typesafe/jev-latest", "provider": "openrouter-decisions",
                                 "klass": "US-CLOSED", "mode": "decide", "outcome": "OK",
                                 "work_type": "swe"}) + "\n")
         assert o._dispatches_logged("wf-hist") == 3, \
@@ -2017,7 +2017,7 @@ def test_history_of_unregistered_models_still_counts_toward_ceilings_and_stats()
         _seed_outcomes(path, "swe", "meta/long-gone", 10, 9, tag="h")
         table = o._work_type_table(o._read_log()["dispatches"], o._read_log()["outcomes"])
         assert table["swe"]["meta/long-gone"]["verdicts"] == 10
-        assert "typesafe/jev-1.13" not in table["swe"], "decision calls carry no generator verdict"
+        assert "typesafe/jev-latest" not in table["swe"], "decision calls carry no generator verdict"
         cell = json.loads(o.fleet_stats())["by_work_type"]["swe"]["meta/long-gone"]
         assert cell["rate"] == 0.9
     _with_temp_log(run)
@@ -2547,7 +2547,7 @@ def test_fleet_check_decider_failures_are_reported():
     def bad_post(url, **kw):
         return _FakeResp(500, {"error": "boom"})
     res, _ = _run_check((get, fake_call, bad_post, calls),
-                        call=lambda: o.fleet_check(["typesafe/jev-1.13"]))
+                        call=lambda: o.fleet_check(["typesafe/jev-latest"]))
     row = res["rows"][0]
     assert row["status"] == "PROBLEM" and "HTTP 500" in row["problems"][0]
 
@@ -2594,7 +2594,12 @@ def test_the_command_line_check_prints_a_table_and_sets_the_exit_code():
 # ---------------------------------------------------------------------------
 def test_new_members_are_pinned_and_hold_no_factual_role():
     assert o._MODELS["meta/muse-ember"]["pin"] == "Meta"
-    assert o._MODELS["moonshotai/kimi-k3.1"]["pin"] is None, "Kimi K3.1's host is not known yet"
+    assert o._MODELS["moonshotai/kimi-k3.1"]["pin"] == "wafer/us"
+    cfg = {**o._MODELS["moonshotai/kimi-k3.1"], **o._CONFIGS["openrouter"]}
+    assert o._check_provenance({"model": "moonshotai/kimi-k3.1", "provider": "Wafer"},
+                               "moonshotai/kimi-k3.1", cfg) is None, "the slug's provider name passes"
+    assert o._check_provenance({"model": "moonshotai/kimi-k3.1", "provider": "Inference.net"},
+                               "moonshotai/kimi-k3.1", cfg).startswith("[SUBSTITUTED]")
     assert o._MODELS["moonshotai/kimi-k3.1"]["klass"] == "CN-OW", "Moonshot is CN-OW (_LAB_CLASS)"
     for m in ("meta/muse-ember", "moonshotai/kimi-k3.1"):
         _, err = o._validate_brief({"role": "verifier", "instruction": "x",
@@ -2654,11 +2659,11 @@ def test_polarity_canary_blocks_panel_members_and_warns_on_others():
     original = requests.post
     requests.post = _canary_post(0.95, 0.90)     # says yes to a claim and to its inverse
     try:
-        panel = _with_env(lambda: o._check_decider("typesafe/jev-1.13"), OPENROUTER_API_KEY="k")
+        panel = _with_env(lambda: o._check_decider("typesafe/jev-latest"), OPENROUTER_API_KEY="k")
         other = _with_temp_decider("typesafe/jev-aux", "US-CLOSED", lambda: _with_env(
             lambda: o._check_decider("typesafe/jev-aux"), OPENROUTER_API_KEY="k"))
         requests.post = _canary_post(0.95, 0.05)
-        clean = _with_env(lambda: o._check_decider("typesafe/jev-1.13"), OPENROUTER_API_KEY="k")
+        clean = _with_env(lambda: o._check_decider("typesafe/jev-latest"), OPENROUTER_API_KEY="k")
     finally:
         requests.post = original
     assert panel["status"] == "PROBLEM" and "polarity canary" in panel["problems"][0]
@@ -2968,7 +2973,7 @@ def test_every_registry_model_has_a_seat_in_the_skill_and_in_governance():
 
 def test_the_docs_describe_the_servers_default_ratification_panel():
     docs = _packaged_docs()
-    names = {"typesafe/jev-1.13": "Jev", "perplexity/pplx-decider-latest": "Decider"}
+    names = {"typesafe/jev-latest": "Jev", "perplexity/pplx-decider-latest": "Decider"}
     assert set(names) == set(o._DECIDERS), "a decision model was added: name it here"
     line = next(x for x in docs["SKILL.md"].splitlines()
                 if x.startswith("No synthesis ships until a cross-class panel"))

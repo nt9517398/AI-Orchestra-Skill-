@@ -1,8 +1,144 @@
 # Orchestra v21 upgrade plan: fleet-powered local workers
 
-Status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; v20.2 (2026-11-24) removed the routers and applied the fleet seats in code; v20.3 added three floating "latest" aliases (GPT Sol, Grok, Gemini Pro) as unvetted candidates. Phase 2 is started: the harness is built and tested and the Claude Code output-cap check is measured; the live model matrix has not been run. Phases 3 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
+Status (2026-11-24): **the plan is being replaced by the bare-minimum rebuild in *Revised direction* below, pending the owner's approval (M1).** Earlier status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; v20.2 (2026-11-24) removed the routers and applied the fleet seats in code; v20.3 added three floating "latest" aliases (GPT Sol, Grok, Gemini Pro) as unvetted candidates. Phase 2 is started: the harness is built and tested and the Claude Code output-cap check is measured; the live model matrix has not been run. Phases 3 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
 
-## Objective
+## Revised direction (2026-11-24): bare-minimum Orchestra (v21-min)
+
+**Owner's decision.** Orchestra is over-engineered. Rebuild it to the bare minimum around three uses, and nothing else:
+
+1. **Ask.** Claude sends a plain request to a fleet model and gets a text answer back, as before October (pre-v16): no JSON brief, no XML envelope, no output contract, no roles.
+2. **Decide.** Claude runs closed questions that matter (dispatch or not, which answer is better, does a synthesis pass its checklist) through the decision bench: `~typesafe/jev-latest` + `~perplexity/pplx-decider-latest`.
+3. **Swarm.** When Claude Code deploys subagents, **60–70% of them are driven by fleet models** and the rest by default Claude models.
+
+This section supersedes Phases 3–7 above and the seat, promotion-rule and routing material under *Fleet redesign*. Those stay in the document as history. The full v20.5 is kept under a git tag, so nothing is lost.
+
+### Target fleet (unchanged from v20.5, plus the Jev alias and the Kimi pin of 2026-11-24)
+
+| Model (wire id) | Class | Host | Typical use |
+|---|---|---|---|
+| `~openai/gpt-terra-latest` | US-CLOSED | unpinned | Review of code and logic; general reasoning |
+| `~google/gemini-flash-latest` | GOOGLE-CLOSED | unpinned | Second reviewer; fast generation |
+| `~x-ai/grok-latest` | XAI-CLOSED | unpinned | Worker and generator |
+| `qwen/qwen4-max` | CN-OW | unpinned | Lead worker: reasoning and coding |
+| `tencent/hy4` | CN-OW | unpinned | Drafts and bulk |
+| `moonshotai/kimi-k3.1` | CN-OW | `wafer/us` | Math and code where a check grades it |
+| `meta/muse-spark-1.3` | META-CLOSED | Meta | Long-context work |
+| `meta/muse-ember` | META-CLOSED | Meta | Cheap subtasks and drafts |
+| `glm-5.3` (direct API) | CN-OW | Zhipu | Software engineering |
+| `deepseek-v4-pro` (direct API) | CN-OW | DeepSeek | Algorithmic code |
+| `deepseek-flash` (direct API, fleet id `deepseek-v4.1-flash`) | CN-OW | DeepSeek | Cheapest drafts; never checks facts |
+| Bench: `~typesafe/jev-latest` | US-CLOSED | OpenRouter decisions | Gatekeeper, ≤ 32K state |
+| Bench: `~perplexity/pplx-decider-latest` | CN-OW (inference) | OpenRouter decisions | Screener, long states up to 262K |
+
+The Typical use column is advice in the docs, not code: no seats, no routing prior and no role enforcement. Class labels stay, as a single field shown by `list_fleet`, because the one rule worth keeping is "a check should come from a different class than the work it checks".
+
+### What stays, what goes
+
+Line numbers refer to `orchestra_mcp_server.py` at v20.5 (4,353 lines). The target is about 1,000 lines.
+
+| Part (v20.5) | Decision | Why |
+|---|---|---|
+| Key loading, `_CONFIGS`, generator registry (`_MODELS`: provider, class, max_out, pin, api_id, served_as, auto_ceiling) | **Keep**, minus `_SEATS`, `_UNVETTED`, `_NO_VERIFY` | Without them no call can be made safely |
+| Streaming `_call` with the silence rule, provenance (`[SUBSTITUTED]`), host pinning, failure tags (`[ERROR]`, `[TIMEOUT]`, `[EMPTY]`, `[TRUNCATED]`) | **Keep** | They stop a wrong model, a wrong host or a cut-off reply from passing as a real answer |
+| Live output ceilings (`_live_ceiling`) for `~` aliases and unpinned models | **Keep** | A typed-in ceiling above the host's makes every call fail |
+| Decision transport (`_decide_raw`), `decide`, `decide_panel` (two classes), polarity canary in `fleet_check` | **Keep** | This is the bench |
+| `decide_compare` | **Drop** | One `decide` with a `choice` question does the same job |
+| Error-body capture, key redaction, save-on-return (`results/<task_id>/`), `recover_results` | **Keep** | They fixed real losses (D11: a finished answer lost to a killed run) |
+| Async jobs (`orchestra_start` → `check_job`) | **Keep, simplified** to one start tool | Claude Desktop cuts tool calls at roughly 60–240 s, and deep calls take longer |
+| `fleet_check` and `python orchestra_mcp_server.py --check` | **Keep** | The only way to verify slugs, ceilings and hosts against the live service |
+| Call log (`dispatch_log.jsonl`: model, served model, host, tokens, latency, error) | **Keep, automatic only** | Cheap; it is the evidence when something goes wrong |
+| Structured briefs, contracts, roles, work types (~1523–1840) | **Drop** | Requests become plain text again: the owner's first rule |
+| Workflow engine (`workflow_start`, ~2217–2400) | **Drop** | The swarm replaces it for multi-step work |
+| Adversarial mode (`orchestra_adversarial`) | **Drop** | Claude can send the critique as a plain request |
+| Dynamic fleet (`fleet_add`, `fleet_remove`, guests, `fleet_probe`; ~535–710, 2817–2969) | **Drop** | Switched off since v18.1; a model joins by a registry line |
+| Memory bank (`memory_update`, `memory_read`, `memory_review`; ~3249–3512) | **Drop** | Not one of the three uses |
+| Routing (`route_evidence`, `route_decide`, router record; ~3619–4004) | **Drop** | Claude picks the model; the docs give advice |
+| Outcome measurement (`log_outcome`, `log_override`, `fleet_stats`) | **Drop** (see open decision 1) | It only paid off through routing, which goes |
+| Seats, `_UNVETTED`, promotion rule, `_ROUTE_BLURB` | **Drop** | No roles to enforce |
+
+### New tool surface (8 MCP tools)
+
+| Tool | Does |
+|---|---|
+| `ask(model, prompt, system="", effort="high")` | One plain request, waits, returns the text (or a failure tag). For short calls |
+| `ask_start(models, prompt, system="", effort="high")` | The same prompt to one or more models in the background; returns a job id |
+| `check_job(job_id)` | Status and, when done, the text from each model, its served model and host |
+| `decide(state, questions, model="typesafe/jev-latest")` | One bench ruling: calibrated probabilities, no prose |
+| `decide_panel(state, questions)` | Jev + Decider; reports where the two classes agree |
+| `list_fleet()` | Models, classes, hosts, budgets, which keys are present |
+| `fleet_check(models=None)` | One tiny live call per model plus a spec lookup; prints the fix for anything wrong |
+| `swarm_plan(n_agents, tasks=None)` | The fleet/Claude split for a swarm, the model per fleet agent, and the exact launch command for each (see below) |
+
+`recover_results(task_id)` stays as a function behind `check_job` rather than its own tool.
+
+### The swarm
+
+**How a fleet agent runs.** A Claude Code subagent started with the Agent tool always uses the session's own Claude model, so it cannot be driven by a fleet model. A fleet agent is therefore a separate headless Claude Code process, `claude -p "<task>"`, with these variables, which send its API calls to OpenRouter's Anthropic-compatible endpoint:
+
+```
+ANTHROPIC_BASE_URL=https://openrouter.ai/api
+ANTHROPIC_AUTH_TOKEN=<OpenRouter key>
+ANTHROPIC_API_KEY=""
+ANTHROPIC_MODEL=<wire id, e.g. qwen/qwen4-max>
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=<registry max_out, at most 120000>
+```
+
+Claude agents are ordinary subagents from the Agent tool, on default Claude models.
+
+**The 60–70% rule.** For N agents, fleet agents F = round(0.65 × N), with at least one Claude agent once N ≥ 2. A single agent is not a swarm: Claude decides, as today. Small swarms cannot always land inside the band:
+
+| N | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|
+| Fleet | 1 | 2 | 3 | 3 | 4 | 5 | 5 | 6 | 7 |
+| Share | 50% | 67% | 75% | 60% | 67% | 71% | 63% | 67% | 70% |
+
+**Which task goes where.** Fleet agents take bounded tasks with a check: tests to pass, a schema to meet, a file to produce. Claude agents take the tasks that need judgment, repository-wide context or anything sensitive, and they check the fleet agents' work. A fleet agent's output counts only after its check passes (L1); review by a Claude agent or a fleet model of another class comes second.
+
+**Which fleet model.** `swarm_plan` assigns by task type from the table above, and spreads agents across classes when tasks are similar, so that one model's blind spot does not repeat across the swarm.
+
+**Launcher.** `orchestra_swarm.py` (stdlib only) starts the fleet agents named by `swarm_plan`. Each agent gets its own git worktree, the variables above, a turn cap and a spend cap. The launcher collects each agent's diff, exit status and cost into `results/<task_id>/`, so a killed swarm keeps what finished. Claude reviews each diff and applies it; fleet agents never write to the real checkout.
+
+**Eligibility.** Only models that pass the existing Phase 2 harness (`docs/diagnostics/agent_compat.py`: tool loop and a real Claude Code worker) may drive a swarm agent. `swarm_plan` reads the latest report and skips the rest.
+
+**Data rule (owner's decision 5, unchanged).** Fleet agents run on test and public projects only until isolation is decided (open decision 2).
+
+### Skill documents
+
+`SKILL.md` shrinks to about 150 lines: when the fleet is worth it, Ask, Decide, Swarm, a short verification ladder (a check beats any model; a lone model's objection is a flag, not a fact; no check means "unverified"), and the failure tags. References shrink to three: `fleet-card.md` (the table above, prices and quirks), `decision-bench.md` (question library and thresholds) and a new `swarm.md` (launch, ratio, eligibility, review). `governance.md`, `dispatch-protocol.md`, `evidence-base.md`, `research-alignment.md`, `memory.md`, `dynamic-fleet.md` and `verification.md` are removed from the package; they stay in the v20.5 tag.
+
+### Phases
+
+| # | Do | Exit check |
+|---|---|---|
+| M0 | Tag v20.5 as `v20.5-full`; record its 165 passing tests | Tag pushed; `git checkout v20.5-full` passes all tests |
+| M1 | Owner approves this plan and answers the open decisions | Written in *Decisions from the owner* |
+| M2 | Rewrite the server to the tool surface above; new test file | All new tests pass offline. Kept behaviour has a test each: provenance, host pin, silence timeout, failure tags, live ceiling, save-on-return, error body, redaction, panel class rule, polarity canary, `--check` exit codes 0/1/2. No network in tests |
+| M3 | `swarm_plan` and `orchestra_swarm.py` | Offline tests with a fake `claude` binary: the ratio table, worktree per agent, variables set and the key never logged, caps enforced, results kept after a kill, ineligible models skipped |
+| M4 | Rewrite `SKILL.md` and the three references; rebuild `orchestra.skill` | Packaging tests (description ≤ 1,004 characters, every file indexed, every registry id in the fleet card); a fresh session asked to "fan this out" plans a 60–70% swarm from the skill alone |
+| M5 | Live run, with an OpenRouter key in the `ai-orchestra-skill` environment | `fleet_check` gives every model OK or a named problem; the Phase 2 matrix decides swarm eligibility; one real swarm on a public repo finishes with diffs Claude applied after tests passed; real spend within the cap |
+| M6 | Release: merge to `main`, update the owner's local copy, test rollback | `orchestra.skill` and the server installed locally; switching back to `v20.5-full` works |
+
+M2–M4 need no key and can be done in the build environment. M5 cannot.
+
+### Risks
+
+| Risk | Control |
+|---|---|
+| Lost safety from dropping roles (for example DeepSeek Flash could be asked to check facts) | Kept as a sentence in the docs, not in code. Accepted by the owner as the price of simplicity |
+| A fleet agent reads or leaks something it should not | Worktree only, scrubbed environment, test and public projects only; container isolation is open decision 2 |
+| OpenRouter's Anthropic endpoint or a model mishandles Claude Code's tool use | Phase 2 harness is the gate; ineligible models never drive an agent |
+| A floating alias changes model under a running swarm | Served model logged per call; `fleet_check` before a large swarm |
+| Unverified slugs (Terra, Gemini Flash, Kimi K3.1, the `~` decision aliases) | `fleet_check` in M5 names any that do not exist |
+| Runaway spend | Per-agent spend cap in the launcher; an OpenRouter key limit as a backstop |
+
+### Open decisions for the owner
+
+1. **Measurement.** Keep a minimal `log_outcome(task_id, model, correct)` so that model choice can later rest on results? Recommendation: no for now; the automatic call log is enough, and it can be added back.
+2. **Isolation for fleet agents.** A git worktree with a scrubbed environment (recommended to start, public and test projects only), or a Docker container (stronger, more setup)?
+3. **Bash for fleet agents.** Off until isolation is decided (recommended), or on, so they can run tests themselves?
+4. **Swarm launch.** Is a script Claude runs with Bash enough (recommended), or should the MCP server start the swarm itself?
+
+## Objective (original v21 plan; see *Revised direction* above)
 
 Let Orchestra run isolated Claude Code workers whose brain is a fleet model, while Claude stays conductor, so that file-level work can move off the Claude usage limit without losing Orchestra's verification, cost control or data safety.
 
@@ -244,3 +380,5 @@ Phase 2 note on decision 3 (measured 2026-11-24, Claude Code 2.1.331): a worker 
 12. Roles table (answered 2026-11-24): Astra, `openrouter/auto` and `openrouter/auto-code` removed; Sol chief reviewer, Gemini second reviewer and generator, Grok worker and generator, Qwen lead worker, Tencent worker, Spark lead long-context worker, Ember efficient worker, Granite math and code where a check grades it; Google and xAI are their own classes; the new five start as candidates. Applied in v20.4. Open: confirm the Qwen and Tencent slugs, pin hosts, and decide whether Sol should be allowed any factual role.
 
 13. **Simpler fleet (answered 2026-11-24, v20.5).** Solar Decide removed; the bench is Jev + `~perplexity/pplx-decider-latest`. GPT Sol replaced by `~openai/gpt-terra-latest`; Gemini Pro by `~google/gemini-flash-latest`; IBM Granite by `moonshotai/kimi-k3.1` (CN-OW, same seat). Grok, Muse Spark, Muse Ember, Tencent HY4 and Qwen 4 Max unchanged. The swarm pattern (Claude Code subagents on fleet models through OpenRouter) is in `SKILL.md`, marked unverified. Open: the Kimi K3.1, Terra and Flash slugs are not checked against OpenRouter, and whether the decisions endpoint accepts the Decider's `~` alias is unknown; the live run answers both.
+
+14. Decision bench aliases (answered 2026-11-24): `~typesafe/jev-latest` replaces `typesafe/jev-1.13`; with `~perplexity/pplx-decider-latest` it forms the bench. Kimi K3.1 host: chosen by Claude from the owner's three options as `wafer/us`, because the other two are 4-bit quantized by name and the seat is math and code. Bare-minimum rebuild approved in principle, plan first: see *Revised direction*.

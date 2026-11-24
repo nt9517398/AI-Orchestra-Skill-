@@ -165,7 +165,7 @@ Operator-directed. Four changes:
      a FLOATING alias, so every dispatch row now logs the model that actually served).
      Generator fleet: 4 models / 2 classes (CN-OW x3, US-CLOSED x1).
 
-  2. DECISION BENCH. Three System One decision models — typesafe/jev-1.13,
+  2. DECISION BENCH. Three System One decision models — typesafe/jev-latest,
      inception/mercury-decide:free, upstage/solar-decide — in a SEPARATE registry
      (_DECIDERS). They never generate text: state + typed questions in, calibrated
      probabilities out, via POST /api/alpha/decisions (NOT /chat/completions, which
@@ -427,7 +427,10 @@ _MODELS = {
         # repeated tool calls, subtasks, extraction and first drafts. Same family as Muse
         # Spark, so the two can never cross-check each other. Unvetted for factual roles.
     "moonshotai/kimi-k3.1": dict(
-        provider="openrouter", klass="CN-OW", max_out=64000, auto_ceiling=True, pin=None),
+        provider="openrouter", klass="CN-OW", max_out=64000, auto_ceiling=True, pin="wafer/us"),
+        # Host chosen 2026-11-24 from the operator's three options (wafer/us, inference-net/mxfp4,
+        # sail-research/fp4/us): the other two are 4-bit quantized by their names, and this seat is
+        # math and code, where quantization loss shows first. Wafer's own precision is not known.
         # Added 2026-11-24, replacing IBM Granite in the same seat (math and code, only where a
         # deterministic check grades it). Moonshot is CN-OW (_LAB_CLASS). Slug and specs NOT
         # checked against OpenRouter; ceiling resolved live (64,000 fallback). Unpinned, unvetted.
@@ -511,8 +514,11 @@ _SEATS = {
 _DECISIONS_URL = os.environ.get("ORCHESTRA_DECISIONS_URL",
                                 "https://openrouter.ai/api/alpha/decisions")
 _DECIDERS = {
-    "typesafe/jev-1.13": dict(
-        klass="US-CLOSED", ctx=32_000, seat="gatekeeper", free=False),
+    "typesafe/jev-latest": dict(
+        klass="US-CLOSED", ctx=32_000, seat="gatekeeper", free=False,
+        api_id="~typesafe/jev-latest", served_prefix="typesafe/jev"),
+        # 2026-11-24 (operator): the floating alias replaces the pinned jev-1.13. Any Jev build is
+        # accepted and the served build is logged. Notes below were written for 1.13.
         # $0.042/M in, $0 out. 0.14-0.32s measured by SIL. Best-calibrated of the
         # models SIL tested. Pinned build; ~typesafe/jev-latest floats.
     "perplexity/pplx-decider-latest": dict(
@@ -524,11 +530,11 @@ _DECIDERS = {
         # the decisions endpoint accepts a ~alias is UNVERIFIED: fleet_check will show it.
 }
 _QTYPES = ("noul", "choice", "score")
-_GATEKEEPER = "typesafe/jev-1.13"
+_GATEKEEPER = "typesafe/jev-latest"
 # 2026-11-23: Solar left the default panel. It misread inverted questions in live tests
 # (11/16 vs 16/16 for Jev and Decider v1.2; FINDINGS-2026-11-23.md, D10). It stays available
 # for states too large for the others: pass it explicitly, with positive-form questions.
-_DEFAULT_PANEL = ("typesafe/jev-1.13", "perplexity/pplx-decider-latest")   # cross-class by construction
+_DEFAULT_PANEL = ("typesafe/jev-latest", "perplexity/pplx-decider-latest")   # cross-class by construction
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +998,8 @@ def _check_provenance(body: dict, model: str, cfg: dict):
     # else is a substitution. Membership test (case-insensitive), not equality.
     allowed = cfg.get("order") or ([cfg["pin"]] if cfg.get("pin") else [])
     if allowed and served_prov:
-        if served_prov.lower() not in {a.lower() for a in allowed}:
+        ok = {a.lower() for a in allowed} | {a.split("/")[0].lower() for a in allowed}
+        if served_prov.lower() not in ok:
             return (f"[SUBSTITUTED] expected one of {allowed!r} but response came from "
                     f"{served_prov!r} — host set not honoured; re-check /endpoints")
     return None
@@ -2715,7 +2722,7 @@ def decide(model: str, state: Union[dict, str], questions: dict) -> str:
     """Ask ONE decision model typed questions about a state. Returns calibrated
     probabilities, not text.
 
-    model: typesafe/jev-1.13 (gatekeeper, 32K) or perplexity/pplx-decider-latest
+    model: typesafe/jev-latest (gatekeeper, 32K) or perplexity/pplx-decider-latest
       (screener, 262K, $0.02/M; the choice for long states) — or, with the dynamic fleet enabled (off by default), any OpenRouter
       decision model by author/name slug, which is looked up and tried as a guest.
     state: the facts, as named JSON fields (preferred) or a string. Reference fields in
@@ -2743,7 +2750,7 @@ def decide_panel(state: Union[dict, str], questions: dict,
     """Ask the SAME questions of two or more decision models from DIFFERENT correlation
     classes, concurrently, and report per-question cross-class agreement. This is how a
     process ruling (gate, route, stop) or a ratification check is CONFIRMED rather than
-    taken from one model. Default panel: typesafe/jev-1.13 [US-CLOSED] +
+    taken from one model. Default panel: typesafe/jev-latest [US-CLOSED] +
     perplexity/pplx-decider-latest [CN-OW]. Single-class panels are refused.
 
     Agreement is descriptive: noul agree = same side of 0.5 and within 0.25; choice
@@ -2761,7 +2768,7 @@ def decide_compare(instructions: str, candidate_a: str, candidate_b: str,
     """Blinded pairwise comparison of two candidates (e.g. two independent syntheses,
     two code fixes). Each model is asked in BOTH orders and the distributions are
     averaged, cancelling position bias; candidates carry no authorship, so a model
-    cannot favour Claude's draft or its own lab's. Default judges: typesafe/jev-1.13 +
+    cannot favour Claude's draft or its own lab's. Default judges: typesafe/jev-latest +
     perplexity/pplx-decider-latest (cross-class). Candidates too long for Jev's 32K context are
     skipped for Jev automatically and the Decider (262K) still judges — but a single judge is
     not cross-class agreement, so agreed_winner stays null and the Decider's verdict is

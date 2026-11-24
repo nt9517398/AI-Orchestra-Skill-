@@ -51,7 +51,7 @@ GATES = ("tool_loop", "claude_code_worker")
 MODELS = {
     "meta/muse-spark-1.3": {"wire": "meta/muse-spark-1.3", "pin": "Meta"},
     "meta/muse-ember": {"wire": "meta/muse-ember", "pin": "Meta"},
-    "moonshotai/kimi-k3.1": {"wire": "moonshotai/kimi-k3.1", "pin": None},
+    "moonshotai/kimi-k3.1": {"wire": "moonshotai/kimi-k3.1", "pin": "wafer/us"},
     "openai/gpt-terra-latest": {"wire": "~openai/gpt-terra-latest", "pin": None},
     "x-ai/grok-latest": {"wire": "~x-ai/grok-latest", "pin": None},
     "google/gemini-flash-latest": {"wire": "~google/gemini-flash-latest", "pin": None},
