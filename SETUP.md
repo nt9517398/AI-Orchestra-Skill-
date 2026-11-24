@@ -3,7 +3,7 @@
 ## What runs where
 
 - `orchestra.skill` is instructions. Upload it to claude.ai (Settings, Capabilities, Skills). It calls nothing.
-- `orchestra_mcp_server.py` does all the calling. It is a local MCP server: it runs on your machine under Claude Desktop (or a local Claude Code), not inside claude.ai and not inside a cloud session.
+- `orchestra_mcp_server.py` does all the calling, and imports `orchestra_swarm.py`, which must sit in the same folder (copy both). `orchestra_swarm.py` also runs on its own to start the fleet agents of a swarm: `python orchestra_swarm.py run --plan <plan.json> --repo . --out <dir>`; it needs `claude` on the PATH and `OPENROUTER_API_KEY`. It is a local MCP server: it runs on your machine under Claude Desktop (or a local Claude Code), not inside claude.ai and not inside a cloud session.
 
 ## Install
 
@@ -47,7 +47,7 @@ It looks up each model's real limits and makes one tiny real call per model (abo
 
 ## Saved results
 
-Every generator reply is saved to `results/<task_id>/` the moment it returns, and a `started` row is logged before each call, so a run that is killed keeps what finished. Read it back with the `recover_results` tool; `fleet_stats` lists calls that started and never finished. The folder holds model output: it is git-ignored, and `ORCHESTRA_SAVE_RESULTS=0` turns saving off.
+Every generator reply is saved to `results/<task_id>/` the moment it returns, and a `started` row is logged before each call, so a run that is killed keeps what finished. Read it back with the `recover_results` tool; called with no task id it lists calls that started and never finished.
 
 ## Cloud sessions (Claude Code on the web)
 

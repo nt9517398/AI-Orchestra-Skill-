@@ -990,17 +990,15 @@ def test_skill_names_every_registry_model():
         card = z.read("orchestra/references/fleet-card.md").decode("utf-8")
         skill = z.read("orchestra/SKILL.md").decode("utf-8")
     for ref in ("fleet-card.md", "dispatch-protocol.md", "verification.md",
-                "evidence-base.md", "decision-bench.md", "governance.md",
-                "research-alignment.md", "memory.md", "dynamic-fleet.md"):
+                "decision-bench.md", "memory.md", "swarm.md"):
         assert f"orchestra/references/{ref}" in names, ref
         assert f"references/{ref}" in skill, f"SKILL.md does not index {ref}"
     for mid in list(o._MODELS) + list(o._DECIDERS):
         assert f"`{mid}`" in card, f"`{mid}` is in the server registry but not in fleet-card.md"
     assert "glm-5.3-prime" not in card.split("## History", 1)[0].lower(), \
         "GLM-5.3-Prime was reverted in v17; only the history section may mention it"
-    routing = card.split("## Routing", 1)[1].split("\n## ", 1)[0]
     for dead in ("Kimi K3 ", "Grok 4.6", "grok-4.6", "Gemini 3.7", "gemini-3.7"):
-        assert dead not in routing, f"{dead} still appears in the routing table"
+        assert dead not in card, f"{dead} still appears in the fleet card"
     head = skill.split("---", 2)[1]
     for dead in ("Kimi K3 ", "Grok 4.6", "grok-4.6", "Gemini 3.7", "gemini-3.7"):
         assert dead not in head, f"SKILL.md frontmatter still names {dead}"
@@ -1565,23 +1563,6 @@ def test_reasoning_param_is_sent_to_core_openrouter_models():
 
 
 
-def test_committed_fleet_file_is_valid_and_the_research_doc_exists():
-    here = os.path.dirname(os.path.abspath(o.__file__))
-    data = json.load(open(os.path.join(here, "fleet_extra.json"), encoding="utf-8"))
-    with zipfile.ZipFile(os.path.join(here, "orchestra.skill")) as z:
-        dyn = z.read("orchestra/references/dynamic-fleet.md").decode("utf-8")
-    assert set(data) == {"generators", "deciders"}
-    for kind in ("generators", "deciders"):
-        for slug, decl in data[kind].items():
-            assert o._SLUG.match(slug), slug
-            assert slug not in _CORE and slug not in _CORE_DECIDERS, \
-                f"{slug} is a core model; it does not belong in fleet_extra.json"
-            assert isinstance(decl, dict)
-    for tool in ("fleet_probe", "fleet_add", "fleet_remove", "ORCHESTRA_DYNAMIC_FLEET"):
-        assert tool in dyn, f"dynamic-fleet.md does not explain {tool}"
-    for heading in ("## Status", "## Architecture", "## Pros", "## Cons", "## Alternatives",
-                    "## How to research it"):
-        assert heading in dyn, f"dynamic-fleet.md lost its {heading!r} section"
 
 
 # ---------------------------------------------------------------------------
@@ -2415,11 +2396,20 @@ def test_the_always_loaded_skill_names_no_retired_model():
         assert dead not in skill, f"SKILL.md still names {dead}"
 
 
-def test_every_registry_model_has_a_seat_in_the_skill_and_in_governance():
-    docs = _packaged_docs()
-    for model in list(o._MODELS) + list(o._DECIDERS):
-        for doc in ("SKILL.md", "references/governance.md"):
-            assert f"`{model}`" in docs[doc], f"`{model}` has no seat in {doc}"
+
+
+def test_every_server_tool_is_documented_and_no_removed_tool_is():
+    import asyncio
+    docs = "\n".join(_packaged_docs().values())
+    tools = {t.name for t in asyncio.run(o.mcp.list_tools())}
+    assert tools >= {"ask", "ask_start", "check_job", "decide", "decide_panel", "swarm_plan",
+                     "list_fleet", "fleet_check", "recover_results", "workflow_start",
+                     "orchestra_start", "memory_review"}, sorted(tools)
+    for name in sorted(tools):
+        assert name in docs, f"the server has a tool `{name}` that no packaged doc mentions"
+    for gone in ("route_evidence", "route_decide", "log_outcome", "log_override", "fleet_stats",
+                 "fleet_probe", "fleet_add", "fleet_remove", "decide_compare", "call_router"):
+        assert gone not in tools and gone not in docs, f"{gone} was removed; the docs still name it"
 
 
 def test_the_docs_describe_the_servers_default_ratification_panel():
@@ -2427,7 +2417,7 @@ def test_the_docs_describe_the_servers_default_ratification_panel():
     names = {"typesafe/jev-latest": "Jev", "perplexity/pplx-decider-latest": "Decider"}
     assert set(names) == set(o._DECIDERS), "a decision model was added: name it here"
     line = next(x for x in docs["SKILL.md"].splitlines()
-                if x.startswith("No synthesis ships until a cross-class panel"))
+                if "No synthesis ships until a cross-class panel" in x)
     for model, short in names.items():
         assert (short in line) == (model in o._DEFAULT_PANEL), \
             f"SKILL.md's ratification line disagrees with _DEFAULT_PANEL about {short}"
