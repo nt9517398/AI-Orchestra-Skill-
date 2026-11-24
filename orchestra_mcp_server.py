@@ -1,6 +1,63 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v20.4 — ASTRA REMOVED; NEW SEATS  (2026-11-24, operator's decision)
+------------------------------------------------------------------
+  1. openai/gpt-astra-latest is removed from the fleet: registry entry, seat, routing prior,
+     default pair and every doc. openrouter/auto and openrouter/auto-code were removed in
+     v20.2 and stay removed.
+  2. Added qwen/qwen4-max (Lead worker, reasoning and coding) and tencent/hy4 (Worker, drafts
+     and bulk), both CN-OW, unpinned, with the ceiling resolved live. Slugs are the operator's;
+     nothing was checked against OpenRouter (no key in the build environment): run fleet_check.
+  3. Google and xAI are their own correlation classes (GOOGLE-CLOSED, XAI-CLOSED), so Sol
+     (US-CLOSED) and Gemini can review each other. Sol keeps US-CLOSED, as OpenAI.
+  4. Seats follow the operator's table: Sol chief reviewer (code and logic), Gemini second
+     reviewer and generator, Grok worker and generator, Qwen lead worker, Tencent worker,
+     Spark lead long-context worker, Ember efficient worker, Granite math and code only
+     where a check grades it. Sol, Gemini, Grok, Qwen and Tencent start as CANDIDATES: no
+     routing prior, no factual role (_UNVETTED), measured like everyone else.
+  5. Consequence: no generator outside CN-OW holds a factual role, so a factual claim has no
+     cross-class confirmer among the generators. The routing prior is now GLM/DeepSeek only,
+     and Sol reviews through the critic role, not as a verifier. See UPGRADE-PLAN-v21.md.
+
+v20.3 — THREE FLOATING "LATEST" ALIASES  (2026-11-24, operator's instruction)
+-----------------------------------------------------------------------------
+  Added ~openai/gpt-sol-latest, ~x-ai/grok-latest and ~google/gemini-pro-latest as generators,
+  by alias rather than by version number (GPT Astra was one until v20.4). Each follows its lab's
+  newest model in the family, so: the served model is logged on every dispatch (provenance
+  accepts the family and rejects anything else), a verdict belongs to the alias and not to
+  one build, output ceilings are resolved live with a 64,000 fallback instead of guessed
+  (_live_ceiling now looks up the WIRE id, which a ~alias needs), and none is pinned to a
+  host yet. All three are unvetted: no factual role, no routing primary, until measured.
+
+v20.2 — SEATS IN CODE; THE ROUTERS ARE REMOVED  (2026-11-24, operator's instruction)
+-------------------------------------------------------------------------------------
+  1. openrouter/auto and call_router are gone, with everything that supported them (the
+     router registry, its allowlist and host checks, credit-to-served-model logging, the
+     log_outcome router guard, the list_fleet `routers` key). The plan's coding router and
+     Fusion were never wired in and are dropped from it. The decision-model router behind
+     route_decide (_ROUTER_CHAIN, router_record) is a different thing and stays.
+  2. The fleet roles of UPGRADE-PLAN-v21.md 'Target roles' are applied in code: _SEATS names
+     each generator's seat, list_fleet reports it, and a test keeps it identical to the seat
+     tables in SKILL.md and governance.md. A seat is a prior: it grants no routing primary
+     (route_evidence needs measured verdicts) and no factual role (_UNVETTED).
+
+v20.1 — REPAIR + RELIABLE RUNS  (2026-11-23; no new capability for the fleet)
+------------------------------------------------------------------------------
+  1. mcp is pinned below 2 (requirements.txt). mcp 2.x renamed FastMCP, so a fresh
+     `pip install "mcp[cli]"` made this file fail at import; the import now says why.
+  2. Meta models are their own correlation class, META-CLOSED, at the operator's
+     direction, so GPT Astra can review Muse Spark. Spark and Ember share a class and
+     still cannot check each other. A lineage prior, not a measurement: fleet_stats
+     co-failure is what would test it.
+  3. A killed run keeps what finished. Every generator call writes a `started` row before
+     it runs and its reply to results/<task_id>/ the moment it returns; recover_results
+     reads them back and fleet_stats lists started calls with no finish.
+  4. Provider errors keep their text. The error body was read after the stream had
+     closed, so it was always empty; it is now read first. Error text goes to the log
+     and to fleet_check rows with keys and bearer tokens removed (_redact).
+  5. fleet_stats reports per-model latency (median, p90, max) to size wrapper timeouts.
+
 v20 — A DECISION MODEL TAKES PART IN ROUTING; MERCURY DECIDE REPLACED  (2026-10-10)
 ------------------------------------------------------------------------------------
   1. route_decide: Jev rules on every fleet routing choice (a `choice` over the eligible
@@ -144,10 +201,10 @@ CRITICAL (stdio transport): never print() / write to stdout — it corrupts JSON
 Every function RETURNS its result.
 
 Setup:
-    pip install "mcp[cli]" python-dotenv requests
+    pip install -r requirements.txt     # pins mcp below 2: 2.x renamed FastMCP
     # API keys in a .env next to this script (see .env.example). Never hardcode.
-    # OPENROUTER_API_KEY is required; missing it removes GPT Astra, the whole decision
-    # bench, and the only non-CN-OW generator class, US-CLOSED.
+    # OPENROUTER_API_KEY is required; missing it removes every non-CN-OW generator, the
+    # whole decision bench, and the Qwen and Tencent workers.
     # DEEPSEEK_API_KEY covers the two DeepSeek models; ZHIPU_API_KEY covers GLM-5.3.
 
 Tests:  python test_orchestra.py     (offline; no keys needed)
@@ -246,7 +303,12 @@ from typing import Optional, Union
 
 import requests
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ModuleNotFoundError as _e:           # mcp 2.x renamed FastMCP to MCPServer
+    sys.stderr.write("orchestra: cannot import FastMCP — this server needs mcp below 2.0. "
+                     "Run: pip install -r requirements.txt  (or: pip install 'mcp[cli]<2')\n")
+    raise
 
 # v14: load the .env sitting NEXT TO THIS FILE, not relative to the process CWD.
 # Claude Desktop launches this server with an unpredictable working directory, so a
@@ -322,17 +384,8 @@ _MODELS = {
         # OpenRouter's z-ai/ namespace (OpenRouter and resellers of it); Zhipu's own
         # docs list GLM-5.3 and GLM-5.3-Flash but no Prime, so there is no direct-API
         # id to swap to.
-    "openai/gpt-astra-latest": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=128000, pin="OpenAI",
-        api_id="~openai/gpt-astra-latest", served_as=("astra",)),
-        # Released 2026-09-11. The tilde slug FLOATS to the newest GPT Astra build, so
-        # the served model is logged on every dispatch (served_model in the log) — a
-        # silent family bump must not blend two models' outcomes in fleet_stats.
-        # served_as=("astra",) accepts any Astra build and rejects anything else.
-        # 128,000 max output / 1.05M context, $10 in / $50 out per 1M (OpenRouter
-        # listing). Worst-case runaway at this budget is ~$6.40 per dispatch.
     "meta/muse-spark-1.3": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=640000, pin="Meta",
+        provider="openrouter", klass="META-CLOSED", max_out=640000, pin="Meta",
         exact_served=True),
         # Added 2026-10-05 at the operator's request as a plain core entry. Meta, closed
         # weights, released 2026-09-02; 1,048,576 context; $1.25 in / $4.25 out per 1M
@@ -351,14 +404,15 @@ _MODELS = {
         # terms where prompts and outputs may be used to improve Meta's products. This
         # entry is the STANDARD tier, and exact_served=True makes provenance exact: the
         # default substring test would accept the contributor tier's reply for this one.
-        # Class US-CLOSED by the fleet's lab-lineage convention (country + openness). That
-        # makes it same-class as GPT Astra: the two cannot cross-check each other. A prior,
-        # not a measurement; give it its own class here if that pairing is wanted.
+        # Class META-CLOSED (2026-11-23, operator's decision): Meta is its own lineage, so GPT
+        # GPT Sol (US-CLOSED) may review Muse Spark. Spark and Ember share the class and can
+        # never check each other. A lineage prior, not a measurement: US labs' models are
+        # unlikely to be independent, and fleet_stats co-failure is what would show it.
         # Pinned to Meta by the operator, 2026-11-23: the same slug was served by both Meta
         # and Google, on different hosts, in one session.
         # Unvetted for factual roles: see _UNVETTED.
     "meta/muse-ember": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=128000, pin="Meta",
+        provider="openrouter", klass="META-CLOSED", max_out=128000, pin="Meta",
         exact_served=True),
         # Added 2026-11-23 (v21 plan). $0.10 in / $0.50 out per 1M; 1.05M context. For
         # repeated tool calls, subtasks, extraction and first drafts. Same family as Muse
@@ -370,6 +424,42 @@ _MODELS = {
         # context. For math and code where a deterministic check grades it. Class US-OW:
         # OpenRouter lists a Hugging Face id, so open weights. A lineage prior, not a
         # measured independence result. Unvetted for factual roles.
+    "openai/gpt-sol-latest": dict(
+        provider="openrouter", klass="US-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
+        api_id="~openai/gpt-sol-latest", served_as=("-sol",)),
+        # Added 2026-11-24 at the operator's request, as a FLOATING alias (OpenRouter: it
+        # always redirects to the newest GPT Sol model). Listing, via a search summary:
+        # 1.05M context, 128,000 max output, $2 in / $10 out per 1M. The ceiling is resolved
+        # live (auto_ceiling; 64,000 if the lookup fails). Same lab and class as the
+        # other OpenAI models. served_as=("-sol",) accepts any Sol build.
+        # Unpinned: the host that serves a ~alias is not known yet; the served host is logged
+        # and the pin is a decision for after fleet_check has shown it. Unvetted.
+    "x-ai/grok-latest": dict(
+        provider="openrouter", klass="XAI-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
+        api_id="~x-ai/grok-latest", served_as=("grok",)),
+        # Added 2026-11-24, floating. Listing, via search summaries: 500K context, $2 in /
+        # $6 out per 1M up to 200K input and $4 / $12 above it; max output reported as both
+        # 450,000 and 1,000,000, so it is resolved live (64,000 fallback), not typed in.
+        # Class XAI-CLOSED (operator, 2026-11-24): xAI is its own lineage. Unpinned, unvetted.
+    "google/gemini-pro-latest": dict(
+        provider="openrouter", klass="GOOGLE-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
+        api_id="~google/gemini-pro-latest", served_as=("-pro",)),
+        # Added 2026-11-24, floating. Listing, via search summaries: 1,048,576 context, 65,536
+        # max output (so the 64,000 fallback fits), $2 in / $12 out per 1M. served_as=("-pro",)
+        # accepts any Pro build and rejects a Flash build served by mistake. Class GOOGLE-CLOSED
+        # (operator, 2026-11-24): Google is its own lineage, so Sol and Gemini can review each
+        # other. Unpinned, unvetted.
+    "qwen/qwen4-max": dict(
+        provider="openrouter", klass="CN-OW", max_out=64000, auto_ceiling=True, pin=None),
+        # Added 2026-11-24 at the operator's request (seat: lead worker, reasoning and coding).
+        # Slug from the operator's roles table; NOT checked against OpenRouter from the build
+        # environment. Ceiling resolved live (64,000 if the lookup fails). Alibaba lineage, so
+        # CN-OW with DeepSeek and GLM: it cannot check them and they cannot check it. Unpinned
+        # and unvetted. Run fleet_check, then decide the pin from the host it shows.
+    "tencent/hy4": dict(
+        provider="openrouter", klass="CN-OW", max_out=64000, auto_ceiling=True, pin=None),
+        # Added 2026-11-24 at the operator's request (seat: worker, drafts and bulk). Same
+        # caveats as qwen/qwen4-max: slug unchecked, ceiling live, unpinned, unvetted, CN-OW.
 }
 
 # Models that must never be the source of a factual PASS (fleet-card 'Verification
@@ -380,18 +470,26 @@ _NO_VERIFY = frozenset({"deepseek-v4.1-flash"})
 # until their record earns one — fleet-card 'Verification eligibility': a model is not
 # added to the verifier column on novelty or index alone. Remove an id here to grant it.
 _UNVETTED = frozenset({"meta/muse-spark-1.3", "meta/muse-ember",
-                       "ibm-granite/granite-4.2-8b"})
+                       "ibm-granite/granite-4.2-8b", "openai/gpt-sol-latest",
+                       "x-ai/grok-latest", "google/gemini-pro-latest",
+                       "qwen/qwen4-max", "tencent/hy4"})
 
-# v21 ROUTERS. OpenRouter picks the model at run time, so a router can never be a verifier:
-# cross-class checks need to know who answered BEFORE the call. Routers are deliberately
-# NOT in _MODELS, which keeps them out of parallel, adversarial, workflows, route_decide and
-# every factual role by construction. Only call_router reaches them. The allowlist and the
-# host list are enforced on the request AND checked on the response.
-_ROUTERS = {
-    "openrouter/auto": dict(
-        provider="openrouter", klass="ROUTER", max_out=64000,
-        allowed=("meta/muse-spark-1.3", "meta/muse-ember", "ibm-granite/granite-4.2-8b"),
-        hosts=("Meta", "CoreWeave")),
+# Seats (UPGRADE-PLAN-v21.md 'Target roles', revised 2026-11-24). A seat is the role a model is
+# a PRIOR for. It grants no routing primary (route_evidence needs measured verdicts) and no
+# factual role (_UNVETTED, _NO_VERIFY). The names are the ones in the seat tables of SKILL.md
+# and governance.md; a test keeps the three in step.
+_SEATS = {
+    "deepseek-v4-pro": "Algorithmist",
+    "deepseek-v4.1-flash": "Drafter",
+    "glm-5.3": "Lead engineer & memory keeper",
+    "openai/gpt-sol-latest": "Chief reviewer (code and logic)",
+    "google/gemini-pro-latest": "Second reviewer and generator",
+    "x-ai/grok-latest": "Worker and generator",
+    "qwen/qwen4-max": "Lead worker (reasoning and coding)",
+    "tencent/hy4": "Worker (drafts and bulk)",
+    "meta/muse-spark-1.3": "Lead long-context worker",
+    "meta/muse-ember": "Efficient worker",
+    "ibm-granite/granite-4.2-8b": "Math and code, only where a check grades it",
 }
 
 # ---------------------------------------------------------------------------
@@ -451,7 +549,7 @@ _DEFAULT_PANEL = ("typesafe/jev-1.13", "perplexity/pplx-decider-v1.2")   # cross
 #
 # Until v17 the fleet was a literal dict: trying one more model meant editing this
 # file in a session. Now the dict is the STABLE CORE (DeepSeek and GLM on their direct
-# APIs, GPT Astra, the three decision models), and anything else on OpenRouter joins at
+# APIs, the three decision models), and anything else on OpenRouter joins at
 # runtime in one of two ways:
 #
 #   GUEST  — name any `author/name` slug in any tool that takes a model. On first
@@ -516,9 +614,9 @@ _GUEST_UNPRICED_OUT = 16_000     # budget when OpenRouter lists no usable price
 # listed gets its own class, "GUEST-<author>": a distinct lab is a distinct class by the
 # same proxy the other labels use. Override per model with fleet_add(klass=...).
 _LAB_CLASS = {"deepseek": "CN-OW", "z-ai": "CN-OW", "moonshotai": "CN-OW",
-              "qwen": "CN-OW", "minimax": "CN-OW",
-              "openai": "US-CLOSED", "anthropic": "US-CLOSED", "google": "US-CLOSED",
-              "x-ai": "US-CLOSED", "upstage": "KR-CLOSED", "typesafe": "US-CLOSED", "meta": "US-CLOSED",
+              "qwen": "CN-OW", "minimax": "CN-OW", "tencent": "CN-OW",
+              "openai": "US-CLOSED", "anthropic": "US-CLOSED", "google": "GOOGLE-CLOSED",
+              "x-ai": "XAI-CLOSED", "upstage": "KR-CLOSED", "typesafe": "US-CLOSED", "meta": "META-CLOSED",
               "inception": "US-CLOSED", "perplexity": "US-CLOSED"}
 
 
@@ -633,8 +731,9 @@ _CEILING_LOCK = threading.Lock()
 _CEILING_STATE: dict = {}        # model -> {"max_out", "source", "ts"}
 
 
-def _live_ceiling(model: str, fallback: int) -> tuple:
-    """(max_out, source). Never raises: every failure degrades to `fallback`."""
+def _live_ceiling(model: str, fallback: int, slug: Optional[str] = None) -> tuple:
+    """(max_out, source). Never raises: every failure degrades to `fallback`. `slug` is the
+    WIRE id to look up (a ~alias is listed under its own name, not its registry key)."""
     with _CEILING_LOCK:
         st = _CEILING_STATE.get(model)
         if st and (st["source"] == "live lookup"
@@ -642,7 +741,7 @@ def _live_ceiling(model: str, fallback: int) -> tuple:
             return st["max_out"], st["source"]
     if not os.environ.get("OPENROUTER_API_KEY"):
         return fallback, "fallback (no OPENROUTER_API_KEY)"      # the call will SKIP anyway
-    facts = _discover(model)
+    facts = _discover(slug or model)
     if facts.get("error"):
         res = (fallback, "fallback (lookup failed)")
     elif not facts.get("declared_out"):
@@ -832,11 +931,6 @@ _load_extras()
 def _resolve(model: str) -> dict:
     """Single lookup point. Fails with a specific, actionable message — never a bare
     KeyError from a dict literal buried inside a calling function (the v13 defect)."""
-    if model in _ROUTERS:
-        m = dict(_ROUTERS[model])
-        m.update(_CONFIGS[m["provider"]])
-        m["key"] = os.environ.get(m["key_env"], "")
-        return m
     if model not in _MODELS:
         raise KeyError(f"{model!r} is not in _MODELS — add a registry entry before "
                        f"dispatch. Known models: {sorted(_MODELS)}")
@@ -847,7 +941,7 @@ def _resolve(model: str) -> dict:
     m.update(_CONFIGS[m["provider"]])
     m["key"] = os.environ.get(m["key_env"], "")
     if m.get("auto_ceiling"):
-        m["max_out"], m["ceiling_source"] = _live_ceiling(model, m["max_out"])
+        m["max_out"], m["ceiling_source"] = _live_ceiling(model, m["max_out"], m.get("api_id"))
     return m
 
 
@@ -868,8 +962,6 @@ def _provider_block(cfg: dict) -> dict:
     """
     if cfg["provider"] != "openrouter":
         return {}
-    if cfg.get("allowed"):                 # a router: only the approved hosts
-        return {"provider": {"only": list(cfg["hosts"]), "allow_fallbacks": False}}
     if cfg.get("order"):
         return {"provider": {"order": cfg["order"],
                              "allow_fallbacks": False,
@@ -892,11 +984,6 @@ def _served_tokens(model: str, cfg: dict) -> tuple:
     return (wire.lstrip("~").split("/")[-1].split(":")[0],)
 
 
-def _router_member(served: str, cfg: dict) -> Optional[str]:
-    """The allowlisted model this served name is (exact or a dated build), or None."""
-    return next((a for a in cfg["allowed"] if _served_ok(served, a)), None)
-
-
 def _check_provenance(body: dict, model: str, cfg: dict):
     """v14 — return a [SUBSTITUTED] string, or None when provenance is clean.
 
@@ -908,14 +995,6 @@ def _check_provenance(body: dict, model: str, cfg: dict):
     """
     served_model = (body.get("model") or "").strip()
     served_prov = (body.get("provider") or "").strip()
-    if cfg.get("allowed"):
-        if served_model and not _router_member(served_model, cfg):
-            return (f"[SUBSTITUTED] router {model!r} served {served_model!r}, which is not "
-                    f"on its allowlist {list(cfg['allowed'])} — discard this output")
-        if served_prov and served_prov.lower() not in {h.lower() for h in cfg["hosts"]}:
-            return (f"[SUBSTITUTED] router {model!r} used host {served_prov!r}, not one of "
-                    f"{list(cfg['hosts'])} — discard this output")
-        return None
     if served_model and not (_served_ok(served_model, cfg.get("api_id") or model)
                              if (cfg.get("extra") or cfg.get("exact_served")) else
                              any(t in served_model for t in _served_tokens(model, cfg))):
@@ -967,7 +1046,7 @@ def _consume_stream(lines, model: str, cfg: dict, progress=None, meta=None) -> s
 
     v16: `meta`, when given, receives the served `model`/`provider` of the first chunk
     that declares them (after that chunk passes provenance). A floating alias like
-    ~openai/gpt-astra-latest resolves to a dated build; the log must record which.
+    ~openai/gpt-sol-latest resolves to a dated build; the log must record which.
     """
     parts, reasoning, finish, n = [], [], None, 0
     try:
@@ -1183,6 +1262,68 @@ def _log_event(rec: dict) -> None:
             _LOG_FAILURES += 1
 
 
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{10,}"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{8,}"),
+)
+_SECRET_KV = re.compile(r"(?i)((?:api[_-]?key|authorization|token|secret)[\"']?\s*[:=]\s*"
+                        r"[\"']?)[A-Za-z0-9._\-]{8,}")
+
+
+def _redact(text) -> str:
+    """Remove credentials from text bound for the log, a saved result or a check row: the
+    value of every configured API key, `sk-...` tokens, `Bearer ...` and key=value pairs
+    that look like credentials. A provider's error body is untrusted text and may echo
+    what it was sent."""
+    s = str(text)
+    for cfg in _CONFIGS.values():
+        v = os.environ.get(cfg["key_env"], "")
+        if len(v) >= 8:
+            s = s.replace(v, "[REDACTED]")
+    for pat in _SECRET_PATTERNS:
+        s = pat.sub("[REDACTED]", s)
+    return _SECRET_KV.sub(lambda m: m.group(1) + "[REDACTED]", s)
+
+
+# v20.1 — every finished generator call is written to disk at once, so a run that is killed
+# (a wrapper timeout, Desktop closing, a crash) loses only the calls still running.
+_RESULTS_DIR = Path(os.environ.get("ORCHESTRA_RESULTS_DIR")
+                    or Path(__file__).with_name("results"))
+_SAVE_RESULTS = os.environ.get("ORCHESTRA_SAVE_RESULTS", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+_RESULT_FAILURES = 0
+
+
+def _safe_name(x) -> str:
+    return (re.sub(r"[^A-Za-z0-9_.-]", "_", str(x))[:64].lstrip(".")) or "_"
+
+
+def _save_result(task_id, call_id, model, out, tag, meta, mode, role) -> None:
+    """results/<task_id>/<model>-<call_id>.json, written atomically (temp file, then
+    rename) so a kill mid-write leaves no half file. Never raises; failures are counted
+    and shown by fleet_stats. Failed calls are saved too, with their error text redacted."""
+    global _RESULT_FAILURES
+    if not _SAVE_RESULTS:
+        return
+    try:
+        d = _RESULTS_DIR / _safe_name(task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        text = out if isinstance(out, str) else None
+        if text is not None and tag != "OK":
+            text = _redact(text)
+        final = d / f"{_safe_name(model)}-{call_id}.json"
+        tmp = final.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "task_id": task_id, "call_id": call_id, "model": model, "mode": mode,
+            "role": role, "outcome": tag, "ts": _now(),
+            "served_model": meta.get("model", ""), "served_host": meta.get("provider", ""),
+            "content": text}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, final)
+    except Exception:
+        with _LOG_LOCK:
+            _RESULT_FAILURES += 1
+
+
 def _new_task_id() -> str:
     return str(uuid.uuid4())[:8]
 
@@ -1260,8 +1401,6 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
     payload = {"model": cfg.get("api_id") or model, "messages": messages,
                "max_tokens": cfg["max_out"], "stream": True}
     payload.update(_provider_block(cfg))     # OpenRouter pin; no-op for direct APIs
-    if cfg.get("allowed"):
-        payload["plugins"] = [{"id": "auto-router", "allowed_models": list(cfg["allowed"])}]
     if provider == "glm":
         # GLM-5.3 cannot disable thinking; thinking.type="disabled" hard-FAILS.
         payload["thinking"] = {"type": "enabled"}
@@ -1290,7 +1429,17 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
                 json=payload, stream=True,
                 timeout=(_CONNECT_SECONDS, _SILENCE_SECONDS),
             ) as resp:
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as e:
+                    # Read the provider's error body NOW, while the stream is open: the
+                    # with-block closes it on the way out and .text is then empty, which
+                    # is how a provider's 400 reached the log with no explanation.
+                    try:
+                        e.provider_body = _redact((resp.text or "")[:500])
+                    except Exception:
+                        e.provider_body = ""
+                    raise
                 return _consume_stream(resp.iter_lines(), model, cfg, progress, meta)
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
@@ -1302,14 +1451,15 @@ def _call(model: str, messages: list, reasoning_effort: str = "max",
             if attempt == 0 and 500 <= status < 600:
                 time.sleep(5)
                 continue
-            body_text = ""
-            try:
-                if e.response is not None:
-                    body_text = e.response.text[:300] if e.response.text else ""
-            except Exception:
-                pass  # Never raise from error handling
-            return f"[ERROR] {provider}/{model}: HTTP {status} — {e}" + \
-                   (f" {body_text}" if body_text else "")
+            body_text = getattr(e, "provider_body", "")
+            if not body_text:
+                try:
+                    if e.response is not None:
+                        body_text = _redact(e.response.text[:500]) if e.response.text else ""
+                except Exception:
+                    pass  # Never raise from error handling
+            return _redact(f"[ERROR] {provider}/{model}: HTTP {status} — {e}" +
+                           (f" {body_text}" if body_text else ""))
         except _STREAM_DEATH as e:
             # Raised before the first chunk (connect timeout / refused). A death DURING
             # the stream is caught inside _consume_stream, which keeps the partial text.
@@ -1331,7 +1481,7 @@ def _source(model: str) -> str:
 
 
 def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=None,
-                 work_type="", meta_out=None, **call_kwargs):
+                 work_type="", **call_kwargs):
     """Wrap the pure _call() so every user-facing dispatch appends EXACTLY ONE log row.
     Placed only at LEAF call sites — never around a path that itself calls _logged_call
     — so _call's internal timeout/429/5xx retries stay invisible and one logical
@@ -1348,22 +1498,29 @@ def _logged_call(model, messages, *, task_id, role="", mode="sync", contract=Non
     dispatches would vanish from the log and it would look the most reliable."""
     t0 = time.time()
     out = None
-    meta = {} if meta_out is None else meta_out
+    meta = {}
+    call_id = uuid.uuid4().hex[:12]
+    # v20.1: written BEFORE the call. A call that is killed never reaches the dispatch row
+    # below, and without this row it would leave no trace. fleet_stats lists started rows
+    # that have no matching dispatch row, and never counts them as successes.
+    _log_event({"type": "started", "ts": _now(), "task_id": task_id, "call_id": call_id,
+                "model": model, "mode": mode, "role": role, "work_type": work_type})
     try:
         out = _call(model, messages, meta=meta, **call_kwargs)
         return out
     finally:
         tag = _outcome_tag(out) if isinstance(out, str) else "UNCAUGHT"
-        # A routed call is credited to the model that served it, so route_evidence and
-        # fleet_stats measure real models and never a moving target.
-        credited = (_router_member(meta.get("model", ""), _ROUTERS[model]) or model
-                    if model in _ROUTERS else model)
-        _log_event({"type": "dispatch", "ts": _now(), "task_id": task_id,
-                    "model": credited, "klass": _MODELS.get(credited, {}).get("klass", "?"),
-                    "provider": _MODELS.get(credited, {}).get("provider", "?"),
-                    **({"via": model} if model in _ROUTERS else {}),
+        # Saved before the row is logged: a kill between the two leaves the answer on disk
+        # and the call listed as unfinished, which is recoverable; the reverse is not.
+        _save_result(task_id, call_id, model, out, tag, meta, mode, role)
+        _log_event({"type": "dispatch", "ts": _now(), "task_id": task_id, "call_id": call_id,
+                    "model": model, "klass": _MODELS.get(model, {}).get("klass", "?"),
+                    "provider": _MODELS.get(model, {}).get("provider", "?"),
                     "mode": mode, "role": role, "outcome": tag,
-                    "source": _source(credited),
+                    **({"error_detail": _redact(out[:600] if isinstance(out, str)
+                                                else "uncaught exception")}
+                       if tag != "OK" else {}),
+                    "source": _source(model),
                     "work_type": work_type,
                     "out_chars": len(out) if isinstance(out, str) else 0,
                     "served_model": meta.get("model", ""),
@@ -1397,22 +1554,26 @@ _FORMATS = ("json", "xml", "code", "markdown", "text")
 _WORK_TYPES = ("swe", "agentic", "algorithmic", "bulk", "drafting", "extraction",
                "reasoning", "factual", "image", "review", "memory", "other")
 
-# The fleet card's routing table as data: (primary, cross-class partner or None).
+# The fleet card's routing table as data: (primary, partner or None).
 # A PRIOR from benchmarks — route_evidence() overrides it once outcomes are measured.
 _ROUTING_PRIOR = {
-    "swe": ("glm-5.3", "openai/gpt-astra-latest"),
-    "agentic": ("openai/gpt-astra-latest", "glm-5.3"),
-    "algorithmic": ("deepseek-v4-pro", "openai/gpt-astra-latest"),
+    "swe": ("glm-5.3", None),
+    "agentic": ("glm-5.3", None),
+    "algorithmic": ("deepseek-v4-pro", None),
     "bulk": ("glm-5.3", None),
     "drafting": ("deepseek-v4.1-flash", None),
-    "extraction": ("glm-5.3", "openai/gpt-astra-latest"),
-    "reasoning": ("openai/gpt-astra-latest", "glm-5.3"),
-    "factual": ("openai/gpt-astra-latest", "glm-5.3"),
+    "extraction": ("glm-5.3", None),
+    "reasoning": ("glm-5.3", None),
+    "factual": ("glm-5.3", None),
     "image": ("deepseek-v4.1-flash", None),
-    "review": ("openai/gpt-astra-latest", "glm-5.3"),
+    "review": ("glm-5.3", None),
     "memory": ("glm-5.3", None),
-    "other": ("openai/gpt-astra-latest", "glm-5.3"),
+    "other": ("glm-5.3", None),
 }
+# No partner is named anywhere: the only generators outside CN-OW (Sol, Gemini, Grok) and the
+# two new CN-OW workers are candidates with no measured record, and the operator's rule is that
+# they start with no routing prior. `explore` lists every unmeasured model, so each is paired
+# with the primary on L1-verifiable work until route_evidence has data to say otherwise.
 
 # Named contracts: {"output_contract": {"name": "critic_v1"}} expands to a fixed shape,
 # so two critics' defects (or two verifiers' claims) line up key-for-key and can be
@@ -1795,6 +1956,7 @@ def _logged_decide(model: str, state, questions: dict, *, task_id: str,
                     "provider": "openrouter-decisions", "mode": mode, "role": role,
                     "source": _source(model),
                     "outcome": _outcome_tag(err) if err else "OK",
+                    **({"error_detail": _redact(err[:500])} if err else {}),
                     "questions": len(questions) if isinstance(questions, dict) else 0,
                     "served_model": (res or {}).get("served_model", "")
                     if isinstance(res, dict) else "",
@@ -1923,7 +2085,7 @@ def _compare_one(model: str, instructions: str, cand_a: str, cand_b: str,
 # Shared mode logic — used by BOTH the sync tools and the job workers, so the
 # two paths can't drift apart (the v9 "hand-synced copies" complaint, fixed).
 # ---------------------------------------------------------------------------
-_DEFAULT_PAIR = ("glm-5.3", "openai/gpt-astra-latest")   # CN-OW x US-CLOSED
+_DEFAULT_PAIR = ("glm-5.3", "openai/gpt-sol-latest")   # CN-OW x US-CLOSED
 
 
 def _run_parallel(models=_DEFAULT_PAIR, brief: Optional[dict] = None,
@@ -2341,7 +2503,7 @@ def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v
                           looked up and tried as a guest — no setup needed — when the dynamic
                           fleet is enabled (ORCHESTRA_DYNAMIC_FLEET=1; off by default).
           "parallel"    — the same brief to two models (`model_a`/`model_b`, default
-                          glm-5.3 [CN-OW] + openai/gpt-astra-latest
+                          glm-5.3 [CN-OW] + openai/gpt-sol-latest
                           [US-CLOSED]). Capped at 2 by design.
           "adversarial" — 2 rounds, 4 dispatches; `model_a`/`model_b` MUST be from
                           different correlation classes. Same-class pairs are REJECTED.
@@ -2488,49 +2650,13 @@ def check_job(job_id: str, wait_seconds: int = 25) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def call_router(brief: Union[dict, str], router: str = "openrouter/auto",
-                reasoning_effort: str = "low") -> str:
-    """Let OpenRouter pick the model for LOW-STAKES generator work, inside the approved
-    allowlist and hosts (list_fleet shows them). QUICK tasks only.
-
-    Generator role only: a router cannot verify, critique, extract or ratify, because who
-    answers is decided at run time. Context marked sensitive is refused. A reply from
-    outside the allowlist returns [SUBSTITUTED]. The dispatch is logged under the model
-    that served it; call log_outcome with `served_model`, never with the router's name.
-
-    Returns JSON {task_id, router, served_model, served_host, outcome, content}.
-    """
-    if router not in _ROUTERS:
-        return json.dumps({"error": f"[ERROR] unknown router {router!r} — known: "
-                                    f"{sorted(_ROUTERS)}"})
-    b, err = _validate_brief(brief, router)
-    if err:
-        return json.dumps({"error": f"[ERROR] invalid brief: {err}"})
-    if b["role"] != "generator":
-        return json.dumps({"error": f"[ERROR] {router} may only take the generator role, got "
-                                    f"{b['role']!r} — who answers is decided at run time, so "
-                                    f"it cannot hold a checking role"})
-    if any(i.get("sensitive") for i in b["context"]):
-        return json.dumps({"error": f"[ERROR] {router} may not receive context marked "
-                                    f"sensitive"})
-    task_id, meta = _new_task_id(), {}
-    out = _logged_call(router, _render_brief(b, task_id), task_id=task_id, role=b["role"],
-                       mode="router", contract=b["output_contract"],
-                       work_type=b.get("work_type", ""), reasoning_effort=reasoning_effort,
-                       meta_out=meta)
-    return json.dumps({"task_id": task_id, "router": router,
-                       "served_model": meta.get("model", ""),
-                       "served_host": meta.get("provider", ""),
-                       "outcome": _outcome_tag(out), "content": out}, ensure_ascii=False)
-
-
-@mcp.tool()
 def call_model(model: str, brief: Union[dict, str], reasoning_effort: str = "max") -> str:
     """Call ONE generator with a structured brief and WAIT. QUICK tasks only; for deep
     work use orchestra_start(mode="model", model=..., brief=...).
 
     Fleet ids: deepseek-v4-pro, deepseek-v4.1-flash, glm-5.3,
-    openai/gpt-astra-latest, meta/muse-spark-1.3. With the dynamic fleet enabled
+    openai/gpt-sol-latest, x-ai/grok-latest, google/gemini-pro-latest, qwen/qwen4-max,
+    tencent/hy4, meta/muse-spark-1.3, meta/muse-ember, ibm-granite/granite-4.2-8b. With the dynamic fleet enabled
     (ORCHESTRA_DYNAMIC_FLEET=1; off by default) ANY other OpenRouter author/name slug is
     looked up and tried as a guest on first mention; otherwise it is refused. Call list_fleet() for classes, seats and budgets. The brief
     shape is documented on orchestra_start.
@@ -2563,7 +2689,7 @@ def orchestra_parallel(brief: Union[dict, str], model_a: str = _DEFAULT_PAIR[0],
     """Send ONE structured brief to two generators concurrently and WAIT. QUICK briefs
     only — for anything substantial use orchestra_start(mode="parallel").
 
-    Default pair is cross-class: glm-5.3 [CN-OW] + openai/gpt-astra-latest
+    Default pair is cross-class: glm-5.3 [CN-OW] + openai/gpt-sol-latest
     [US-CLOSED]. This tool does NOT judge or pick a winner: hand the two candidates to
     decide_compare / decide_panel and adjudicate per SKILL.md 'Ratification'. Both
     dispatches share the returned task_id — log each model's correctness under it.
@@ -2781,8 +2907,8 @@ def fleet_add(model: str, kind: str = "generator", klass: str = "",
       False. Set it only on a measured record (SKILL.md 'Trying a model').
     note: free text kept in the file.
 
-    The core fleet (DeepSeek V4 Pro, DeepSeek V4.1 Flash, GLM-5.3, GPT Astra, Muse Spark
-    1.3, and the three core decision models) is fixed in code; this adds to it and can
+    The core fleet (DeepSeek V4 Pro, DeepSeek V4.1 Flash, GLM-5.3, the OpenRouter workers
+    and the three core decision models) is fixed in code; this adds to it and can
     remove only what it added. Refused while the dynamic fleet is switched off.
     """
     if not _DYNAMIC:
@@ -2826,8 +2952,8 @@ def fleet_remove(model: str) -> str:
     """Take a guest or added model out of the fleet — for this process and, if it was
     saved, from fleet_extra.json. Its past dispatches and verdicts stay in the log.
 
-    The core fleet (DeepSeek V4 Pro, DeepSeek V4.1 Flash, GLM-5.3, GPT Astra, Muse Spark
-    1.3 and the three core decision models) is fixed in code and is refused here. Refused
+    The core fleet (DeepSeek V4 Pro, DeepSeek V4.1 Flash, GLM-5.3, the OpenRouter workers
+    and the three core decision models) is fixed in code and is refused here. Refused
     entirely while the dynamic fleet is switched off.
     """
     if not _DYNAMIC:
@@ -2912,7 +3038,9 @@ def _check_generator(model: str) -> dict:
             f"model, widen its provenance rule (served_as / exact_served); if it is a "
             f"different tier, the rejection is correct")
     else:
-        row["problems"].append(f"the test call returned {tag}: {out.strip()[:220]}")
+        row["problems"].append(f"the test call returned {tag}: "
+                               f"{_redact(out.strip()[:600])}")
+        row["error_text"] = _redact(out.strip()[:600])
     row["status"] = "PROBLEM" if row["problems"] else "OK"
     return row
 
@@ -2927,7 +3055,7 @@ def _check_decider(model: str) -> dict:
     if err.startswith("[SKIPPED]"):
         return {**row, "status": "SKIPPED", "note": err[:160]}
     if err:
-        return {**row, "status": "PROBLEM", "problems": [err[:240]]}
+        return {**row, "status": "PROBLEM", "problems": [_redact(err[:600])]}
     row.update(served_model=res.get("served_model", ""),
                p_greeting=(res["answers"].get("greeting") or {}).get("noul"))
     trouble = _polarity_canary(model)
@@ -3056,7 +3184,7 @@ def list_fleet() -> str:
 
     Use it before choosing a verifier (its class must differ from the worker's) and
     whenever a call returns [SKIPPED] or [ERROR]. A missing OPENROUTER_API_KEY removes
-    GPT Astra, the entire decision bench, and the only non-CN-OW generator class — say
+    every non-CN-OW generator, the entire decision bench and the OpenRouter workers — say
     so explicitly rather than silently same-class verifying or falling back to
     Claude-alone rulings.
     """
@@ -3078,6 +3206,7 @@ def list_fleet() -> str:
             **({"budget_source": (_CEILING_STATE[mid]["source"] if mid in _CEILING_STATE
                                   else "registry fallback — resolved live on first use")}
                if m.get("auto_ceiling") else {}),
+            "seat": _SEATS.get(mid, "guest" if m.get("extra") else "unassigned"),
             "may_verify_facts": _verify_bar(mid) is None,
             "api_key_present": key_present,
             "source": _source(mid),
@@ -3099,9 +3228,6 @@ def list_fleet() -> str:
         "decision_bench": bench,
         "correlation_classes": classes,
         "bench_classes": sorted({d["klass"] for d in _DECIDERS.values()}),
-        "routers": {k: {"allowed": list(v["allowed"]), "hosts": list(v["hosts"]),
-                        "use": "call_router, generator role only; never a verifier"}
-                    for k, v in _ROUTERS.items()},
         "classes_reachable_now": reachable,
         "cross_class_verification_available": len(reachable) > 1,
         "bench_available": or_key,
@@ -3122,8 +3248,10 @@ def list_fleet() -> str:
         "note": "Verifier.class must differ from Worker.class (SKILL.md 'Verification "
                 "ladder'). Classes are a lab-lineage prior, not a measurement — "
                 "fleet_stats() replaces the guess once it has enough paired verdicts. "
-                "Only one generator (openai/gpt-astra-latest) is outside CN-OW, so it is "
-                "the only cross-class partner for the other three.",
+                "Generators outside CN-OW: " + ", ".join(
+                    sorted(m for m, e in _MODELS.items() if e["klass"] != "CN-OW"))
+                + " — the cross-class partners for the CN-OW models. Models of the same "
+                "class cannot check each other.",
     }, indent=2)
 
 
@@ -3535,7 +3663,7 @@ def _route_evidence_data(work_type: str, role: str = "generator", last_n: int = 
                                            and _verify_bar(m))]
     primary, partner = _ROUTING_PRIOR[work_type]
     if primary not in eligible:
-        primary = partner if partner in eligible else "openai/gpt-astra-latest"
+        primary = partner if partner in eligible else "glm-5.3"
     log = _read_log(last_n)
     table = _work_type_table(log["dispatches"], log["outcomes"]).get(work_type, {})
     measured = {}
@@ -3594,8 +3722,6 @@ _ROUTER_LEAD = 0.20           # (wins - losses) / decisive needed to be "ahead"/
 
 _ROUTE_BLURB = {
     "glm-5.3": "strong real-world software-engineering and terminal work; 1M context",
-    "openai/gpt-astra-latest": "lowest measured hallucination rate among the generators; "
-                               "the only non-CN-OW generator; costs $10/$50 per M tokens",
     "deepseek-v4-pro": "best on competitive and algorithmic code; weaker on general reasoning",
     "deepseek-v4.1-flash": "cheapest; image input; for drafting and bulk work only",
     "meta/muse-spark-1.3": "candidate added at the operator's request; closed weights; "
@@ -3603,6 +3729,15 @@ _ROUTE_BLURB = {
     "meta/muse-ember": "small and cheap; repeated tool calls, subtasks and drafts; unmeasured",
     "ibm-granite/granite-4.2-8b": "very cheap open-weights 8B; math and code when a "
                                   "deterministic check grades it; unmeasured",
+    "openai/gpt-sol-latest": "chief reviewer (code and logic) by the operator's decision; "
+                             "floating alias; 1.05M context; the build changes; unmeasured",
+    "x-ai/grok-latest": "worker and generator; floating alias; own class; 500K context; "
+                        "the build changes; unmeasured",
+    "google/gemini-pro-latest": "second reviewer and generator; floating alias; own class, so "
+                                "Sol can review it; the build changes; unmeasured",
+    "qwen/qwen4-max": "lead worker for reasoning and coding by the operator's decision; "
+                      "CN-OW; unmeasured",
+    "tencent/hy4": "worker for drafts and bulk by the operator's decision; CN-OW; unmeasured",
 }
 
 
@@ -3918,9 +4053,6 @@ def log_outcome(task_id: str, model: str, correctness: str,
         return f"[ERROR] disposition must be one of {[x for x in _DISPOSITION if x]} or empty — got {disposition!r}"
     if not task_id.strip() or not model.strip():
         return "[ERROR] task_id and model are both required — per-model verdicts are the whole point"
-    if model.strip() in _ROUTERS:
-        return (f"[ERROR] {model.strip()} is a router: log the outcome under the model that "
-                f"served it (`served_model` in the call_router result)")
     bs = "L1" if c == "OVERTURNED_BY_L1" else basis.strip().upper()
     if bs not in _BASIS:
         return f"[ERROR] basis must be one of {list(_BASIS)} — got {basis!r}"
@@ -3934,7 +4066,7 @@ def _read_log(last_n: int = 1000) -> dict:
     """Parse the last `last_n` log lines into dispatch / outcome / override rows.
     Shared by fleet_stats and route_evidence so the two can never disagree."""
     out = {"lines": 0, "dispatches": [], "outcomes": [], "overrides": [], "rulings": [],
-           "malformed": 0, "error": None}
+           "starts": [], "malformed": 0, "error": None}
     lines = []
     try:
         with _LOG_LOCK:
@@ -3947,7 +4079,7 @@ def _read_log(last_n: int = 1000) -> dict:
     lines = lines[-max(1, last_n):]
     out["lines"] = len(lines)
     bucket = {"dispatch": "dispatches", "outcome": "outcomes", "override": "overrides",
-              "route_ruling": "rulings"}
+              "route_ruling": "rulings", "started": "starts"}
     for ln in lines:
         ln = ln.strip()
         if not ln:
@@ -4007,6 +4139,65 @@ def _rate(cell: dict, min_n: int = _MIN_ROUTE_SAMPLES) -> tuple:
 
 
 @mcp.tool()
+def recover_results(task_id: str) -> str:
+    """Read back what a task left on disk: every call that finished (its reply, outcome,
+    served model and host) and every call that started and never did. Use it after a
+    wrapper timeout, a closed Desktop or a crash, or to re-read a result without
+    re-running it. Replies are cut at 20,000 characters here; `path` is the full file.
+
+    Results live in results/<task_id>/ next to the server (ORCHESTRA_RESULTS_DIR moves
+    them; ORCHESTRA_SAVE_RESULTS=0 turns saving off). They hold model output, so treat the
+    folder like the memory bank: local, and never committed.
+    """
+    tid, err = _task_id_arg(task_id)
+    if err or not tid:
+        return json.dumps({"error": err or "[ERROR] task_id is required"})
+    d = _RESULTS_DIR / _safe_name(tid)
+    saved = []
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            saved.append({"path": str(p), "error": "unreadable"})
+            continue
+        text = rec.get("content")
+        saved.append({**{k: rec.get(k) for k in ("model", "mode", "role", "outcome", "ts",
+                                                 "served_model", "served_host")},
+                      "chars": len(text) if isinstance(text, str) else 0,
+                      "truncated": isinstance(text, str) and len(text) > 20000,
+                      "content": text[:20000] if isinstance(text, str) else None,
+                      "path": str(p)})
+    log = _read_log(5000)
+    finished = {x.get("call_id") for x in log["dispatches"] if x.get("call_id")}
+    open_calls = [{"model": s.get("model"), "mode": s.get("mode"), "started": s.get("ts")}
+                  for s in log["starts"]
+                  if s.get("task_id") == tid and s.get("call_id") not in finished]
+    return json.dumps({"task_id": tid, "saved": saved, "unfinished": open_calls,
+                       "results_dir": str(d),
+                       "note": "unfinished = started, no finish logged: killed, hung or "
+                               "still running"}, ensure_ascii=False, indent=2)
+
+
+def _unfinished_report(log: dict) -> dict:
+    """Started calls with no dispatch row: killed, hung, or still running in another
+    process. Listed with their age and never counted as successes or as failures."""
+    finished = {d.get("call_id") for d in log["dispatches"] if d.get("call_id")}
+    open_calls = [s for s in log["starts"] if s.get("call_id") not in finished]
+    now, rows = time.time(), []
+    for s in open_calls[-20:]:
+        try:
+            age = round(now - time.mktime(time.strptime(s["ts"], "%Y-%m-%dT%H:%M:%S")))
+        except Exception:
+            age = None
+        rows.append({"task_id": s.get("task_id"), "model": s.get("model"),
+                     "mode": s.get("mode"), "started": s.get("ts"), "age_s": age})
+    return {"count": len(open_calls), "latest": rows,
+            "note": "a call that has been open longer than its model's p90 latency "
+                    "(per_model.elapsed_s) was probably killed; recover_results(task_id) "
+                    "returns whatever the same task finished"}
+
+
+@mcp.tool()
 def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
     """Read the dispatch log and report what the fleet has actually DONE — the measured
     counterpart to fleet-card.md's ASSUMED routing priors, and the answer to list_fleet's
@@ -4029,7 +4220,9 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
          above is stale; a silent dead flywheel is the worst case, so it is loud here.
       6. (v16) claude_overrides_of_bench and the builds a floating alias served.
       7. (v17) by_work_type — per (work type, model) verdict counts and correct rates,
-         verified (L1/L2) verdicts preferred. route_evidence reads the same table."""
+         verified (L1/L2) verdicts preferred. route_evidence reads the same table.
+      8. (v20.1) unfinished_calls — started calls with no finish, and per_model latency
+         (elapsed_s: median, p90, max over OK calls) for sizing a caller's time limit."""
     log = _read_log(last_n)
     if log["error"]:
         return json.dumps({"error": log["error"], "log_path": str(_LOG_PATH)})
@@ -4041,6 +4234,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
 
     if not dispatches:
         return json.dumps({"note": "no dispatches in window — nothing measured yet",
+                           "unfinished_calls": _unfinished_report(log),
                            "log_path": str(_LOG_PATH), "lines_scanned": n_lines,
                            "malformed_lines_skipped": malformed,
                            "log_write_failures": _LOG_FAILURES}, indent=2)
@@ -4050,7 +4244,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
         outcome_by[(o.get("task_id"), o.get("model"))] = o
 
     per = defaultdict(lambda: {"dispatches": 0, "infra_fail": 0, "skipped": 0, "klass": "?",
-                               "served": set()})
+                               "served": set(), "elapsed": []})
     mode_by, klass_by, dispatched_pairs = {}, {}, set()
     for d in dispatches:
         m = d.get("model"); key = (d.get("task_id"), m)
@@ -4063,6 +4257,8 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
             p["skipped"] += 1
         elif tag != "OK":
             p["infra_fail"] += 1
+        if tag == "OK" and isinstance(d.get("elapsed_s"), (int, float)):
+            p["elapsed"].append(float(d["elapsed_s"]))
         mode_by[key] = d.get("mode"); klass_by[key] = d.get("klass", "?")
         dispatched_pairs.add(key)
 
@@ -4079,6 +4275,11 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
             per_model[m]["source"] = p["source"]       # a guest or added model
         if p["served"]:
             per_model[m]["served_models"] = sorted(p["served"])
+        if p["elapsed"]:
+            e, n = sorted(p["elapsed"]), len(p["elapsed"])
+            per_model[m]["elapsed_s"] = {
+                "n": n, "median": round(e[n // 2] if n % 2 else (e[n // 2 - 1] + e[n // 2]) / 2, 1),
+                "p90": round(e[max(0, math.ceil(0.9 * n) - 1)], 1), "max": round(e[-1], 1)}
 
     covered = sum(1 for pr in dispatched_pairs if pr in outcome_by)
     outstanding = len(dispatched_pairs) - covered
@@ -4131,6 +4332,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
                              "Claude-judged — a weak signal until L1-verified outcomes "
                              "dominate. The fleet_stats() / SKILL.md 'Outcome log' seed, not the finished result.",
         "worst_recent": worst,
+        "unfinished_calls": _unfinished_report(log),
         "claude_overrides_of_bench": override_counts or "none logged",
         "routing": _routing_report(log["rulings"], _router_record(log))
                    or "no routing rulings yet — route_decide has not been used",
@@ -4139,6 +4341,7 @@ def fleet_stats(last_n: int = 1000, mode: str = "") -> str:
                          for wt, models in _work_type_table(all_dispatches, outcomes).items()}
                         or "no adjudicated dispatches carry a work_type yet",
         "log_write_failures": _LOG_FAILURES,
+        "result_write_failures": _RESULT_FAILURES,
         "log_path": str(_LOG_PATH),
     }, indent=2, ensure_ascii=False)
 

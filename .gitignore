@@ -2,3 +2,8 @@ __pycache__/
 memory_bank.json
 memory_bank.tmp
 .env
+results/
+_archive*/
+_backup*/
+.venv/
+venv/
