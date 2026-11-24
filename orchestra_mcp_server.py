@@ -2,9 +2,9 @@
 orchestra_mcp_server.py — local MCP server for Claude Desktop (v21-min)
 
 Three jobs:
-  ASK    ask / ask_start / check_job: a plain request to a fleet model, a text answer back.
-         call_model, orchestra_start and workflow_start are the structured version: JSON briefs,
-         output contracts, two-model adversarial rounds, multi-step workflow plans.
+  ASK    call_model / ask_start / orchestra_start: a JSON brief, rendered to an XML envelope,
+         with an output contract checked on the reply; check_job polls. Also two-model
+         adversarial rounds and multi-step workflow plans (workflow_start).
   DECIDE decide / decide_panel: closed questions answered by the decision bench (Jev + the
          Perplexity Decider): calibrated probabilities, no prose.
   SWARM  swarm_plan: the fleet/Claude split for a Claude Code swarm and the launch command for
@@ -2036,53 +2036,33 @@ def check_job(job_id: str, wait_seconds: int = 25) -> str:
 # go through orchestra_start instead (client-side timeout risk). All take a brief.
 # ---------------------------------------------------------------------------
 
-def _plain_messages(prompt: str, system: str) -> list:
-    msgs = [{"role": "system", "content": system}] if str(system or "").strip() else []
-    return msgs + [{"role": "user", "content": prompt}]
-
-
 @mcp.tool()
-def ask(model: str, prompt: str, system: str = "", reasoning_effort: str = "high") -> str:
-    """Send ONE plain request to ONE fleet model and WAIT. The reply is the model's text,
-    exactly as it came back — or a failure tag ([ERROR], [TIMEOUT], [EMPTY], [TRUNCATED],
-    [SUBSTITUTED], [SKIPPED]). No brief, no contract, no roles: this is how the fleet was
-    used before the structured briefs.
-
-    QUICK requests only (Claude Desktop drops tool results that take more than a minute or
-    so). For anything long use ask_start. model: a fleet id from list_fleet(). Every call
-    is logged and its reply saved under results/<task_id>/ (recover_results lists them).
-    """
-    err = _admit_model(model)
-    if err:
-        return err
-    if not str(prompt or "").strip():
-        return "[ERROR] prompt is empty"
-    return _logged_call(model, _plain_messages(prompt, system), task_id=_new_task_id(),
-                        mode="ask", reasoning_effort=reasoning_effort)
-
-
-@mcp.tool()
-def ask_start(models: Union[list, str], prompt: str, system: str = "",
+def ask_start(models: Union[list, str], brief: Union[dict, str],
               reasoning_effort: str = "high", task_id: str = "") -> str:
-    """START plain requests as a background job and return at once with a job_id. Use it
-    for anything slow, and to put the SAME prompt to several models at once (at most 6;
-    they never see each other's replies). Poll with check_job; the result is
-    {"task_id", "results": {model: {"class", "outcome", "content", "served_model"}}}.
+    """START the same structured brief on one or more models as a background job. The brief
+    is validated, rendered to the XML <orchestra_brief> envelope for each model, and each
+    reply is checked against the brief's output contract. At most 6 models; they never see
+    each other's replies. Poll with check_job. The brief shape is documented on
+    orchestra_start. Result: {"task_id", "results": {model: {"class", "outcome",
+    "contract", "content"}}}.
 
-    models: a fleet id or a list of them. To cross-check, choose models of different
-    classes (list_fleet shows each class); two models of one class agreeing is not
-    confirmation. task_id: optional, groups the calls in the log and in results/.
+    models: a fleet id or a list. To cross-check, choose models of different classes
+    (list_fleet shows each class); two models of one class agreeing is not confirmation.
+    A plain-text prompt is refused: write a brief. task_id: optional, groups the calls in
+    the log and in results/.
     """
     ms = [models] if isinstance(models, str) else list(models or [])
     if not 1 <= len(ms) <= _MAX_DISPATCHES or len(set(ms)) != len(ms):
         return json.dumps({"status": "failed", "error":
                            f"models must be 1 to {_MAX_DISPATCHES} distinct fleet ids"})
+    b = None
     for m in ms:
         err = _admit_model(m)
         if err:
             return json.dumps({"status": "failed", "error": err})
-    if not str(prompt or "").strip():
-        return json.dumps({"status": "failed", "error": "[ERROR] prompt is empty"})
+        b, err = _validate_brief(brief, m)
+        if err:
+            return json.dumps({"status": "failed", "error": f"invalid brief: {err}"})
     given, tid_err = _task_id_arg(task_id)
     if tid_err:
         return json.dumps({"status": "failed", "error": tid_err})
@@ -2090,13 +2070,13 @@ def ask_start(models: Union[list, str], prompt: str, system: str = "",
     def work(job_id, progress):
         tid = given or job_id
         progress(f"calling {', '.join(ms)}")
-        msgs = _plain_messages(prompt, system)
+        msgs = _render_brief(b, tid)
         res = _run_threads({m: (lambda m=m: _logged_call(
-            m, msgs, task_id=tid, mode="ask", reasoning_effort=reasoning_effort,
+            m, msgs, task_id=tid, role=b["role"], mode="ask", contract=b["output_contract"],
+            work_type=b.get("work_type", ""), reasoning_effort=reasoning_effort,
             progress=progress)) for m in ms})
         return json.dumps({"task_id": tid, "results": {
-            m: {"class": _MODELS[m]["klass"], "outcome": _outcome_tag(res.get(m)),
-                "content": res.get(m, "[ERROR] no result")} for m in ms}},
+            m: _package(m, res.get(m, "[ERROR] no result"), b["output_contract"]) for m in ms}},
             indent=2, ensure_ascii=False)
 
     return _start_job("ask", work)

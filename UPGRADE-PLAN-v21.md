@@ -8,7 +8,7 @@ Status (2026-11-24): **the plan is replaced by the bare-minimum rebuild in *Revi
 
 **Owner's decision.** Orchestra is over-engineered. Rebuild it to the bare minimum around three uses, and nothing else:
 
-1. **Ask.** Claude sends a plain request to a fleet model and gets a text answer back, as before October (pre-v16): no JSON brief, no XML envelope, no output contract, no roles.
+1. **Ask.** Claude sends a **JSON brief**, rendered to an **XML envelope**, with an **output contract** checked on the reply (owner's decision, 2026-11-24: the structured request stays; free text is refused).
 2. **Decide.** Claude runs closed questions that matter (dispatch or not, which answer is better, does a synthesis pass its checklist) through the decision bench: `~typesafe/jev-latest` + `~perplexity/pplx-decider-latest`.
 3. **Swarm.** When Claude Code deploys subagents, **60–70% of them are driven by fleet models** and the rest by default Claude models.
 
@@ -62,8 +62,7 @@ Line numbers refer to `orchestra_mcp_server.py` at v20.5 (4,353 lines). Result: 
 
 | Tool | Does |
 |---|---|
-| `ask(model, prompt, system)` | One plain request; returns the model's text or a failure tag |
-| `ask_start(models, prompt, system)` | The same prompt to 1–6 models in the background |
+| `ask_start(models, brief)` | The same validated brief, XML-rendered, to 1–6 models in the background; each reply contract-checked. (`call_model` is the quick single-model call.) |
 | `check_job(job_id)` | Poll any background job |
 | `decide`, `decide_panel` | The bench: Jev (`~typesafe/jev-latest`) and the Decider (`~perplexity/pplx-decider-latest`) |
 | `call_model`, `orchestra_start`, `orchestra_parallel`, `orchestra_adversarial`, `workflow_start` | The structured path, kept |
@@ -396,3 +395,5 @@ Phase 2 note on decision 3 (measured 2026-11-24, Claude Code 2.1.331): a worker 
 14. Decision bench aliases (answered 2026-11-24): `~typesafe/jev-latest` replaces `typesafe/jev-1.13`; with `~perplexity/pplx-decider-latest` it forms the bench. Kimi K3.1 host: chosen by Claude from the owner's three options as `wafer/us`, because the other two are 4-bit quantized by name and the seat is math and code. Bare-minimum rebuild approved in principle, plan first: see *Revised direction*.
 
 15. Rebuild go-ahead (answered 2026-11-24): proceed with the bare-minimum rebuild on the recommendations above, keeping workflows, adversarial mode and memory, with the 60–70% / 80–90% ratio. Done offline as M0–M4 (commits after `7a95b10`). Jev is `~typesafe/jev-latest`; Kimi K3.1 is pinned to `wafer/us`.
+
+16. Requests stay structured (answered 2026-11-24): JSON brief + XML envelope + output contract is how Claude sends every request. The plain `ask` tool was removed; `ask_start` takes a brief.

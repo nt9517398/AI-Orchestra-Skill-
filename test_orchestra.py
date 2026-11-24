@@ -2402,7 +2402,7 @@ def test_every_server_tool_is_documented_and_no_removed_tool_is():
     import asyncio
     docs = "\n".join(_packaged_docs().values())
     tools = {t.name for t in asyncio.run(o.mcp.list_tools())}
-    assert tools >= {"ask", "ask_start", "check_job", "decide", "decide_panel", "swarm_plan",
+    assert tools >= {"ask_start", "check_job", "decide", "decide_panel", "swarm_plan",
                      "list_fleet", "fleet_check", "recover_results", "workflow_start",
                      "orchestra_start", "memory_review"}, sorted(tools)
     for name in sorted(tools):
@@ -2865,57 +2865,37 @@ def test_google_and_xai_are_their_own_classes_so_sol_and_gemini_review_each_othe
 # v21-min — plain requests: ask / ask_start
 # ---------------------------------------------------------------------------
 
-def test_ask_sends_the_plain_prompt_and_returns_the_models_text_unchanged():
+def test_ask_start_sends_a_validated_brief_as_an_xml_envelope_to_each_model_and_checks_the_contract():
     def run(path, rdir):
-        seen = []
-        fleet = _FakeFleet({"glm-5.3": lambda msgs: seen.append(msgs) or "four"})
-        out = _with_fake_fleet(fleet, lambda: o.ask("glm-5.3", "What is 2+2?", system="Be brief."))
-        assert out == "four", "the reply is the model's text, with no wrapper"
-        assert seen[0] == [{"role": "system", "content": "Be brief."},
-                           {"role": "user", "content": "What is 2+2?"}], \
-            "no brief, no XML envelope, no contract"
-        seen.clear()
-        _with_fake_fleet(fleet, lambda: o.ask("glm-5.3", "hi"))
-        assert seen[0] == [{"role": "user", "content": "hi"}], "no system message unless given"
-        rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
-        assert [r["type"] for r in rows if r["model"] == "glm-5.3"][:2] == ["started", "dispatch"]
-        assert rows[1]["mode"] == "ask" and rows[1]["outcome"] == "OK"
-    _log_and_results(run)
-
-
-def test_ask_passes_failure_tags_through_and_refuses_bad_input():
-    def run(path, rdir):
-        fleet = _FakeFleet({"glm-5.3": "[EMPTY] glm-5.3 streamed no answer"})
-        assert _with_fake_fleet(fleet, lambda: o.ask("glm-5.3", "x")).startswith("[EMPTY]")
-        assert o.ask("nope/unknown", "x").startswith("[ERROR] unknown model")
-        assert o.ask("glm-5.3", "   ").startswith("[ERROR]")
-        assert fleet.calls and len(fleet.calls) == 1, "refused requests never reach a model"
-    _log_and_results(run)
-
-
-def test_ask_start_puts_the_same_prompt_to_several_models_that_never_see_each_other():
-    def run(path, rdir):
-        fleet = _FakeFleet({"glm-5.3": "from glm", "deepseek-v4-pro": "from deepseek"})
+        good = '{"verdict": "PASS", "defects": []}'
+        fleet = _FakeFleet({"glm-5.3": good, "deepseek-v4-pro": "not json"})
+        brief = {"role": "critic", "instruction": "Find defects.",
+                 "context": [{"id": "design", "content": "x"}],
+                 "output_contract": {"name": "critic_v1"}}
         job = json.loads(_with_fake_fleet(fleet, lambda: o.ask_start(
-            ["glm-5.3", "deepseek-v4-pro"], "Which is faster, a list or a set lookup?")))
+            ["glm-5.3", "deepseek-v4-pro"], brief)))
         res = json.loads(_with_fake_fleet(fleet, lambda: o.check_job(job["job_id"], 10)))
         assert res["status"] == "complete", res
         body = json.loads(res["result"])
-        assert body["results"]["glm-5.3"]["content"] == "from glm"
-        assert body["results"]["deepseek-v4-pro"]["content"] == "from deepseek"
-        assert body["results"]["glm-5.3"]["class"] == "CN-OW" and \
-            body["results"]["glm-5.3"]["outcome"] == "OK"
-        assert {c["brief"] for c in fleet.calls} == {"Which is faster, a list or a set lookup?"}
+        r = body["results"]
+        assert r["glm-5.3"]["outcome"] == "OK" and r["glm-5.3"]["contract"]["valid"] is True
+        assert r["deepseek-v4-pro"]["contract"]["valid"] is False, "a reply that breaks the contract is flagged"
+        assert r["glm-5.3"]["class"] == "CN-OW" and r["glm-5.3"]["content"] == good
+        assert len(fleet.calls) == 2 and all(c["brief"].startswith("<orchestra_brief")
+                                             for c in fleet.calls), "the XML envelope, not free text"
         saved = json.loads(o.recover_results(body["task_id"]))["saved"]
         assert sorted(x["model"] for x in saved) == ["deepseek-v4-pro", "glm-5.3"]
     _log_and_results(run)
 
 
-def test_ask_start_rejects_unknown_duplicate_empty_and_too_many_models():
+def test_ask_start_refuses_free_text_unknown_duplicate_and_too_many_models():
+    brief = {"role": "generator", "instruction": "x", "output_contract": {"format": "text"}}
     for bad in ([], ["glm-5.3", "glm-5.3"], ["glm-5.3", "kimi-k9"], list(o._MODELS)[:7]):
-        out = json.loads(o.ask_start(bad, "x"))
-        assert out["status"] == "failed", bad
-    assert json.loads(o.ask_start("glm-5.3", "  "))["status"] == "failed"
+        assert json.loads(o.ask_start(bad, brief))["status"] == "failed", bad
+    out = json.loads(o.ask_start("glm-5.3", "What is 2+2?"))
+    assert out["status"] == "failed" and "invalid brief" in out["error"], \
+        "a free-text prompt is refused: requests are briefs"
+    assert "ask" not in {t.name for t in __import__("asyncio").run(o.mcp.list_tools())}
 
 
 # ---------------------------------------------------------------------------
