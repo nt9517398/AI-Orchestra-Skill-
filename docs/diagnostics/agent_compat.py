@@ -52,10 +52,11 @@ MODELS = {
     "meta/muse-spark-1.3": {"wire": "meta/muse-spark-1.3", "pin": "Meta"},
     "meta/muse-ember": {"wire": "meta/muse-ember", "pin": "Meta"},
     "ibm-granite/granite-4.2-8b": {"wire": "ibm-granite/granite-4.2-8b", "pin": "CoreWeave"},
-    "openai/gpt-astra-latest": {"wire": "~openai/gpt-astra-latest", "pin": "OpenAI"},
     "openai/gpt-sol-latest": {"wire": "~openai/gpt-sol-latest", "pin": None},
     "x-ai/grok-latest": {"wire": "~x-ai/grok-latest", "pin": None},
     "google/gemini-pro-latest": {"wire": "~google/gemini-pro-latest", "pin": None},
+    "qwen/qwen4-max": {"wire": "qwen/qwen4-max", "pin": None},
+    "tencent/hy4": {"wire": "tencent/hy4", "pin": None},
 }
 TOOLS = [
     {"name": "add", "description": "Add two integers.",

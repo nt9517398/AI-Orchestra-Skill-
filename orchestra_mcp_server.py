@@ -1,10 +1,29 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v20.4 — ASTRA REMOVED; NEW SEATS  (2026-11-24, operator's decision)
+------------------------------------------------------------------
+  1. openai/gpt-astra-latest is removed from the fleet: registry entry, seat, routing prior,
+     default pair and every doc. openrouter/auto and openrouter/auto-code were removed in
+     v20.2 and stay removed.
+  2. Added qwen/qwen4-max (Lead worker, reasoning and coding) and tencent/hy4 (Worker, drafts
+     and bulk), both CN-OW, unpinned, with the ceiling resolved live. Slugs are the operator's;
+     nothing was checked against OpenRouter (no key in the build environment): run fleet_check.
+  3. Google and xAI are their own correlation classes (GOOGLE-CLOSED, XAI-CLOSED), so Sol
+     (US-CLOSED) and Gemini can review each other. Sol keeps US-CLOSED, as OpenAI.
+  4. Seats follow the operator's table: Sol chief reviewer (code and logic), Gemini second
+     reviewer and generator, Grok worker and generator, Qwen lead worker, Tencent worker,
+     Spark lead long-context worker, Ember efficient worker, Granite math and code only
+     where a check grades it. Sol, Gemini, Grok, Qwen and Tencent start as CANDIDATES: no
+     routing prior, no factual role (_UNVETTED), measured like everyone else.
+  5. Consequence: no generator outside CN-OW holds a factual role, so a factual claim has no
+     cross-class confirmer among the generators. The routing prior is now GLM/DeepSeek only,
+     and Sol reviews through the critic role, not as a verifier. See UPGRADE-PLAN-v21.md.
+
 v20.3 — THREE FLOATING "LATEST" ALIASES  (2026-11-24, operator's instruction)
 -----------------------------------------------------------------------------
   Added ~openai/gpt-sol-latest, ~x-ai/grok-latest and ~google/gemini-pro-latest as generators,
-  by alias rather than by version number, as GPT Astra already is. Each follows its lab's
+  by alias rather than by version number (GPT Astra was one until v20.4). Each follows its lab's
   newest model in the family, so: the served model is logged on every dispatch (provenance
   accepts the family and rejects anything else), a verdict belongs to the alias and not to
   one build, output ceilings are resolved live with a 64,000 fallback instead of guessed
@@ -184,8 +203,8 @@ Every function RETURNS its result.
 Setup:
     pip install -r requirements.txt     # pins mcp below 2: 2.x renamed FastMCP
     # API keys in a .env next to this script (see .env.example). Never hardcode.
-    # OPENROUTER_API_KEY is required; missing it removes GPT Astra, the whole decision
-    # bench, and the only non-CN-OW generator class, US-CLOSED.
+    # OPENROUTER_API_KEY is required; missing it removes every non-CN-OW generator, the
+    # whole decision bench, and the Qwen and Tencent workers.
     # DEEPSEEK_API_KEY covers the two DeepSeek models; ZHIPU_API_KEY covers GLM-5.3.
 
 Tests:  python test_orchestra.py     (offline; no keys needed)
@@ -365,15 +384,6 @@ _MODELS = {
         # OpenRouter's z-ai/ namespace (OpenRouter and resellers of it); Zhipu's own
         # docs list GLM-5.3 and GLM-5.3-Flash but no Prime, so there is no direct-API
         # id to swap to.
-    "openai/gpt-astra-latest": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=128000, pin="OpenAI",
-        api_id="~openai/gpt-astra-latest", served_as=("astra",)),
-        # Released 2026-09-11. The tilde slug FLOATS to the newest GPT Astra build, so
-        # the served model is logged on every dispatch (served_model in the log) — a
-        # silent family bump must not blend two models' outcomes in fleet_stats.
-        # served_as=("astra",) accepts any Astra build and rejects anything else.
-        # 128,000 max output / 1.05M context, $10 in / $50 out per 1M (OpenRouter
-        # listing). Worst-case runaway at this budget is ~$6.40 per dispatch.
     "meta/muse-spark-1.3": dict(
         provider="openrouter", klass="META-CLOSED", max_out=640000, pin="Meta",
         exact_served=True),
@@ -395,7 +405,7 @@ _MODELS = {
         # entry is the STANDARD tier, and exact_served=True makes provenance exact: the
         # default substring test would accept the contributor tier's reply for this one.
         # Class META-CLOSED (2026-11-23, operator's decision): Meta is its own lineage, so GPT
-        # Astra (US-CLOSED) may review Muse Spark. Spark and Ember share the class and can
+        # GPT Sol (US-CLOSED) may review Muse Spark. Spark and Ember share the class and can
         # never check each other. A lineage prior, not a measurement: US labs' models are
         # unlikely to be independent, and fleet_stats co-failure is what would show it.
         # Pinned to Meta by the operator, 2026-11-23: the same slug was served by both Meta
@@ -420,24 +430,36 @@ _MODELS = {
         # Added 2026-11-24 at the operator's request, as a FLOATING alias (OpenRouter: it
         # always redirects to the newest GPT Sol model). Listing, via a search summary:
         # 1.05M context, 128,000 max output, $2 in / $10 out per 1M. The ceiling is resolved
-        # live (auto_ceiling; 64,000 if the lookup fails). Same lab and class as GPT Astra,
-        # so the two cannot check each other. served_as=("-sol",) accepts any Sol build.
+        # live (auto_ceiling; 64,000 if the lookup fails). Same lab and class as the
+        # other OpenAI models. served_as=("-sol",) accepts any Sol build.
         # Unpinned: the host that serves a ~alias is not known yet; the served host is logged
         # and the pin is a decision for after fleet_check has shown it. Unvetted.
     "x-ai/grok-latest": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
+        provider="openrouter", klass="XAI-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
         api_id="~x-ai/grok-latest", served_as=("grok",)),
         # Added 2026-11-24, floating. Listing, via search summaries: 500K context, $2 in /
         # $6 out per 1M up to 200K input and $4 / $12 above it; max output reported as both
         # 450,000 and 1,000,000, so it is resolved live (64,000 fallback), not typed in.
-        # US-CLOSED by the lab-lineage convention. Unpinned, unvetted.
+        # Class XAI-CLOSED (operator, 2026-11-24): xAI is its own lineage. Unpinned, unvetted.
     "google/gemini-pro-latest": dict(
-        provider="openrouter", klass="US-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
+        provider="openrouter", klass="GOOGLE-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
         api_id="~google/gemini-pro-latest", served_as=("-pro",)),
         # Added 2026-11-24, floating. Listing, via search summaries: 1,048,576 context, 65,536
         # max output (so the 64,000 fallback fits), $2 in / $12 out per 1M. served_as=("-pro",)
-        # accepts any Pro build and rejects a Flash build served by mistake. US-CLOSED by the
-        # lab-lineage convention. Unpinned, unvetted.
+        # accepts any Pro build and rejects a Flash build served by mistake. Class GOOGLE-CLOSED
+        # (operator, 2026-11-24): Google is its own lineage, so Sol and Gemini can review each
+        # other. Unpinned, unvetted.
+    "qwen/qwen4-max": dict(
+        provider="openrouter", klass="CN-OW", max_out=64000, auto_ceiling=True, pin=None),
+        # Added 2026-11-24 at the operator's request (seat: lead worker, reasoning and coding).
+        # Slug from the operator's roles table; NOT checked against OpenRouter from the build
+        # environment. Ceiling resolved live (64,000 if the lookup fails). Alibaba lineage, so
+        # CN-OW with DeepSeek and GLM: it cannot check them and they cannot check it. Unpinned
+        # and unvetted. Run fleet_check, then decide the pin from the host it shows.
+    "tencent/hy4": dict(
+        provider="openrouter", klass="CN-OW", max_out=64000, auto_ceiling=True, pin=None),
+        # Added 2026-11-24 at the operator's request (seat: worker, drafts and bulk). Same
+        # caveats as qwen/qwen4-max: slug unchecked, ceiling live, unpinned, unvetted, CN-OW.
 }
 
 # Models that must never be the source of a factual PASS (fleet-card 'Verification
@@ -449,9 +471,10 @@ _NO_VERIFY = frozenset({"deepseek-v4.1-flash"})
 # added to the verifier column on novelty or index alone. Remove an id here to grant it.
 _UNVETTED = frozenset({"meta/muse-spark-1.3", "meta/muse-ember",
                        "ibm-granite/granite-4.2-8b", "openai/gpt-sol-latest",
-                       "x-ai/grok-latest", "google/gemini-pro-latest"})
+                       "x-ai/grok-latest", "google/gemini-pro-latest",
+                       "qwen/qwen4-max", "tencent/hy4"})
 
-# Seats (UPGRADE-PLAN-v21.md 'Target roles', applied 2026-11-24). A seat is the role a model is
+# Seats (UPGRADE-PLAN-v21.md 'Target roles', revised 2026-11-24). A seat is the role a model is
 # a PRIOR for. It grants no routing primary (route_evidence needs measured verdicts) and no
 # factual role (_UNVETTED, _NO_VERIFY). The names are the ones in the seat tables of SKILL.md
 # and governance.md; a test keeps the three in step.
@@ -459,13 +482,14 @@ _SEATS = {
     "deepseek-v4-pro": "Algorithmist",
     "deepseek-v4.1-flash": "Drafter",
     "glm-5.3": "Lead engineer & memory keeper",
-    "openai/gpt-astra-latest": "Chief reviewer & research author",
-    "meta/muse-spark-1.3": "Lead worker candidate",
+    "openai/gpt-sol-latest": "Chief reviewer (code and logic)",
+    "google/gemini-pro-latest": "Second reviewer and generator",
+    "x-ai/grok-latest": "Worker and generator",
+    "qwen/qwen4-max": "Lead worker (reasoning and coding)",
+    "tencent/hy4": "Worker (drafts and bulk)",
+    "meta/muse-spark-1.3": "Lead long-context worker",
     "meta/muse-ember": "Efficient worker",
-    "ibm-granite/granite-4.2-8b": "Math and code candidate",
-    "openai/gpt-sol-latest": "GPT Sol candidate",
-    "x-ai/grok-latest": "Grok candidate",
-    "google/gemini-pro-latest": "Gemini Pro candidate",
+    "ibm-granite/granite-4.2-8b": "Math and code, only where a check grades it",
 }
 
 # ---------------------------------------------------------------------------
@@ -525,7 +549,7 @@ _DEFAULT_PANEL = ("typesafe/jev-1.13", "perplexity/pplx-decider-v1.2")   # cross
 #
 # Until v17 the fleet was a literal dict: trying one more model meant editing this
 # file in a session. Now the dict is the STABLE CORE (DeepSeek and GLM on their direct
-# APIs, GPT Astra, the three decision models), and anything else on OpenRouter joins at
+# APIs, the three decision models), and anything else on OpenRouter joins at
 # runtime in one of two ways:
 #
 #   GUEST  — name any `author/name` slug in any tool that takes a model. On first
@@ -590,9 +614,9 @@ _GUEST_UNPRICED_OUT = 16_000     # budget when OpenRouter lists no usable price
 # listed gets its own class, "GUEST-<author>": a distinct lab is a distinct class by the
 # same proxy the other labels use. Override per model with fleet_add(klass=...).
 _LAB_CLASS = {"deepseek": "CN-OW", "z-ai": "CN-OW", "moonshotai": "CN-OW",
-              "qwen": "CN-OW", "minimax": "CN-OW",
-              "openai": "US-CLOSED", "anthropic": "US-CLOSED", "google": "US-CLOSED",
-              "x-ai": "US-CLOSED", "upstage": "KR-CLOSED", "typesafe": "US-CLOSED", "meta": "META-CLOSED",
+              "qwen": "CN-OW", "minimax": "CN-OW", "tencent": "CN-OW",
+              "openai": "US-CLOSED", "anthropic": "US-CLOSED", "google": "GOOGLE-CLOSED",
+              "x-ai": "XAI-CLOSED", "upstage": "KR-CLOSED", "typesafe": "US-CLOSED", "meta": "META-CLOSED",
               "inception": "US-CLOSED", "perplexity": "US-CLOSED"}
 
 
@@ -1022,7 +1046,7 @@ def _consume_stream(lines, model: str, cfg: dict, progress=None, meta=None) -> s
 
     v16: `meta`, when given, receives the served `model`/`provider` of the first chunk
     that declares them (after that chunk passes provenance). A floating alias like
-    ~openai/gpt-astra-latest resolves to a dated build; the log must record which.
+    ~openai/gpt-sol-latest resolves to a dated build; the log must record which.
     """
     parts, reasoning, finish, n = [], [], None, 0
     try:
@@ -1530,22 +1554,26 @@ _FORMATS = ("json", "xml", "code", "markdown", "text")
 _WORK_TYPES = ("swe", "agentic", "algorithmic", "bulk", "drafting", "extraction",
                "reasoning", "factual", "image", "review", "memory", "other")
 
-# The fleet card's routing table as data: (primary, cross-class partner or None).
+# The fleet card's routing table as data: (primary, partner or None).
 # A PRIOR from benchmarks — route_evidence() overrides it once outcomes are measured.
 _ROUTING_PRIOR = {
-    "swe": ("glm-5.3", "openai/gpt-astra-latest"),
-    "agentic": ("openai/gpt-astra-latest", "glm-5.3"),
-    "algorithmic": ("deepseek-v4-pro", "openai/gpt-astra-latest"),
+    "swe": ("glm-5.3", None),
+    "agentic": ("glm-5.3", None),
+    "algorithmic": ("deepseek-v4-pro", None),
     "bulk": ("glm-5.3", None),
     "drafting": ("deepseek-v4.1-flash", None),
-    "extraction": ("glm-5.3", "openai/gpt-astra-latest"),
-    "reasoning": ("openai/gpt-astra-latest", "glm-5.3"),
-    "factual": ("openai/gpt-astra-latest", "glm-5.3"),
+    "extraction": ("glm-5.3", None),
+    "reasoning": ("glm-5.3", None),
+    "factual": ("glm-5.3", None),
     "image": ("deepseek-v4.1-flash", None),
-    "review": ("openai/gpt-astra-latest", "glm-5.3"),
+    "review": ("glm-5.3", None),
     "memory": ("glm-5.3", None),
-    "other": ("openai/gpt-astra-latest", "glm-5.3"),
+    "other": ("glm-5.3", None),
 }
+# No partner is named anywhere: the only generators outside CN-OW (Sol, Gemini, Grok) and the
+# two new CN-OW workers are candidates with no measured record, and the operator's rule is that
+# they start with no routing prior. `explore` lists every unmeasured model, so each is paired
+# with the primary on L1-verifiable work until route_evidence has data to say otherwise.
 
 # Named contracts: {"output_contract": {"name": "critic_v1"}} expands to a fixed shape,
 # so two critics' defects (or two verifiers' claims) line up key-for-key and can be
@@ -2057,7 +2085,7 @@ def _compare_one(model: str, instructions: str, cand_a: str, cand_b: str,
 # Shared mode logic — used by BOTH the sync tools and the job workers, so the
 # two paths can't drift apart (the v9 "hand-synced copies" complaint, fixed).
 # ---------------------------------------------------------------------------
-_DEFAULT_PAIR = ("glm-5.3", "openai/gpt-astra-latest")   # CN-OW x US-CLOSED
+_DEFAULT_PAIR = ("glm-5.3", "openai/gpt-sol-latest")   # CN-OW x US-CLOSED
 
 
 def _run_parallel(models=_DEFAULT_PAIR, brief: Optional[dict] = None,
@@ -2475,7 +2503,7 @@ def orchestra_start(mode: str, brief: Union[dict, str], model: str = "deepseek-v
                           looked up and tried as a guest — no setup needed — when the dynamic
                           fleet is enabled (ORCHESTRA_DYNAMIC_FLEET=1; off by default).
           "parallel"    — the same brief to two models (`model_a`/`model_b`, default
-                          glm-5.3 [CN-OW] + openai/gpt-astra-latest
+                          glm-5.3 [CN-OW] + openai/gpt-sol-latest
                           [US-CLOSED]). Capped at 2 by design.
           "adversarial" — 2 rounds, 4 dispatches; `model_a`/`model_b` MUST be from
                           different correlation classes. Same-class pairs are REJECTED.
@@ -2627,7 +2655,8 @@ def call_model(model: str, brief: Union[dict, str], reasoning_effort: str = "max
     work use orchestra_start(mode="model", model=..., brief=...).
 
     Fleet ids: deepseek-v4-pro, deepseek-v4.1-flash, glm-5.3,
-    openai/gpt-astra-latest, meta/muse-spark-1.3. With the dynamic fleet enabled
+    openai/gpt-sol-latest, x-ai/grok-latest, google/gemini-pro-latest, qwen/qwen4-max,
+    tencent/hy4, meta/muse-spark-1.3, meta/muse-ember, ibm-granite/granite-4.2-8b. With the dynamic fleet enabled
     (ORCHESTRA_DYNAMIC_FLEET=1; off by default) ANY other OpenRouter author/name slug is
     looked up and tried as a guest on first mention; otherwise it is refused. Call list_fleet() for classes, seats and budgets. The brief
     shape is documented on orchestra_start.
@@ -2660,7 +2689,7 @@ def orchestra_parallel(brief: Union[dict, str], model_a: str = _DEFAULT_PAIR[0],
     """Send ONE structured brief to two generators concurrently and WAIT. QUICK briefs
     only — for anything substantial use orchestra_start(mode="parallel").
 
-    Default pair is cross-class: glm-5.3 [CN-OW] + openai/gpt-astra-latest
+    Default pair is cross-class: glm-5.3 [CN-OW] + openai/gpt-sol-latest
     [US-CLOSED]. This tool does NOT judge or pick a winner: hand the two candidates to
     decide_compare / decide_panel and adjudicate per SKILL.md 'Ratification'. Both
     dispatches share the returned task_id — log each model's correctness under it.
@@ -2878,8 +2907,8 @@ def fleet_add(model: str, kind: str = "generator", klass: str = "",
       False. Set it only on a measured record (SKILL.md 'Trying a model').
     note: free text kept in the file.
 
-    The core fleet (DeepSeek V4 Pro, DeepSeek V4.1 Flash, GLM-5.3, GPT Astra, Muse Spark
-    1.3, and the three core decision models) is fixed in code; this adds to it and can
+    The core fleet (DeepSeek V4 Pro, DeepSeek V4.1 Flash, GLM-5.3, the OpenRouter workers
+    and the three core decision models) is fixed in code; this adds to it and can
     remove only what it added. Refused while the dynamic fleet is switched off.
     """
     if not _DYNAMIC:
@@ -2923,8 +2952,8 @@ def fleet_remove(model: str) -> str:
     """Take a guest or added model out of the fleet — for this process and, if it was
     saved, from fleet_extra.json. Its past dispatches and verdicts stay in the log.
 
-    The core fleet (DeepSeek V4 Pro, DeepSeek V4.1 Flash, GLM-5.3, GPT Astra, Muse Spark
-    1.3 and the three core decision models) is fixed in code and is refused here. Refused
+    The core fleet (DeepSeek V4 Pro, DeepSeek V4.1 Flash, GLM-5.3, the OpenRouter workers
+    and the three core decision models) is fixed in code and is refused here. Refused
     entirely while the dynamic fleet is switched off.
     """
     if not _DYNAMIC:
@@ -3155,7 +3184,7 @@ def list_fleet() -> str:
 
     Use it before choosing a verifier (its class must differ from the worker's) and
     whenever a call returns [SKIPPED] or [ERROR]. A missing OPENROUTER_API_KEY removes
-    GPT Astra, the entire decision bench, and the only non-CN-OW generator class — say
+    every non-CN-OW generator, the entire decision bench and the OpenRouter workers — say
     so explicitly rather than silently same-class verifying or falling back to
     Claude-alone rulings.
     """
@@ -3634,7 +3663,7 @@ def _route_evidence_data(work_type: str, role: str = "generator", last_n: int = 
                                            and _verify_bar(m))]
     primary, partner = _ROUTING_PRIOR[work_type]
     if primary not in eligible:
-        primary = partner if partner in eligible else "openai/gpt-astra-latest"
+        primary = partner if partner in eligible else "glm-5.3"
     log = _read_log(last_n)
     table = _work_type_table(log["dispatches"], log["outcomes"]).get(work_type, {})
     measured = {}
@@ -3693,8 +3722,6 @@ _ROUTER_LEAD = 0.20           # (wins - losses) / decisive needed to be "ahead"/
 
 _ROUTE_BLURB = {
     "glm-5.3": "strong real-world software-engineering and terminal work; 1M context",
-    "openai/gpt-astra-latest": "lowest measured hallucination rate among the generators; "
-                               "the only non-CN-OW generator; costs $10/$50 per M tokens",
     "deepseek-v4-pro": "best on competitive and algorithmic code; weaker on general reasoning",
     "deepseek-v4.1-flash": "cheapest; image input; for drafting and bulk work only",
     "meta/muse-spark-1.3": "candidate added at the operator's request; closed weights; "
@@ -3702,12 +3729,15 @@ _ROUTE_BLURB = {
     "meta/muse-ember": "small and cheap; repeated tool calls, subtasks and drafts; unmeasured",
     "ibm-granite/granite-4.2-8b": "very cheap open-weights 8B; math and code when a "
                                   "deterministic check grades it; unmeasured",
-    "openai/gpt-sol-latest": "OpenAI's newest Sol model via a floating alias; 1.05M context; "
-                             "the build behind it changes; unmeasured",
-    "x-ai/grok-latest": "xAI's newest Grok via a floating alias; 500K context; the build "
-                        "behind it changes; unmeasured",
-    "google/gemini-pro-latest": "Google's newest Gemini Pro via a floating alias; 1M context; "
-                                "the build behind it changes; unmeasured",
+    "openai/gpt-sol-latest": "chief reviewer (code and logic) by the operator's decision; "
+                             "floating alias; 1.05M context; the build changes; unmeasured",
+    "x-ai/grok-latest": "worker and generator; floating alias; own class; 500K context; "
+                        "the build changes; unmeasured",
+    "google/gemini-pro-latest": "second reviewer and generator; floating alias; own class, so "
+                                "Sol can review it; the build changes; unmeasured",
+    "qwen/qwen4-max": "lead worker for reasoning and coding by the operator's decision; "
+                      "CN-OW; unmeasured",
+    "tencent/hy4": "worker for drafts and bulk by the operator's decision; CN-OW; unmeasured",
 }
 
 

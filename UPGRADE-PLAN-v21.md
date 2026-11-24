@@ -136,47 +136,66 @@ Roles applied in code and docs on 2026-11-24 (v20.2); routers removed the same d
 | `meta/muse-spark-1.3` | 1.25 / 4.25 | 1.05M | Pass | Hosts: Google, Meta |
 | `meta/muse-ember` | 0.10 / 0.50 | 1.05M | Pass | Hosts: Google, Meta |
 | `ibm-granite/granite-4.2-8b` | 0.06 / 0.15 (CoreWeave) | 131K | Pass | Hosts: CoreWeave, DeepInfra |
-| GPT Astra (current) | 8 / 40 listed | 1.05M | Not retested | The registry comment still says $10 / $50 |
+| GPT Astra | 8 / 40 listed | 1.05M | Not retested | Removed from the fleet 2026-11-24 |
 
 ### Decision (2026-11-24): no routers
 
-The owner removed the routers. `openrouter/auto` is out of the fleet and `call_router` is deleted (v20.2); `openrouter/auto-code` and `openrouter/fusion` were never wired in and are dropped from the plan. This replaces the 2026-11-23 decision that routers would assist Astra. The reasons recorded then still describe what the routers would have cost: Orchestra's verification depends on knowing **which model answered and that it differs in class from the worker**, and a router chooses that at run time, so:
+The owner removed the routers. `openrouter/auto` is out of the fleet and `call_router` is deleted (v20.2); `openrouter/auto-code` and `openrouter/fusion` were never wired in and are dropped from the plan. This replaces the 2026-11-23 decision that routers would assist the then chief reviewer, GPT Astra, who has since been removed too. The reasons recorded then still describe what the routers would have cost: Orchestra's verification depends on knowing **which model answered and that it differs in class from the worker**, and a router chooses that at run time, so:
 
 - it can pick the worker's own family, silently voiding a cross-class check;
 - the `[SUBSTITUTED]` provenance guard cannot tell a legitimate route from a wrong model unless it checks against an allowlist;
 - `route_evidence` learns nothing about a moving target unless each result is logged under the served model;
 - Fusion can answer with Claude, so it is not independent of a Claude-authored synthesis, and it uses web search on the prompt.
 
+### Decision (2026-11-24): Astra removed; roles from the owner's table
+
+The owner removed **GPT Astra, `openrouter/auto` and `openrouter/auto-code`**, and approved the roles below. Applied in v20.4: registry, seats, routing prior, default pair, tests, the Phase 2 harness and the packaged docs. The three floating aliases from v20.3 stay as the models for Sol, Grok and Gemini (the owner chose `~…-latest` over fixed version numbers).
+
 ### Target roles (applied 2026-11-24: `_SEATS` in code, `list_fleet`, and the seat tables in `SKILL.md` and `governance.md`)
 
-| Seat | Model | Rule |
-|---|---|---|
-| Conductor | Claude | Unchanged |
-| **Lead worker candidate** | Muse Spark 1.3 | Long-context agentic and coding work, deep drafting. Pinned host, worker output cap |
-| Efficient worker | Muse Ember | Repeated tool calls, subtasks, extraction, first drafts |
-| Math / code specialist candidate | Granite 4.2 8B | Only where a deterministic check grades it. Possible new correlation class, to be confirmed from its lineage |
-| Chief reviewer | **GPT Astra, for now** | Verifier and high-stakes review |
-| GPT Sol, Grok and Gemini Pro candidates (added 2026-11-24) | `~openai/gpt-sol-latest`, `~x-ai/grok-latest`, `~google/gemini-pro-latest` | Floating aliases, unvetted, unpinned. No factual role and no routing primary until measured; same class as Astra and each other |
+| Seat | Model | Class | Rule |
+|---|---|---|---|
+| Conductor | Claude | US-CLOSED | Unchanged |
+| **Chief reviewer (code and logic)** | `~openai/gpt-sol-latest` | US-CLOSED | Reviews as a `critic`. Candidate: no routing prior, no factual role |
+| Second reviewer and generator | `~google/gemini-pro-latest` | GOOGLE-CLOSED | Its own class, so Sol and Gemini can review each other. Candidate |
+| Worker and generator | `~x-ai/grok-latest` | XAI-CLOSED | Its own class. Candidate |
+| Lead worker (reasoning and coding) | `qwen/qwen4-max` | CN-OW | Same class as DeepSeek and GLM. Candidate. Slug not yet checked against OpenRouter |
+| Worker (drafts and bulk) | `tencent/hy4` | CN-OW | Same class as DeepSeek and GLM. Candidate. Slug not yet checked against OpenRouter |
+| Lead long-context worker | Muse Spark 1.3 | META-CLOSED | Long-context agentic and coding work. Pinned host, worker output cap |
+| Efficient worker | Muse Ember | META-CLOSED | Repeated tool calls, subtasks, extraction, first drafts |
+| Math and code, only where a check grades it | Granite 4.2 8B | US-OW | Never without a deterministic check |
+| GLM-5.3, DeepSeek V4 Pro, DeepSeek V4.1 Flash | unchanged | CN-OW | Lead engineer and memory keeper; Algorithmist; Drafter |
 
-Muse Spark and Ember share a family, so neither may verify the other. Neither takes a factual or verifier role until measured.
+**Reviews.** A worker is reviewed by a model from a different class. Sol and Gemini can review each other because Google has its own class. Qwen and Tencent share a class with GLM and DeepSeek, so none of those can review another. Spark and Ember share a class and never check each other.
 
-### Promotion rule: how Muse can replace Astra
+**Starting status.** Sol, Gemini, Grok, Qwen and Tencent start as candidates: no routing prior, no factual role. The prior is now GLM-5.3 and DeepSeek only, with no cross-class partner named, and the default pair is GLM-5.3 + Sol.
 
-Muse Spark may take Astra's reviewer seat for a work type only if, on the Phase 6 frozen benchmark:
+**Consequences the owner should see.**
 
-1. it catches at least as many seeded defects as Astra, within a margin fixed before the run;
-2. its false-accept rate is no higher than Astra's;
+1. **No cross-class factual verifier.** Astra was the only generator outside CN-OW with a factual role. A factual flag on DeepSeek or GLM output can now be confirmed only by a fetched source or a check (L1); otherwise it ships labelled unconfirmed. The owner can lift this by moving a candidate out of `_UNVETTED` after a measured fabrication record, which needs the Phase 6 benchmark.
+2. **Sol reviews as a `critic`, not a `verifier`.** The server refuses a verifier brief to an unvetted model. Phase 5's worker and verifier loop therefore gates on the L1 check, with Sol's defect list as a flag, until Sol is vetted.
+3. **Research authorship moved to Claude** (reviewed by Sol), because the "lowest hallucination rate" reason for Astra authoring it no longer has a holder.
+4. **Qwen and Tencent facts are unverified.** The slugs come from the owner's table. Nothing was read from OpenRouter (no key in the build environment): `fleet_check` or `fleet_probe` will show whether the slugs exist, their ceilings, prices and hosts.
+5. **Whole non-CN-OW fleet sits behind one aggregator**, as before, but now there is no direct-API generator outside CN-OW at all.
+
+### Promotion rule: how a model can take the chief reviewer seat
+
+Another model may take Sol's reviewer seat for a work type only if, on the Phase 6 frozen benchmark:
+
+1. it catches at least as many seeded defects as Sol, within a margin fixed before the run;
+2. its false-accept rate is no higher than Sol's;
 3. it has at least 20 graded verdicts in that work type;
 4. a measured fabrication check clears the `_UNVETTED` restriction;
-5. the reviewer is still a different class from the worker. If Muse is reviewer, the worker cannot be Muse.
+5. the reviewer is still a different class from the worker.
 
-Astra stays as the fallback until all five hold.
+Sol stays as the fallback until all five hold. (This rule used to name Muse Spark and Astra; the structure is unchanged.)
 
 ### Added work
 
 - **Phase 1:** register Ember and Granite as unvetted. (Done. The router work that was listed here was removed.)
 - **Phase 2:** add Ember and Granite to the worker compatibility matrix.
-- **Phase 6:** add arms for Spark, Ember, Granite, and Spark + Astra review.
+- **Phase 2:** add Qwen and Tencent to the worker compatibility matrix (done in the harness; not yet run).
+- **Phase 6:** add arms for Spark, Ember, Granite, Qwen, Tencent, Grok, and Spark + Sol review, and a fabrication test for each candidate that might hold a factual role.
 
 ## Release gates
 
@@ -210,14 +229,16 @@ All answered 2026-11-23:
 3. Muse worker output cap: **at least 120,000 tokens**. Set 120,000. Claude Code reported a 32,000 output limit in the proof of concept, so Phase 2 must confirm a worker really reaches 120,000 (for example through `CLAUDE_CODE_MAX_OUTPUT_TOKENS`). One full response costs about $0.51.
 5. Code leaving the machine: **test and public projects only** at first.
 6. Commit v20 as baseline once `.gitignore` is restored: **yes**.
-7. Astra stays reviewer until Muse earns promotion: **yes**.
+7. Astra stays reviewer until Muse earns promotion: **yes**. *Superseded 2026-11-24: Astra was removed; Sol is chief reviewer under the same promotion rule.*
 8. `openrouter/auto`: **allowlist only**. *Superseded 2026-11-24: the routers were removed.*
 9. Fusion: **opt-in, public content only**. *Superseded 2026-11-24: Fusion is out of the plan.*
 
 4. Spend limits during testing: **$2 per worker, $10 per day**. Enforced from OpenRouter's reported cost, and replaced with measured limits after the Phase 6 benchmark.
 
-10. Reviewer of Muse workers: **Astra** (answered 2026-11-23). Because the class rule would have refused a Muse and Astra pair, Meta models became their own class, `META-CLOSED` (v20.1). Muse Spark and Muse Ember share it and still cannot check each other.
+10. Reviewer of Muse workers: **Astra** (answered 2026-11-23; *superseded 2026-11-24: now Sol*). Because the class rule would have refused a Muse and Astra pair, Meta models became their own class, `META-CLOSED` (v20.1). Muse Spark and Muse Ember share it and still cannot check each other.
 
 Phase 2 note on decision 3 (measured 2026-11-24, Claude Code 2.1.331): a worker sends `max_tokens` 32,000 for an unrecognised model id; with `CLAUDE_CODE_MAX_OUTPUT_TOKENS=120000` it sends 120,000, so the 120,000 cap is reachable. A request for 640,000 is clamped to 128,000, so Muse Spark's 640,000 registry ceiling can never apply to a worker.
 
 11. Floating "latest" aliases (answered 2026-11-24): use `~openai/gpt-sol-latest`, `~x-ai/grok-latest` and `~google/gemini-pro-latest` instead of fixed version numbers. Added as unvetted candidates (v20.3). Open: pin each to a host once `fleet_check` shows who serves it; whether any of them should be its own class like Meta.
+
+12. Roles table (answered 2026-11-24): Astra, `openrouter/auto` and `openrouter/auto-code` removed; Sol chief reviewer, Gemini second reviewer and generator, Grok worker and generator, Qwen lead worker, Tencent worker, Spark lead long-context worker, Ember efficient worker, Granite math and code where a check grades it; Google and xAI are their own classes; the new five start as candidates. Applied in v20.4. Open: confirm the Qwen and Tencent slugs, pin hosts, and decide whether Sol should be allowed any factual role.
