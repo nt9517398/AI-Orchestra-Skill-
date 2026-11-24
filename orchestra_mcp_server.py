@@ -1,6 +1,16 @@
 """
 orchestra_mcp_server.py — Local MCP server for Claude Desktop
 
+v20.3 — THREE FLOATING "LATEST" ALIASES  (2026-11-24, operator's instruction)
+-----------------------------------------------------------------------------
+  Added ~openai/gpt-sol-latest, ~x-ai/grok-latest and ~google/gemini-pro-latest as generators,
+  by alias rather than by version number, as GPT Astra already is. Each follows its lab's
+  newest model in the family, so: the served model is logged on every dispatch (provenance
+  accepts the family and rejects anything else), a verdict belongs to the alias and not to
+  one build, output ceilings are resolved live with a 64,000 fallback instead of guessed
+  (_live_ceiling now looks up the WIRE id, which a ~alias needs), and none is pinned to a
+  host yet. All three are unvetted: no factual role, no routing primary, until measured.
+
 v20.2 — SEATS IN CODE; THE ROUTERS ARE REMOVED  (2026-11-24, operator's instruction)
 -------------------------------------------------------------------------------------
   1. openrouter/auto and call_router are gone, with everything that supported them (the
@@ -404,6 +414,30 @@ _MODELS = {
         # context. For math and code where a deterministic check grades it. Class US-OW:
         # OpenRouter lists a Hugging Face id, so open weights. A lineage prior, not a
         # measured independence result. Unvetted for factual roles.
+    "openai/gpt-sol-latest": dict(
+        provider="openrouter", klass="US-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
+        api_id="~openai/gpt-sol-latest", served_as=("-sol",)),
+        # Added 2026-11-24 at the operator's request, as a FLOATING alias (OpenRouter: it
+        # always redirects to the newest GPT Sol model). Listing, via a search summary:
+        # 1.05M context, 128,000 max output, $2 in / $10 out per 1M. The ceiling is resolved
+        # live (auto_ceiling; 64,000 if the lookup fails). Same lab and class as GPT Astra,
+        # so the two cannot check each other. served_as=("-sol",) accepts any Sol build.
+        # Unpinned: the host that serves a ~alias is not known yet; the served host is logged
+        # and the pin is a decision for after fleet_check has shown it. Unvetted.
+    "x-ai/grok-latest": dict(
+        provider="openrouter", klass="US-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
+        api_id="~x-ai/grok-latest", served_as=("grok",)),
+        # Added 2026-11-24, floating. Listing, via search summaries: 500K context, $2 in /
+        # $6 out per 1M up to 200K input and $4 / $12 above it; max output reported as both
+        # 450,000 and 1,000,000, so it is resolved live (64,000 fallback), not typed in.
+        # US-CLOSED by the lab-lineage convention. Unpinned, unvetted.
+    "google/gemini-pro-latest": dict(
+        provider="openrouter", klass="US-CLOSED", max_out=64000, auto_ceiling=True, pin=None,
+        api_id="~google/gemini-pro-latest", served_as=("-pro",)),
+        # Added 2026-11-24, floating. Listing, via search summaries: 1,048,576 context, 65,536
+        # max output (so the 64,000 fallback fits), $2 in / $12 out per 1M. served_as=("-pro",)
+        # accepts any Pro build and rejects a Flash build served by mistake. US-CLOSED by the
+        # lab-lineage convention. Unpinned, unvetted.
 }
 
 # Models that must never be the source of a factual PASS (fleet-card 'Verification
@@ -414,7 +448,8 @@ _NO_VERIFY = frozenset({"deepseek-v4.1-flash"})
 # until their record earns one — fleet-card 'Verification eligibility': a model is not
 # added to the verifier column on novelty or index alone. Remove an id here to grant it.
 _UNVETTED = frozenset({"meta/muse-spark-1.3", "meta/muse-ember",
-                       "ibm-granite/granite-4.2-8b"})
+                       "ibm-granite/granite-4.2-8b", "openai/gpt-sol-latest",
+                       "x-ai/grok-latest", "google/gemini-pro-latest"})
 
 # Seats (UPGRADE-PLAN-v21.md 'Target roles', applied 2026-11-24). A seat is the role a model is
 # a PRIOR for. It grants no routing primary (route_evidence needs measured verdicts) and no
@@ -428,6 +463,9 @@ _SEATS = {
     "meta/muse-spark-1.3": "Lead worker candidate",
     "meta/muse-ember": "Efficient worker",
     "ibm-granite/granite-4.2-8b": "Math and code candidate",
+    "openai/gpt-sol-latest": "GPT Sol candidate",
+    "x-ai/grok-latest": "Grok candidate",
+    "google/gemini-pro-latest": "Gemini Pro candidate",
 }
 
 # ---------------------------------------------------------------------------
@@ -669,8 +707,9 @@ _CEILING_LOCK = threading.Lock()
 _CEILING_STATE: dict = {}        # model -> {"max_out", "source", "ts"}
 
 
-def _live_ceiling(model: str, fallback: int) -> tuple:
-    """(max_out, source). Never raises: every failure degrades to `fallback`."""
+def _live_ceiling(model: str, fallback: int, slug: Optional[str] = None) -> tuple:
+    """(max_out, source). Never raises: every failure degrades to `fallback`. `slug` is the
+    WIRE id to look up (a ~alias is listed under its own name, not its registry key)."""
     with _CEILING_LOCK:
         st = _CEILING_STATE.get(model)
         if st and (st["source"] == "live lookup"
@@ -678,7 +717,7 @@ def _live_ceiling(model: str, fallback: int) -> tuple:
             return st["max_out"], st["source"]
     if not os.environ.get("OPENROUTER_API_KEY"):
         return fallback, "fallback (no OPENROUTER_API_KEY)"      # the call will SKIP anyway
-    facts = _discover(model)
+    facts = _discover(slug or model)
     if facts.get("error"):
         res = (fallback, "fallback (lookup failed)")
     elif not facts.get("declared_out"):
@@ -878,7 +917,7 @@ def _resolve(model: str) -> dict:
     m.update(_CONFIGS[m["provider"]])
     m["key"] = os.environ.get(m["key_env"], "")
     if m.get("auto_ceiling"):
-        m["max_out"], m["ceiling_source"] = _live_ceiling(model, m["max_out"])
+        m["max_out"], m["ceiling_source"] = _live_ceiling(model, m["max_out"], m.get("api_id"))
     return m
 
 
@@ -3663,6 +3702,12 @@ _ROUTE_BLURB = {
     "meta/muse-ember": "small and cheap; repeated tool calls, subtasks and drafts; unmeasured",
     "ibm-granite/granite-4.2-8b": "very cheap open-weights 8B; math and code when a "
                                   "deterministic check grades it; unmeasured",
+    "openai/gpt-sol-latest": "OpenAI's newest Sol model via a floating alias; 1.05M context; "
+                             "the build behind it changes; unmeasured",
+    "x-ai/grok-latest": "xAI's newest Grok via a floating alias; 500K context; the build "
+                        "behind it changes; unmeasured",
+    "google/gemini-pro-latest": "Google's newest Gemini Pro via a floating alias; 1M context; "
+                                "the build behind it changes; unmeasured",
 }
 
 

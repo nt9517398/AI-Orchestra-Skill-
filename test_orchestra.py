@@ -341,7 +341,7 @@ def test_tools_dropped_the_dead_knobs():
 
 def test_list_fleet_reports_only_live_fields():
     rows = json.loads(o.list_fleet())["fleet"]
-    assert len(rows) == 7
+    assert len(rows) == 10
     for r in rows:
         assert "default_max_tokens" not in r
         assert "timeout_sync_s" not in r and "timeout_job_s" not in r
@@ -382,7 +382,7 @@ def test_removed_models_are_gone():
     for dead in ("stealth/ox-alpha", "moonshotai/kimi-k3", "x-ai/grok-4.6",
                  "google/gemini-3.7-flash", "deepseek-v4-flash", "z-ai/glm-5.3-prime"):
         assert dead not in o._MODELS, f"{dead} should be removed from _MODELS"
-    assert len(o._MODELS) == 7, f"_MODELS should have 7 entries, got {len(o._MODELS)}"
+    assert len(o._MODELS) == 10, f"_MODELS should have 10 entries, got {len(o._MODELS)}"
     assert "meta/muse-spark-1.3" in o._MODELS
     classes = set(m["klass"] for m in o._MODELS.values())
     assert classes == {"CN-OW", "US-CLOSED", "US-OW", "META-CLOSED"}, \
@@ -1012,10 +1012,10 @@ def test_skill_names_every_registry_model():
     assert "glm-5.3-prime" not in card.split("## History", 1)[0].lower(), \
         "GLM-5.3-Prime was reverted in v17; only the history section may mention it"
     routing = card.split("## Routing", 1)[1].split("\n## ", 1)[0]
-    for dead in ("Kimi", "Grok", "Gemini"):
+    for dead in ("Kimi", "Grok 4.6", "grok-4.6", "Gemini 3.7", "gemini-3.7"):
         assert dead not in routing, f"{dead} still appears in the routing table"
     head = skill.split("---", 2)[1]
-    for dead in ("Kimi", "Grok", "Gemini"):
+    for dead in ("Kimi", "Grok 4.6", "grok-4.6", "Gemini 3.7", "gemini-3.7"):
         assert dead not in head, f"SKILL.md frontmatter still names {dead}"
 
 
@@ -2308,15 +2308,23 @@ def test_a_recovered_lookup_replaces_the_fallback():
 @_with_muse_auto_ceiling
 def test_resolve_applies_the_live_ceiling_only_to_flagged_entries():
     _reset_lookups()
-    handler = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718)})
+    aliases = {"openai/gpt-sol-latest": ("~openai/gpt-sol-latest", 128_000, 128_000),
+               "x-ai/grok-latest": ("~x-ai/grok-latest", 450_000, 128_000),
+               "google/gemini-pro-latest": ("~google/gemini-pro-latest", 65_536, 65_536)}
+    handler = _get_by_slug({MUSE_CORE: _endpoints_body(MUSE_CORE, out=943_718),
+                            **{wire: _endpoints_body(wire, out=declared)
+                               for wire, declared, _ in aliases.values()}})
 
     def resolve_all():
         return {m: o._resolve(m) for m in o._BUILTIN}
     cfgs = _with_fake_get(handler, resolve_all)
     assert cfgs[MUSE_CORE]["max_out"] == 128_000
     assert cfgs[MUSE_CORE]["ceiling_source"] == "live lookup"
-    assert handler.calls == [MUSE_CORE], "no other core model triggers a lookup"
-    for m in o._BUILTIN - {MUSE_CORE}:
+    assert sorted(handler.calls) == sorted([MUSE_CORE] + [w for w, _, _ in aliases.values()]), \
+        "only the flagged models look anything up, and an alias is looked up by its WIRE id"
+    for m, (wire, declared, budget) in aliases.items():
+        assert cfgs[m]["max_out"] == budget and cfgs[m]["ceiling_source"] == "live lookup", m
+    for m in o._BUILTIN - {MUSE_CORE} - set(aliases):
         assert "ceiling_source" not in cfgs[m], m
         assert cfgs[m]["max_out"] == o._MODELS[m]["max_out"], m
 
@@ -2376,7 +2384,11 @@ def _healthy_world(overrides=None, astra_declared=128_000, served=None):
              "ibm-granite/granite-4.2-8b": _endpoints_body("ibm-granite/granite-4.2-8b",
                                                            out=117_964),
              "~openai/gpt-astra-latest": _endpoints_body("~openai/gpt-astra-latest",
-                                                         out=astra_declared)}
+                                                         out=astra_declared),
+             "~openai/gpt-sol-latest": _endpoints_body("~openai/gpt-sol-latest", out=128_000),
+             "~x-ai/grok-latest": _endpoints_body("~x-ai/grok-latest", out=450_000),
+             "~google/gemini-pro-latest": _endpoints_body("~google/gemini-pro-latest",
+                                                          out=65_536)}
     get = _get_by_slug(table)
     calls = []
 
@@ -2408,7 +2420,7 @@ def _run_check(world, call=lambda: o.fleet_check(), **env):
 def test_fleet_check_passes_a_healthy_fleet():
     _reset_lookups()
     res, calls = _run_check(_healthy_world())
-    assert res["ok"] is True and res["problems"] == [] and res["checked"] == 10
+    assert res["ok"] is True and res["problems"] == [] and res["checked"] == 13
     assert {r["status"] for r in res["rows"]} == {"OK"}
     muse = [r for r in res["rows"] if r["model"] == MUSE_CORE][0]
     assert muse["budget"] == 128_000 and muse["declared_ceiling"] == 943_718
@@ -2433,7 +2445,7 @@ def test_fleet_check_reports_a_substitution_with_the_served_name_and_the_fix():
     assert row["served_model"] == "meta/muse-spark-1.3-0902" and row["served_host"] == "Meta"
     assert "meta/muse-spark-1.3-0902" in res["problems"][0]["what"]
     assert "legitimate alias" in res["problems"][0]["what"]
-    assert [r["status"] for r in res["rows"] if r["model"] != MUSE_CORE] == ["OK"] * 9
+    assert [r["status"] for r in res["rows"] if r["model"] != MUSE_CORE] == ["OK"] * 12
 
 
 def test_fleet_check_flags_a_budget_above_the_declared_ceiling():
@@ -2452,13 +2464,14 @@ def test_fleet_check_skips_providers_with_no_key_without_failing():
     assert res["ok"] is True
     assert sorted(res["skipped"]) == ["deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3"]
     assert {m for m, _ in calls} == {MUSE_CORE, "openai/gpt-astra-latest", "meta/muse-ember",
-                                      "ibm-granite/granite-4.2-8b"}
+                                      "ibm-granite/granite-4.2-8b", "openai/gpt-sol-latest",
+                                      "x-ai/grok-latest", "google/gemini-pro-latest"}
     skipped = [r for r in res["rows"] if r["status"] == "SKIPPED"][0]
     assert "is not set" in skipped["note"]
-    assert res["tested"] == 7 and res["verdict"].startswith("OK — 7 of 10"), res["verdict"]
+    assert res["tested"] == 10 and res["verdict"].startswith("OK — 10 of 13"), res["verdict"]
     nothing, _ = _run_check(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None,
                             OPENROUTER_API_KEY=None)
-    assert nothing["checked"] == 10 and len(nothing["skipped"]) == 10 and nothing["problems"] == []
+    assert nothing["checked"] == 13 and len(nothing["skipped"]) == 13 and nothing["problems"] == []
     assert nothing["tested"] == 0 and nothing["ok"] is False, \
         "nothing tested must never read as healthy"
     assert nothing["verdict"].startswith("NOTHING WAS TESTED")
@@ -2486,7 +2499,7 @@ def test_fleet_check_reports_failed_calls_and_unknown_models():
     assert only["rows"][1]["status"] == "PROBLEM" and "not in the fleet" in only["rows"][1]["problems"][0]
     assert [m for m, _ in calls] == ["glm-5.3"], "only the models asked for are called"
     none_dec, _ = _run_check(_healthy_world(), call=lambda: o.fleet_check(include_deciders=False))
-    assert none_dec["checked"] == 7
+    assert none_dec["checked"] == 10
 
 
 def test_fleet_check_decider_failures_are_reported():
@@ -2532,7 +2545,7 @@ def test_the_command_line_check_prints_a_table_and_sets_the_exit_code():
     assert code == 0 and len(rows) == 1 and rows[0].split()[1] == "glm-5.3"
     assert MUSE_CORE not in text, "only the model asked for is checked"
     code, text = run(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None)
-    assert code == 0 and "not tested (no API key)" in text and "FLEET OK — 7 of 10" in text
+    assert code == 0 and "not tested (no API key)" in text and "FLEET OK — 10 of 13" in text
     _reset_lookups()
     code, text = run(_healthy_world(), ZHIPU_API_KEY=None, DEEPSEEK_API_KEY=None,
                      OPENROUTER_API_KEY=None)
@@ -2902,8 +2915,8 @@ def test_the_package_points_only_at_files_inside_it():
 
 def test_the_always_loaded_skill_names_no_retired_model():
     skill = _packaged_docs()["SKILL.md"].lower()
-    for dead in ("mercury", "pplx-decider-v1.1", "kimi", "grok", "gemini", "ox-alpha",
-                 "glm-5.3-prime"):
+    for dead in ("mercury", "pplx-decider-v1.1", "kimi", "ox-alpha", "glm-5.3-prime",
+                 "grok-4.6", "gemini-3.7"):
         assert dead not in skill, f"SKILL.md still names {dead}"
 
 
@@ -3239,6 +3252,79 @@ def test_compat_report_is_built_from_the_logs_alone():
     assert "No model has been run through the live matrix yet." in ac.build_report(empty)
     shutil_rmtree = __import__("shutil").rmtree
     shutil_rmtree(empty)
+
+
+# ---------------------------------------------------------------------------
+# v20.3 — floating "latest" aliases: GPT Sol, Grok, Gemini Pro
+# ---------------------------------------------------------------------------
+
+LATEST = {"openai/gpt-sol-latest": "~openai/gpt-sol-latest",
+          "x-ai/grok-latest": "~x-ai/grok-latest",
+          "google/gemini-pro-latest": "~google/gemini-pro-latest"}
+
+
+def test_the_latest_aliases_float_and_hold_no_factual_role():
+    import re
+    for key, wire in LATEST.items():
+        e = o._MODELS[key]
+        assert e["api_id"] == wire and wire.startswith("~") and wire.endswith("-latest")
+        assert not re.search(r"\d", key + wire), "an alias must carry no fixed version number"
+        assert e["auto_ceiling"] is True and e["max_out"] == 64_000, \
+            "the ceiling is looked up, with 64,000 as the fallback; it is not guessed"
+        assert e["pin"] is None and e["klass"] == "US-CLOSED" and key in o._UNVETTED
+        for role, contract in (("verifier", {"name": "verifier_v1"}),
+                               ("memory_keeper", {"name": "memory_ops_v1"})):
+            _, err = o._validate_brief({"role": role, "instruction": "x",
+                                        "output_contract": contract}, key)
+            assert err and f"may not act as a {role}" in err, (key, role)
+        assert key not in [p for pair in o._ROUTING_PRIOR.values() for p in pair], \
+            "unmeasured: not even a routing partner"
+        assert key in json.loads(o.route_evidence("swe"))["explore"], \
+            "offered for exploration, so it can earn a record"
+
+
+def test_alias_provenance_accepts_the_family_and_rejects_anything_else():
+    def check(key, served):
+        cfg = {**o._MODELS[key], **o._CONFIGS["openrouter"]}
+        return o._check_provenance({"model": served}, key, cfg)
+    for key, good, bad in (
+            ("openai/gpt-sol-latest",
+             ("openai/gpt-6.1-sol-20260929", "openai/gpt-5.6-sol", "openai/gpt-5.6-sol-pro-20260709"),
+             ("openai/gpt-6-astra-20260911", "anthropic/claude-opus-5.5")),
+            ("x-ai/grok-latest",
+             ("x-ai/grok-4.6-20260810", "x-ai/grok-4.20-20260309"),
+             ("openai/gpt-6.1-sol-20260929", "google/gemini-3.1-pro-preview")),
+            ("google/gemini-pro-latest",
+             ("google/gemini-3.1-pro-preview", "google/gemini-3.8-pro-20261101"),
+             ("google/gemini-3.1-flash", "x-ai/grok-4.6"))):
+        for served in good:
+            assert check(key, served) is None, (key, served)
+        for served in bad:
+            assert (check(key, served) or "").startswith("[SUBSTITUTED]"), (key, served)
+
+
+def test_an_alias_ceiling_is_looked_up_by_its_wire_id_with_a_64k_fallback():
+    _reset_lookups()
+    wire = "~google/gemini-pro-latest"
+    found = _get_by_slug({wire: _endpoints_body(wire, out=65_536)})
+    cfg = _with_fake_get(found, lambda: o._resolve("google/gemini-pro-latest"))
+    assert found.calls == [wire], "a ~alias is listed under its own name, not its registry key"
+    assert cfg["max_out"] == 65_536 and cfg["ceiling_source"] == "live lookup"
+    _reset_lookups()
+    cfg = _with_fake_get(_get_by_slug({}), lambda: o._resolve("x-ai/grok-latest"))
+    assert cfg["max_out"] == 64_000 and cfg["ceiling_source"] == "fallback (lookup failed)"
+
+
+def test_the_latest_aliases_cross_check_by_lab_class():
+    same = o._run_adversarial(BRIEF, model_a="openai/gpt-sol-latest",
+                              model_b="openai/gpt-astra-latest")
+    assert same.startswith("[ERROR]") and "cross-class" in same.lower(), \
+        "Sol and Astra are one lab and one class: neither may check the other"
+    other = _with_fake_fleet(_FakeFleet({"openai/gpt-sol-latest": "a", MUSE_CORE: "b"}),
+                             lambda: o._run_adversarial(BRIEF, model_a="openai/gpt-sol-latest",
+                                                        model_b=MUSE_CORE, task_id="adv-sol"))
+    assert json.loads(other)["pair"] == {"openai/gpt-sol-latest": "US-CLOSED",
+                                         MUSE_CORE: "META-CLOSED"}
 
 
 if __name__ == "__main__":

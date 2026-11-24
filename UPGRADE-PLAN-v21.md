@@ -1,6 +1,6 @@
 # Orchestra v21 upgrade plan: fleet-powered local workers
 
-Status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; v20.2 (2026-11-24) removed the routers and applied the fleet seats in code. Phase 2 is started: the harness is built and tested and the Claude Code output-cap check is measured; the live model matrix has not been run. Phases 3 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
+Status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; v20.2 (2026-11-24) removed the routers and applied the fleet seats in code; v20.3 added three floating "latest" aliases (GPT Sol, Grok, Gemini Pro) as unvetted candidates. Phase 2 is started: the harness is built and tested and the Claude Code output-cap check is measured; the live model matrix has not been run. Phases 3 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
 
 ## Objective
 
@@ -156,6 +156,7 @@ The owner removed the routers. `openrouter/auto` is out of the fleet and `call_r
 | Efficient worker | Muse Ember | Repeated tool calls, subtasks, extraction, first drafts |
 | Math / code specialist candidate | Granite 4.2 8B | Only where a deterministic check grades it. Possible new correlation class, to be confirmed from its lineage |
 | Chief reviewer | **GPT Astra, for now** | Verifier and high-stakes review |
+| GPT Sol, Grok and Gemini Pro candidates (added 2026-11-24) | `~openai/gpt-sol-latest`, `~x-ai/grok-latest`, `~google/gemini-pro-latest` | Floating aliases, unvetted, unpinned. No factual role and no routing primary until measured; same class as Astra and each other |
 
 Muse Spark and Ember share a family, so neither may verify the other. Neither takes a factual or verifier role until measured.
 
@@ -218,3 +219,5 @@ All answered 2026-11-23:
 10. Reviewer of Muse workers: **Astra** (answered 2026-11-23). Because the class rule would have refused a Muse and Astra pair, Meta models became their own class, `META-CLOSED` (v20.1). Muse Spark and Muse Ember share it and still cannot check each other.
 
 Phase 2 note on decision 3 (measured 2026-11-24, Claude Code 2.1.331): a worker sends `max_tokens` 32,000 for an unrecognised model id; with `CLAUDE_CODE_MAX_OUTPUT_TOKENS=120000` it sends 120,000, so the 120,000 cap is reachable. A request for 640,000 is clamped to 128,000, so Muse Spark's 640,000 registry ceiling can never apply to a worker.
+
+11. Floating "latest" aliases (answered 2026-11-24): use `~openai/gpt-sol-latest`, `~x-ai/grok-latest` and `~google/gemini-pro-latest` instead of fixed version numbers. Added as unvetted candidates (v20.3). Open: pin each to a host once `fleet_check` shows who serves it; whether any of them should be its own class like Meta.
