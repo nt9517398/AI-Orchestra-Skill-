@@ -2957,6 +2957,316 @@ def test_the_fleet_card_lists_every_class_in_use():
         assert f"**{klass}**" in card, f"the fleet card does not list the class {klass}"
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 harness (docs/diagnostics/agent_compat.py), against a fake Messages server
+# ---------------------------------------------------------------------------
+
+def _compat():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(o.__file__))
+    spec = importlib.util.spec_from_file_location(
+        "agent_compat", os.path.join(here, "docs", "diagnostics", "agent_compat.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class _FakeMessages:
+    """A loopback Anthropic-style Messages server. The MODEL NAME picks the behaviour:
+    good (everything works), notools (400 when tools are sent), noloop (answers without
+    using tools), sequential (one tool call per turn), badpin (rejects `provider`), echo
+    (400 whose body repeats the Authorization header)."""
+
+    def __init__(self):
+        import http.server
+        import threading
+        self.requests, self.cache_seen, outer = [], {}, self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                outer.requests.append({"auth": self.headers.get("Authorization"), "body": body})
+                code, payload = outer.respond(body, self.headers.get("Authorization", ""))
+                if code == 200 and body.get("stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    self.wfile.write(outer.sse(payload["content"]).encode())
+                    return
+                out = json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                if code == 200 and body.get("provider"):
+                    self.send_header("X-Provider", body["provider"]["only"][0])
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    @staticmethod
+    def sse(content):
+        ev = [("message_start", {"type": "message_start", "message": {"id": "m", "content": []}})]
+        for i, b in enumerate(content):
+            if b["type"] == "tool_use":
+                js = json.dumps(b["input"])
+                ev.append(("content_block_start", {"type": "content_block_start", "index": i,
+                           "content_block": {"type": "tool_use", "id": b["id"], "name": b["name"],
+                                             "input": {}}}))
+                for piece in (js[:3], js[3:]):
+                    ev.append(("content_block_delta", {"type": "content_block_delta", "index": i,
+                               "delta": {"type": "input_json_delta", "partial_json": piece}}))
+            else:
+                ev.append(("content_block_delta", {"type": "content_block_delta", "index": i,
+                           "delta": {"type": "text_delta", "text": b.get("text", "")}}))
+        ev.append(("message_stop", {"type": "message_stop"}))
+        return "".join(f"event: {n}\ndata: {json.dumps(d)}\n\n" for n, d in ev)
+
+    def respond(self, body, auth):
+        model = body["model"]
+        if model == "echo":
+            return 400, {"error": {"message": f"bad credential {auth}"}}
+        if model == "notools" and body.get("tools"):
+            return 400, {"error": {"message": "tools are not supported"}}
+        if model == "badpin" and body.get("provider"):
+            return 400, {"error": {"message": "unknown field provider"}}
+        tid = lambda n: {"type": "tool_use", "id": f"toolu_{n}", "name": "add",
+                         "input": {"a": 1, "b": 2}}
+        msgs, usage = body["messages"], {"input_tokens": 20, "output_tokens": 8}
+        prompt = msgs[0]["content"] if isinstance(msgs[0]["content"], str) else ""
+        results = sum(1 for m in msgs if isinstance(m["content"], list)
+                      for b in m["content"] if b.get("type") == "tool_result")
+        if body.get("thinking"):
+            content = [{"type": "thinking", "thinking": "17*19", "signature": "s"},
+                       {"type": "text", "text": "323"}]
+        elif body.get("tool_choice"):
+            content = [{"type": "tool_use", "id": "toolu_f", "name": "add",
+                        "input": {"a": 2, "b": 3}}]
+        elif body.get("tools") and "at the same time" in prompt:
+            content = [tid(1)] if model == "sequential" else [tid(1), tid(2)]
+        elif body.get("tools") and "(7 + 5) * 3" in prompt:
+            if model == "noloop" or results >= 2:
+                content = [{"type": "text", "text": "36"}]
+            else:
+                content = [{"type": "tool_use", "id": f"toolu_{results}",
+                            "name": "add" if results == 0 else "multiply",
+                            "input": {"a": 7, "b": 5} if results == 0 else {"a": 12, "b": 3}}]
+        else:
+            content = [{"type": "text", "text": "pong" if "pong" in prompt else "1 2 3 4 5"}]
+        if body.get("system"):
+            n = self.cache_seen.get(model, 0)
+            self.cache_seen[model] = n + 1
+            usage |= {"cache_creation_input_tokens": 1800} if n == 0 else \
+                {"cache_read_input_tokens": 1800}
+        return 200, {"id": "msg", "type": "message", "role": "assistant", "model": model,
+                     "content": content, "stop_reason": "end_turn", "usage": usage}
+
+
+def _compat_run(model, features=None, key="k-test-key-123456", max_requests=80, worker=None):
+    import tempfile
+    ac = _compat()
+    fake = _FakeMessages()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            client = ac.Client(fake.url, key, o.Path(d) / f"{model}.jsonl",
+                               max_requests=max_requests)
+            res = ac.run_model(client, model, {"wire": model, "pin": "Meta"},
+                               features or tuple(f for f in ac.FEATURES
+                                                 if f != "claude_code_worker"), worker)
+            return ac, res, client, fake, (o.Path(d) / f"{model}.jsonl").read_text("utf-8")
+    finally:
+        fake.close()
+
+
+def test_compat_a_fully_capable_model_passes_every_feature_and_both_gates_need_the_worker():
+    ac, res, client, fake, log = _compat_run("good")
+    assert {f: s for f, (s, _) in res.items()} == {
+        "basic": "pass", "pin": "pass", "forced_tool": "pass", "tool_loop": "pass",
+        "parallel_tools": "pass", "streaming": "pass", "caching": "pass", "thinking": "pass"}, res
+    assert "claude_code_worker" not in res
+    assert not ac.eligible(res), "the worker gate has not passed, so the model is not eligible"
+    assert fake.requests[0]["auth"] == "Bearer k-test-key-123456"
+
+
+def test_compat_each_weakness_is_reported_as_the_feature_it_breaks():
+    _, res, *_ = _compat_run("notools")
+    assert res["basic"][0] == "pass" and res["forced_tool"][0] == "fail"
+    assert res["tool_loop"][0] == "fail" and "tools are not supported" in res["tool_loop"][1]
+    _, res, *_ = _compat_run("noloop")
+    assert res["forced_tool"][0] == "pass" and res["tool_loop"][0] == "fail"
+    assert "used 0 tool call" in res["tool_loop"][1], "a right answer without tools is not a pass"
+    _, res, *_ = _compat_run("sequential")
+    assert res["parallel_tools"][0] == "partial" and res["tool_loop"][0] == "pass"
+    _, res, *_ = _compat_run("badpin")
+    assert res["pin"][0] == "fail"
+    assert res["basic"][0] == "pass" and res["tool_loop"][0] == "pass", \
+        "a rejected pin must not poison the other features: they run unpinned"
+
+
+def test_compat_eligibility_needs_both_gates():
+    ac = _compat()
+    ok = {"tool_loop": ("pass", ""), "claude_code_worker": ("pass", "")}
+    assert ac.eligible(ok)
+    assert not ac.eligible({**ok, "claude_code_worker": ("skip", "")})
+    assert not ac.eligible({**ok, "tool_loop": ("partial", "")})
+    assert not ac.eligible({})
+
+
+def test_compat_never_logs_the_key_and_keeps_the_error_text():
+    key = "sk-or-v1-PLANTEDSECRET0123456789abcdef"
+    ac, res, client, fake, log = _compat_run("echo", features=("basic",), key=key)
+    assert key not in log and "[REDACTED]" in log, "the credential the server echoed was kept"
+    assert res["basic"][0] == "fail" and "HTTP 400" in res["basic"][1]
+    assert key not in res["basic"][1]
+
+
+def test_compat_runs_out_of_request_budget_cleanly():
+    ac, res, client, fake, log = _compat_run("good", max_requests=2)
+    assert client.requests == 2
+    assert res["basic"][0] == "pass" and res["pin"][0] == "pass"
+    assert res["tool_loop"][0] == "skip" and "budget" in res["tool_loop"][1]
+    assert all(s == "skip" for f, (s, _) in res.items() if f not in ("basic", "pin"))
+
+
+def test_compat_will_not_send_a_key_over_plain_http_to_a_remote_host():
+    import tempfile
+    ac = _compat()
+    with tempfile.TemporaryDirectory() as d:
+        for bad in ("http://example.com", "ftp://openrouter.ai"):
+            try:
+                ac.Client(bad, "k", o.Path(d) / "x.jsonl")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{bad} was accepted")
+        ac.Client("https://openrouter.ai/api", "k", o.Path(d) / "x.jsonl")
+        ac.Client("http://127.0.0.1:9", "k", o.Path(d) / "y.jsonl")
+
+
+def test_compat_parses_server_sent_events():
+    ac = _compat()
+    lines = [b"event: a\n", b'data: {"x": 1}\n', b"\n", b"event: b\n", b"data: part1\n",
+             b"data: part2\n", b"\n", b'data: {"type": "z"}\n', b"\n"]
+    assert ac.parse_sse(lines) == [("a", {"x": 1}), ("b", "part1\npart2"), ("z", {"type": "z"})]
+
+
+def test_compat_defaults_match_the_server_registry():
+    ac = _compat()
+    for label, spec in ac.MODELS.items():
+        if label in o._ROUTERS:
+            r = o._ROUTERS[label]
+            assert spec["extra"]["plugins"][0]["allowed_models"] == list(r["allowed"])
+            assert spec["extra"]["provider"]["only"] == list(r["hosts"])
+            continue
+        assert label in o._MODELS, f"{label} is not in the registry"
+        assert spec["pin"] == o._MODELS[label]["pin"], label
+        assert spec["wire"] == (o._MODELS[label].get("api_id") or label), label
+    assert set(ac.MODELS) - set(o._ROUTERS) == {
+        m for m, e in o._MODELS.items() if e["provider"] == "openrouter"}, \
+        "an OpenRouter model is missing from the compatibility harness"
+
+
+def _worker_run(runner, max_output=None):
+    ac = _compat()
+    return ac, ac.run_worker("claude", "http://127.0.0.1:9", "k-secret-12345678", "meta/muse-ember",
+                             max_output=max_output, runner=runner)
+
+
+def test_compat_a_worker_passes_only_when_the_check_flips_and_check_py_is_untouched():
+    import types
+    seen = {}
+
+    def fixer(cmd, cwd, **kw):
+        seen.update(cmd=cmd, env=kw["env"], cwd=cwd)
+        (o.Path(cwd) / "median.py").write_text(
+            "def median(xs):\n    xs = sorted(xs)\n    n = len(xs)\n"
+            "    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2\n")
+        return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+    ac, r = _worker_run(fixer, max_output=120000)
+    assert r["status"] == "pass" and r["check_before"] != 0 and r["check_after"] == 0
+    env = seen["env"]
+    assert set(env) == {"PATH", "HOME", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                        "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+                        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_MAX_OUTPUT_TOKENS"}
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "k-secret-12345678" and env["ANTHROPIC_API_KEY"] == ""
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "120000"
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("--tools") + 1] == "Read,Edit" and "--strict-mcp-config" in cmd
+    assert cmd[cmd.index("--setting-sources") + 1] == "" and "Bash" not in " ".join(cmd)
+
+    def idle(cmd, cwd, **kw):
+        return types.SimpleNamespace(returncode=0, stdout="done", stderr="")
+    _, r = _worker_run(idle)
+    assert r["status"] == "fail" and "unchanged" in r["note"], \
+        "a worker that changes nothing is never reported as success"
+
+    def cheat(cmd, cwd, **kw):
+        (o.Path(cwd) / "check.py").write_text("print('ok')\n")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    _, r = _worker_run(cheat)
+    assert r["status"] == "fail" and "check.py" in r["note"]
+
+    def crash(cmd, cwd, **kw):
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="boom k-secret-12345678")
+    _, r = _worker_run(crash)
+    assert r["status"] == "fail" and "exited 1" in r["note"]
+    assert "k-secret-12345678" not in json.dumps(r), "the worker's output is redacted"
+
+
+def test_compat_measures_what_claude_code_sends_for_each_cap_setting():
+    import types
+    import urllib.request
+    ac = _compat()
+
+    def fake_claude(cmd, cwd, **kw):
+        cap = int(kw["env"].get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") or 32000)
+        body = json.dumps({"model": "m", "max_tokens": min(cap, 128000), "messages": [],
+                           "thinking": {"type": "adaptive"}}).encode()
+        urllib.request.urlopen(urllib.request.Request(
+            kw["env"]["ANTHROPIC_BASE_URL"] + "/v1/messages", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")).read()
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    rows = ac.run_cap_check("no-such-claude", runner=fake_claude)
+    assert [(r["requested"], r["max_tokens_sent"]) for r in rows] == [
+        (None, [32000]), (120000, [120000]), (640000, [128000])]
+    assert rows[0]["thinking_sent"] == ['{"type": "adaptive"}']
+
+
+def test_compat_report_is_built_from_the_logs_alone():
+    import tempfile
+    ac = _compat()
+    with tempfile.TemporaryDirectory() as d:
+        rows = [{"ts": "2026-11-24T00:00:01", "type": "request", "model": "m"},
+                {"type": "verdict", "model": "good-m", "feature": "tool_loop", "status": "pass",
+                 "note": "3 tool calls"},
+                {"type": "verdict", "model": "good-m", "feature": "claude_code_worker",
+                 "status": "pass", "note": "check flipped"},
+                {"type": "verdict", "model": "weak-m", "feature": "tool_loop", "status": "fail",
+                 "note": "no tool_use block"},
+                {"type": "cap", "claude_version": "9.9", "wire": "w", "requested": 120000,
+                 "max_tokens_sent": [120000], "thinking_sent": [], "tools_sent": [3]}]
+        (o.Path(d) / "a.jsonl").write_text("\n".join(json.dumps(r) for r in rows), "utf-8")
+        text = ac.build_report(d)
+    good = [x for x in text.splitlines() if x.startswith("| `good-m`")][0]
+    weak = [x for x in text.splitlines() if x.startswith("| `weak-m`")][0]
+    assert good.endswith("**yes** |") and weak.endswith("no |")
+    assert "- `weak-m` / tool_loop: FAIL — no tool_use block" in text
+    assert "| 120000 | 120000 |" in text and "Claude Code `9.9`" in text
+    empty = tempfile.mkdtemp()
+    assert "No model has been run through the live matrix yet." in ac.build_report(empty)
+    shutil_rmtree = __import__("shutil").rmtree
+    shutil_rmtree(empty)
+
+
 if __name__ == "__main__":
     # Run every test and report all failures; one failure must not hide the rest.
     import traceback

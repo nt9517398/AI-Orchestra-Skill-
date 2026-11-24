@@ -1,6 +1,6 @@
 # Orchestra v21 upgrade plan: fleet-powered local workers
 
-Status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; Phases 2 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
+Status: **Phases 0 and 1 are done; v20.1 (2026-11-23) repaired the baseline and did the offline part of Phase 1.5; Phase 2 is started: the harness is built and tested and the Claude Code output-cap check is measured; the live model matrix has not been run. Phases 3 to 7 are not started.** Evidence: `FINDINGS-2026-11-23.md`.
 
 ## Objective
 
@@ -71,6 +71,10 @@ Why: on 2026-11-23 a two-model review lost a finished GPT Astra answer when a 59
 **Do:** run the same small script for each fleet model through the Messages endpoint: forced tool call, multi-turn tool loop, parallel tools, streaming, caching, thinking blocks, a real Claude Code worker.
 
 **Verify:** a committed `docs/agent-compatibility.md` with pass or fail per feature and model, from raw logs. Only models passing the tool loop and the worker test become eligible.
+
+**Status (2026-11-24).** Built: `docs/diagnostics/agent_compat.py` runs the matrix (basic, host pin, forced tool, tool loop, parallel tools, streaming, caching, thinking, and a real Claude Code worker) through the Messages endpoint, logs every exchange to JSONL without the key, and `report` rebuilds `docs/agent-compatibility.md` from the logs alone. It is tested offline against a fake Messages server, and every guard in it was checked by breaking it. Measured now, with no key: what Claude Code sends (`docs/agent-compat-logs/2026-11-24/`). **Not run:** the live matrix. It needs OpenRouter reachable from the session and a key; this session had neither, so no model has a verdict yet and none is eligible.
+
+To run it in a session on the `ai-orchestra-skill` environment (created 2026-11-24 so the key stays off the shared Default): approve the OpenRouter credential when asked, then `python docs/diagnostics/agent_compat.py run --out docs/agent-compat-logs/<date> --worker`, then `report`. A per-model request cap (default 60) bounds the spend; set an OpenRouter key limit of about $2 as well.
 
 ### Phase 3: Isolation
 
@@ -226,3 +230,5 @@ All answered 2026-11-23:
 4. Spend limits during testing: **$2 per worker, $10 per day**. Enforced from OpenRouter's reported cost, and replaced with measured limits after the Phase 6 benchmark.
 
 10. Reviewer of Muse workers: **Astra** (answered 2026-11-23). Because the class rule would have refused a Muse and Astra pair, Meta models became their own class, `META-CLOSED` (v20.1). Muse Spark and Muse Ember share it and still cannot check each other.
+
+Phase 2 note on decision 3 (measured 2026-11-24, Claude Code 2.1.331): a worker sends `max_tokens` 32,000 for an unrecognised model id; with `CLAUDE_CODE_MAX_OUTPUT_TOKENS=120000` it sends 120,000, so the 120,000 cap is reachable. A request for 640,000 is clamped to 128,000, so Muse Spark's 640,000 registry ceiling can never apply to a worker.
