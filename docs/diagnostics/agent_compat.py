@@ -597,6 +597,15 @@ def read_logs(log_dir) -> list:
     return rows
 
 
+def eligible_models(log_dir) -> list:
+    """Registry ids whose logged verdicts pass both gates."""
+    verdicts = {}
+    for r in read_logs(log_dir):
+        if r.get("type") == "verdict":
+            verdicts.setdefault(r["model"], {})[r["feature"]] = (r["status"], r["note"])
+    return sorted(m for m, res in verdicts.items() if eligible(res))
+
+
 def build_report(log_dir) -> str:
     """The compatibility report, from the raw logs only."""
     rows = read_logs(log_dir)
@@ -680,10 +689,15 @@ def main(argv=None) -> int:
     p = sub.add_parser("report", help="build the report from existing logs")
     p.add_argument("--logs", required=True)
     p.add_argument("--out", default="")
+    p.add_argument("--eligible-json", default="", help="also write the models that pass both gates")
     a = ap.parse_args(argv)
 
     if a.cmd == "report":
         text = build_report(a.logs)
+        if a.eligible_json:
+            Path(a.eligible_json).write_text(json.dumps(
+                {"models": eligible_models(a.logs), "built": time.strftime("%Y-%m-%d")}, indent=2),
+                encoding="utf-8")
         if a.out:
             Path(a.out).write_text(text, encoding="utf-8")
         else:

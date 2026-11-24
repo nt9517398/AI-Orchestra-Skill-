@@ -2928,6 +2928,207 @@ def test_ask_start_rejects_unknown_duplicate_empty_and_too_many_models():
     assert json.loads(o.ask_start("glm-5.3", "  "))["status"] == "failed"
 
 
+# ---------------------------------------------------------------------------
+# v21-min — swarm: the ratio, the plan, and fleet agents in worktrees
+# ---------------------------------------------------------------------------
+import subprocess as _sp
+import orchestra_swarm as sw
+
+
+def test_the_swarm_ratio_is_60_70_percent_else_80_90_else_nearest():
+    expected = {1: 0, 2: 1, 3: 2, 4: 3, 5: 3, 6: 4, 7: 6, 8: 5, 9: 6, 10: 7, 11: 7, 12: 8}
+    for n, f in expected.items():
+        assert sw.fleet_count(n) == f, (n, sw.fleet_count(n))
+    for n in range(2, 41):
+        f = sw.fleet_count(n)
+        assert 1 <= f <= n - 1, "at least one Claude agent, at least one fleet agent"
+        fits60 = [k for k in range(1, n) if 0.6 - 1e-9 <= k / n <= 0.7 + 1e-9]
+        fits80 = [k for k in range(1, n) if 0.8 - 1e-9 <= k / n <= 0.9 + 1e-9]
+        if fits60:
+            assert f in fits60, (n, f, "60-70% is used whenever a whole number reaches it")
+        elif fits80:
+            assert f in fits80, (n, f, "else 80-90%")
+
+
+def _fleet_models():
+    return [{"id": "qwen/qwen4-max", "wire": "qwen/qwen4-max", "klass": "CN-OW", "max_out": 64000},
+            {"id": "x-ai/grok-latest", "wire": "~x-ai/grok-latest", "klass": "XAI-CLOSED",
+             "max_out": 64000},
+            {"id": "meta/muse-ember", "wire": "meta/muse-ember", "klass": "META-CLOSED",
+             "max_out": 128000},
+            {"id": "tencent/hy4", "wire": "tencent/hy4", "klass": "CN-OW", "max_out": 64000}]
+
+
+def test_the_swarm_plan_keeps_judgment_tasks_with_claude_and_spreads_classes():
+    tasks = [{"task": f"t{i}", "claude_only": i in (0, 1)} for i in range(6)]
+    p = sw.plan(6, tasks, _fleet_models())
+    assert p["fleet"] == 4 and p["claude"] == 2 and p["band"] == "60-70%"
+    drivers = {a["task"]: a["driver"] for a in p["agents"]}
+    assert drivers["t0"] == drivers["t1"] == "claude"
+    fleet = [a for a in p["agents"] if a["driver"] == "fleet"]
+    assert len({a["klass"] for a in fleet}) == 3, "three classes available, three used first"
+    # more judgment tasks than the ratio allows: judgment wins
+    many = [{"task": f"t{i}", "claude_only": i < 4} for i in range(6)]
+    q = sw.plan(6, many, _fleet_models())
+    assert q["claude"] == 4 and q["fleet"] == 2
+    assert "error" in sw.plan(3, ["a", "b"], _fleet_models()), "one task per agent"
+    assert "error" in sw.plan(4, None, []), "no eligible model is an error, not a silent Claude swarm"
+    one = sw.plan(1, None, _fleet_models())
+    assert one["fleet"] == 0 and one["agents"][0]["driver"] == "claude"
+
+
+def test_the_swarm_plan_tool_offers_unverified_models_with_a_warning_and_honours_the_eligible_file():
+    import tempfile
+    def run(rdir):
+        p = json.loads(o.swarm_plan(4))
+        assert p["fleet"] == 3 and p["claude"] == 1 and p["models_verified"] is False
+        assert "unverified" in p["warning"]
+        assert all(a["model"] in o._MODELS and o._MODELS[a["model"]]["provider"] == "openrouter"
+                   for a in p["agents"] if a["driver"] == "fleet"), "direct-API models cannot drive"
+        assert os.path.exists(p["launch"].split('--plan "')[1].split('"')[0])
+        assert "orchestra_swarm.py" in p["launch"]
+        assert "launch" not in json.loads(o.swarm_plan(1)), "one agent is not a swarm"
+        with tempfile.TemporaryDirectory() as d:
+            f = o.Path(d) / "swarm_eligible.json"
+            f.write_text(json.dumps({"models": ["qwen/qwen4-max", "glm-5.3", "nope/x"]}))
+            saved = o._SWARM_ELIGIBLE_PATH
+            o._SWARM_ELIGIBLE_PATH = f
+            try:
+                q = json.loads(o.swarm_plan(5))
+            finally:
+                o._SWARM_ELIGIBLE_PATH = saved
+        assert q["models_verified"] is True and "warning" not in q
+        assert {a["model"] for a in q["agents"] if a["driver"] == "fleet"} == {"qwen/qwen4-max"}, \
+            "unlisted, unknown and direct-API ids are dropped"
+    _with_temp_results(run)
+
+
+def _git_repo(d):
+    d = o.Path(d)
+    def g(*a):
+        return _sp.run(["git", "-C", str(d), *a], capture_output=True, text=True, check=True)
+    g("init", "-q"); g("config", "user.email", "t@example.com"); g("config", "user.name", "t")
+    (d / "a.txt").write_text("one\n")
+    g("add", "a.txt"); g("commit", "-qm", "init")
+    (d / ".env").write_text("OPENROUTER_API_KEY=untracked-secret\n")     # untracked, like a real .env
+    return d, g
+
+
+class _AgentRun:
+    """A fake `claude`: records how it was started and edits a file in its working folder."""
+    def __init__(self, edit="two\n", rc=0, exc=None):
+        self.edit, self.rc, self.exc, self.seen = edit, rc, exc, []
+
+    def __call__(self, cmd, cwd=None, env=None, **kw):
+        self.seen.append({"cmd": cmd, "cwd": cwd, "env": dict(env), "env_file_visible":
+                          os.path.exists(os.path.join(cwd, ".env")), "kw": kw})
+        if self.exc:
+            raise self.exc
+        if self.edit is not None:
+            with open(os.path.join(cwd, "a.txt"), "w") as f:
+                f.write(self.edit)
+        return _sp.CompletedProcess(cmd, self.rc, stdout="done " + env["ANTHROPIC_AUTH_TOKEN"],
+                                    stderr="")
+
+
+def _agent(i="a1"):
+    return {"id": i, "driver": "fleet", "model": "qwen/qwen4-max", "wire": "qwen/qwen4-max",
+            "task": "fix a.txt", "max_out": 64000}
+
+
+def test_a_fleet_agent_works_in_a_worktree_with_a_scrubbed_environment_and_returns_a_diff():
+    import tempfile
+    os.environ["PLANTED_SECRET"] = "planted-" + uuid.uuid4().hex
+    try:
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            repo, g = _git_repo(d)
+            run = _AgentRun()
+            key = "sk-or-test-" + uuid.uuid4().hex
+            rec = sw.run_agent(_agent(), repo, out, key=key, runner=run)
+            seen = run.seen[0]
+            assert rec["status"] == "changed" and "+two" in rec["diff"] and "-one" in rec["diff"]
+            assert (repo / "a.txt").read_text() == "one\n", "the real checkout is never touched"
+            assert os.path.realpath(seen["cwd"]) != os.path.realpath(str(repo))
+            assert not seen["env_file_visible"], "an untracked .env is not in the worktree"
+            assert set(seen["env"]) == {"PATH", "HOME", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                                        "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+                                        "ANTHROPIC_SMALL_FAST_MODEL",
+                                        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                                        "CLAUDE_CODE_MAX_OUTPUT_TOKENS"}
+            assert "PLANTED_SECRET" not in seen["env"] and seen["env"]["ANTHROPIC_API_KEY"] == ""
+            assert seen["env"]["ANTHROPIC_BASE_URL"] == "https://openrouter.ai/api"
+            assert seen["env"]["ANTHROPIC_MODEL"] == "qwen/qwen4-max"
+            assert seen["env"]["HOME"] != os.environ.get("HOME")
+            tools = seen["cmd"][seen["cmd"].index("--tools") + 1].split(",")
+            assert "Bash" not in tools and sw.TOOLS.split(",") == tools, "file tools only"
+            assert "--max-turns" in seen["cmd"] and seen["kw"]["timeout"] == 900
+            saved = (o.Path(out) / "a1.json").read_text(encoding="utf-8")
+            assert key not in saved and "[REDACTED]" in saved, "the key never reaches a result file"
+            wl = g("worktree", "list").stdout.strip().splitlines()
+            assert len(wl) == 1, "the worktree is removed afterwards"
+    finally:
+        del os.environ["PLANTED_SECRET"]
+
+
+def test_fleet_agent_failures_are_tagged_and_never_lose_the_other_agents():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        repo, g = _git_repo(d)
+        cases = {"t": _AgentRun(exc=_sp.TimeoutExpired("claude", 1)), "f": _AgentRun(rc=1),
+                 "n": _AgentRun(edit=None), "x": _AgentRun(exc=ValueError("boom")),
+                 "ok": _AgentRun()}
+        plan_obj = {"agents": [dict(_agent(i), id=i) for i in cases]}
+        order = iter(cases)           # agents start in plan order under parallel=1
+        def serial(cmd, cwd=None, env=None, **kw):
+            return cases[next(order)](cmd, cwd=cwd, env=env, **kw)
+        recs = sw.run_swarm(plan_obj, repo, out, key="k" * 12, parallel=1, runner=serial)
+        got = {r["id"]: r["status"] for r in recs}
+        assert got == {"t": "timeout", "f": "failed", "n": "no_change", "x": "failed",
+                       "ok": "changed"}, got
+        assert sorted(p.name for p in o.Path(out).glob("*.json")) == sorted(
+            f"{k}.json" for k in cases), "every agent leaves a file, success or not"
+        assert (repo / "a.txt").read_text() == "one\n"
+        assert len(g("worktree", "list").stdout.strip().splitlines()) == 1
+
+
+def test_the_swarm_launcher_refuses_to_run_without_a_key_and_skips_claude_agents():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        repo, g = _git_repo(d)
+        plan_file = o.Path(d) / "plan.json"
+        plan_file.write_text(json.dumps({"agents": [dict(_agent("a1")), dict(_agent("a2"), driver="claude")]}))
+        saved_key, saved_fn = os.environ.pop("OPENROUTER_API_KEY", None), sw._key
+        sw._key = lambda: ""
+        try:
+            assert sw.main(["run", "--plan", str(plan_file), "--repo", str(repo), "--out", out]) == 2
+        finally:
+            sw._key = saved_fn
+            if saved_key is not None:
+                os.environ["OPENROUTER_API_KEY"] = saved_key
+        assert list(o.Path(out).glob("*.json")) == [], "nothing was run"
+        rr = _AgentRun()
+        recs = sw.run_swarm(json.loads(plan_file.read_text()), repo, out, key="k" * 12, runner=rr)
+        assert [r["id"] for r in recs] == ["a1"] and len(rr.seen) == 1, \
+            "Claude agents are not launched by the script"
+
+
+def test_the_harness_exports_the_models_that_pass_both_gates():
+    import tempfile
+    ac = _compat()
+    with tempfile.TemporaryDirectory() as d:
+        rows = [{"type": "verdict", "model": m, "feature": f, "status": s, "note": ""}
+                for m, res in (("qwen/qwen4-max", {"tool_loop": "pass", "claude_code_worker": "pass"}),
+                               ("tencent/hy4", {"tool_loop": "pass", "claude_code_worker": "fail"}),
+                               ("x-ai/grok-latest", {"tool_loop": "pass"}))
+                for f, s in res.items()]
+        (o.Path(d) / "m.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        assert ac.eligible_models(d) == ["qwen/qwen4-max"]
+        outp = o.Path(d) / "swarm_eligible.json"
+        assert ac.main(["report", "--logs", d, "--out", str(o.Path(d) / "r.md"),
+                        "--eligible-json", str(outp)]) == 0
+        assert json.loads(outp.read_text())["models"] == ["qwen/qwen4-max"]
+
+
 if __name__ == "__main__":
     # Run every test and report all failures; one failure must not hide the rest.
     import traceback

@@ -45,6 +45,8 @@ from typing import Optional, Union
 
 import requests
 from dotenv import load_dotenv
+
+import orchestra_swarm
 try:
     from mcp.server.fastmcp import FastMCP
 except ModuleNotFoundError as _e:           # mcp 2.x renamed FastMCP to MCPServer
@@ -2426,6 +2428,72 @@ def _check_main(argv: list) -> int:
     if result["problems"]:
         return 1
     return 0 if result["ok"] else 2
+
+
+# ---------------------------------------------------------------------------
+# Swarm — Claude Code agents, most of them driven by fleet models (orchestra_swarm.py)
+# ---------------------------------------------------------------------------
+_SWARM_ELIGIBLE_PATH = Path(os.environ.get("ORCHESTRA_SWARM_ELIGIBLE")
+                            or Path(__file__).with_name("swarm_eligible.json"))
+
+
+def _swarm_models() -> tuple:
+    """(models, verified). Only OpenRouter models can drive an agent: it needs OpenRouter's
+    Anthropic-compatible endpoint. swarm_eligible.json, written by the compatibility harness
+    (`agent_compat.py report --eligible-json`), narrows the list to models that passed both
+    gates; without it every OpenRouter model is offered and the plan says so."""
+    orm = {m: e for m, e in _MODELS.items() if e["provider"] == "openrouter"}
+    ids, verified = list(orm), False
+    try:
+        listed = json.loads(_SWARM_ELIGIBLE_PATH.read_text(encoding="utf-8")).get("models", [])
+        ids, verified = [m for m in listed if m in orm], True
+    except (OSError, ValueError, AttributeError):
+        pass
+    return ([{"id": m, "wire": orm[m].get("api_id") or m, "klass": orm[m]["klass"],
+              "max_out": (_CEILING_STATE.get(m) or {}).get("max_out") or orm[m]["max_out"]}
+             for m in ids], verified)
+
+
+@mcp.tool()
+def swarm_plan(n_agents: int, tasks: Optional[list] = None, repo: str = ".") -> str:
+    """Plan a swarm of Claude Code agents where most agents are driven by fleet models.
+
+    n_agents: how many agents in all. 60-70% are fleet agents; if no whole number fits that
+      (2, 4, 7 agents) 80-90%, else the nearest share; at least one agent is always Claude.
+      One agent is not a swarm: Claude decides.
+    tasks: optional, one per agent. A string, or {"task": "...", "claude_only": true} for work
+      that needs judgment, whole-repository context or sensitive data: those go to Claude
+      agents. Give fleet agents bounded tasks that a test or check can grade.
+    repo: the git repository the fleet agents work on (a worktree of HEAD each).
+
+    Returns the plan and a launch command. Claude agents are ordinary subagents started with
+    the Agent tool; run the launch command with Bash for the fleet agents, then review and
+    apply each diff. Fleet agents have file tools only (no Bash) and never touch the real
+    checkout. Test and public projects only until isolation is decided.
+    """
+    try:
+        n = int(n_agents)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "[ERROR] n_agents must be a whole number"})
+    models, verified = _swarm_models()
+    p = orchestra_swarm.plan(n, tasks, models)
+    if "error" in p:
+        return json.dumps(p)
+    tid = _new_task_id()
+    out_dir = _RESULTS_DIR / f"swarm-{tid}"
+    p.update(task_id=tid, repo=repo, models_verified=verified)
+    if not verified:
+        p["warning"] = ("unverified: swarm_eligible.json is absent, so these models have not "
+                        "passed the compatibility harness; expect failures")
+    if p["fleet"]:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "plan.json").write_text(json.dumps(p, indent=2), encoding="utf-8")
+            p["launch"] = (f'python "{Path(__file__).with_name("orchestra_swarm.py")}" run '
+                           f'--plan "{out_dir / "plan.json"}" --repo "{repo}" --out "{out_dir}"')
+        except OSError as e:
+            p["error"] = f"could not write the plan: {e}"
+    return json.dumps(p, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
