@@ -1,0 +1,31 @@
+Bash permission probe, 2026-11-25. Claude Code 2.1.332, Linux container, stub model (no network, no key),
+headless (-p), --permission-mode acceptEdits, --setting-sources "". Tool result seen by the "model":
+
+RULE  Read,Edit,Write,Glob,Grep,Bash(python -m pytest:*)
+python -m pytest --version                  ran ("No module named pytest": python started, so the rule matched)
+ls /                                        blocked: outside the working directory
+echo hi                                     ran   (built-in read-only command, not covered by the rule)
+cat /etc/hostname                           blocked: outside the working directory
+printenv ANTHROPIC_AUTH_TOKEN               refused: "This command requires approval"
+echo $ANTHROPIC_AUTH_TOKEN                  refused: variable can't be checked before it runs
+env                                         refused: requires approval
+curl -s http://127.0.0.1:9/                 refused: requires approval
+python -c 'print(1)'                        refused: requires approval
+python -m pytest --version; echo CHAINED    ran both parts (each part allowed)
+python -m pytest --version && cat /etc/hostname   second part blocked (outside the working directory)
+python -m pytest $(echo SUBST)              refused: nested command can't be checked
+cd / && python -m pytest --version          blocked: cd outside the working directory
+python -m pytest --version | cat            ran
+
+RULE  Read,Bash(python:*)   (probe only, to see what a Python process can do)
+no scrub:  python reads os.environ[ANTHROPIC_AUTH_TOKEN]  -> the key (a dummy value here)
+CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 without bubblewrap  -> Claude Code refuses to start any shell command
+... with bubblewrap but without socat                  -> every shell command refused (sandbox failed to initialise)
+... with bubblewrap and socat installed:
+  key via env                       None   (hidden)
+  read /home/user/canary_probe.txt  CANARY-123   (read outside the working directory: allowed)
+  write real repo / home / root / /tmp   WROTE   (writes outside the working directory: allowed; files existed afterwards)
+  connect to a listening local port CONNECTED
+  connect to example.com:443        failed (this container's network may also block it; not a general guarantee)
+
+Conclusion: the rule narrows which commands start; it is not isolation. The scrub hides the key but does not confine files.

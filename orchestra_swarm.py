@@ -10,10 +10,15 @@ Anthropic-compatible endpoint. This file does three things:
   run             start the fleet agents, each in its own git worktree, and keep every result
 
 Each fleet agent gets: a worktree of HEAD (tracked files only, so an untracked .env is never
-there), a scrubbed environment (PATH, an empty HOME and its one OpenRouter credential), file
-tools only (no Bash), a turn cap and a time limit. It never touches the real checkout: what it
-changed comes back as a diff that Claude reviews and applies. Spend is NOT capped here (Claude
-Code has no spend flag): set an OpenRouter key limit as the backstop.
+there), a scrubbed environment (PATH, an empty HOME and its one OpenRouter credential), a tool
+list, a turn cap and a time limit. Its changes come back as a diff that Claude reviews and
+applies. Spend is NOT capped here (Claude Code has no spend flag): set an OpenRouter key limit.
+
+TOOLS ARE PER AGENT. Every fleet agent has file tools. Bash is OFF unless the plan turns it on
+for that agent, and then only for the four models in BASH_MODELS, only as the test-runner rule
+BASH_RULE (never bare Bash), and only when the caller said the repo is public or a test project.
+This is a permission rule, NOT isolation: see swarm.md. A Bash agent can still write and read
+outside its worktree, so "never touches the real checkout" holds for file-only agents only.
 
     python orchestra_swarm.py run --plan results/<id>/plan.json --repo . --out results/<id>
 """
@@ -31,7 +36,22 @@ from pathlib import Path
 
 BANDS = ((0.60, 0.70), (0.80, 0.90))     # the owner's rule: 60-70%, and 80-90% when that is out of reach
 TARGET = 0.65
-TOOLS = "Read,Edit,Write,Glob,Grep"      # no Bash: isolation is not decided yet (plan, decision 3)
+FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep")     # every fleet agent; no Bash
+# The only models that may be given Bash, kept in one place. Any other model gets file tools only,
+# even if a plan asks for Bash (the launcher re-checks, so editing plan.json does not widen it).
+BASH_MODELS = frozenset({"meta/muse-spark-1.3", "x-ai/grok-latest", "openai/gpt-terra-latest",
+                         "qwen/qwen4-max"})
+# The one shell permission: the test runner. Checked against Claude Code 2.1.332 with a stub model
+# (bashprobe, 2026-11-25): this rule runs `python -m pytest ...`, and `env`, `curl`, `python -c`
+# are denied in headless mode. It is never bare "Bash"; the assert makes a bad edit fail on import.
+BASH_RULE = "Bash(python -m pytest:*)"
+assert BASH_RULE.startswith("Bash(") and BASH_RULE.endswith(")") and len(BASH_RULE) > 10
+BASH_GUARD = ("Bash is on for this plan. The public/test-repo flag is the ONLY guard on what the "
+              "shell can reach: a permission rule is not isolation. A Bash agent can still read and "
+              "write outside its worktree (verified offline), and a test run executes arbitrary "
+              "code. With bubblewrap and socat installed the key is hidden from the shell and "
+              "outside network is refused; without them every shell command fails closed. Full "
+              "Bash stays blocked until container isolation exists.")
 DEFAULT_BASE = "https://openrouter.ai/api"
 
 
@@ -73,20 +93,44 @@ def _spread(models: list, k: int) -> list:
     return out
 
 
-def plan(n_agents: int, tasks=None, models=None, claude_only=()) -> dict:
-    """The swarm plan. `tasks`: strings, or dicts {"task": str, "claude_only": bool}. A task
-    marked claude_only (judgment, repository-wide context, anything sensitive) goes to a Claude
-    agent. `models`: the eligible fleet models, dicts with id, wire, klass, max_out."""
+def resolve_tools(agent: dict, public_or_test_repo: bool) -> dict:
+    """What this fleet agent may use. Bash only when the agent asks, the caller vouched for the
+    repo, and the model is in BASH_MODELS; otherwise file tools only, with the reason. Nothing
+    in `agent` except `model` and `bash` is trusted: a `tools` list in a plan file is ignored."""
+    tools, allowed, note = list(FILE_TOOLS), list(FILE_TOOLS), ""
+    if agent.get("bash"):
+        if public_or_test_repo is not True:
+            note = "Bash refused: the plan does not say the repo is public or a test project"
+        elif agent.get("model") not in BASH_MODELS:
+            note = f"Bash refused: {agent.get('model')} is not in BASH_MODELS; file tools only"
+        else:
+            tools.append("Bash")
+            allowed.append(BASH_RULE)
+    return {"tools": tools, "allowed": allowed, "bash": "Bash" in tools, "bash_note": note}
+
+
+def plan(n_agents: int, tasks=None, models=None, public_or_test_repo: bool = False) -> dict:
+    """The swarm plan. `tasks`: strings, or dicts {"task": str, "claude_only": bool, "bash": bool}.
+    A task marked claude_only (judgment, repository-wide context, anything sensitive) goes to a
+    Claude agent. `bash: true` asks for the test-runner shell; it is refused unless
+    `public_or_test_repo` is true, and only models in BASH_MODELS get it. `models`: the eligible
+    fleet models, dicts with id, wire, klass, max_out."""
     models = list(models or [])
     n = int(n_agents)
     items = []
     for t in (tasks or []):
         d = t if isinstance(t, dict) else {"task": t}
-        items.append({"task": str(d.get("task", "")), "claude_only": bool(d.get("claude_only"))})
+        items.append({"task": str(d.get("task", "")), "claude_only": bool(d.get("claude_only")),
+                      "bash": bool(d.get("bash")) and not d.get("claude_only")})
     if items and len(items) != n:
         return {"error": f"{len(items)} tasks for {n} agents: give one task per agent"}
     if n < 1:
         return {"error": "n_agents must be at least 1"}
+    asks = [f"a{i + 1}" for i, d in enumerate(items) if d["bash"]]
+    if asks and public_or_test_repo is not True:
+        return {"error": f"Bash was requested for {', '.join(asks)} but the caller did not say the "
+                         "repo is public or a test project (public_or_test_repo). Refused: that "
+                         "flag is the only guard on what the shell can reach."}
     f = fleet_count(n)
     if f and not models:
         return {"error": "no eligible fleet model: run the compatibility harness first "
@@ -96,18 +140,31 @@ def plan(n_agents: int, tasks=None, models=None, claude_only=()) -> dict:
         f = n - len(need_claude)              # judgment tasks win over the ratio
     chosen = _spread(models, f)
     fleet_slots = [i for i in range(n) if i not in need_claude][:f]
-    agents = []
+    bash_pool = [m for m in models if m["id"] in BASH_MODELS]
+    agents, k, nb = [], 0, 0
     for i in range(n):
         a = {"id": f"a{i + 1}", "task": items[i]["task"] if items else ""}
         if i in fleet_slots:
-            m = chosen[fleet_slots.index(i) % len(chosen)]
+            wants = bool(items and items[i]["bash"])
+            if wants and bash_pool:                   # a Bash agent goes to a model that may have it
+                m, nb = bash_pool[nb % len(bash_pool)], nb + 1
+            else:
+                m, k = chosen[k % len(chosen)], k + 1
             a.update(driver="fleet", model=m["id"], wire=m["wire"], klass=m["klass"],
-                     max_out=min(int(m.get("max_out") or 64000), 120000))
+                     max_out=min(int(m.get("max_out") or 64000), 120000), bash=wants)
+            res = resolve_tools(a, public_or_test_repo)
+            a.update(tools=[*FILE_TOOLS, *([BASH_RULE] if res["bash"] else [])], bash=res["bash"])
+            if res["bash_note"]:
+                a["bash_note"] = res["bash_note"]
         else:
             a.update(driver="claude")
         agents.append(a)
-    return {"n": n, "fleet": f, "claude": n - f, "share": round(f / n, 2),
-            "band": band_of(n, f) if f else "none", "agents": agents}
+    out = {"n": n, "fleet": f, "claude": n - f, "share": round(f / n, 2),
+           "band": band_of(n, f) if f else "none", "public_or_test_repo": public_or_test_repo is True,
+           "agents": agents}
+    if any(a.get("bash") for a in agents):
+        out["bash_guard"] = BASH_GUARD
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -121,19 +178,25 @@ def redact(text: str, key: str) -> str:
     return re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}", r"\1[REDACTED]", s)
 
 
-def agent_env(key: str, base: str, wire: str, home: str, max_out=None) -> dict:
-    """Everything the agent may see. Nothing else from this process is passed on."""
+def agent_env(key: str, base: str, wire: str, home: str, max_out=None, bash: bool = False) -> dict:
+    """Everything the agent may see. Nothing else from this process is passed on. For a Bash
+    agent, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 hides the credential from the shell; Claude Code
+    needs bubblewrap and socat for it and otherwise fails every shell command (fails closed)."""
     env = {"PATH": os.environ.get("PATH", ""), "HOME": home,
            "ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": key, "ANTHROPIC_API_KEY": "",
            "ANTHROPIC_MODEL": wire, "ANTHROPIC_SMALL_FAST_MODEL": wire,
            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
     if max_out:
         env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_out)
+    if bash:
+        env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
     return env
 
 
-def agent_command(claude: str, wire: str, task: str, max_turns: int) -> list:
-    return [claude, "-p", task, "--model", wire, "--tools", TOOLS, "--allowedTools", TOOLS,
+def agent_command(claude: str, wire: str, task: str, max_turns: int, res: dict = None) -> list:
+    res = res or resolve_tools({}, False)
+    return [claude, "-p", task, "--model", wire, "--tools", ",".join(res["tools"]),
+            "--allowedTools", ",".join(res["allowed"]),
             "--permission-mode", "acceptEdits", "--max-turns", str(max_turns),
             "--strict-mcp-config", "--setting-sources", "", "--output-format", "json"]
 
@@ -143,13 +206,17 @@ def _git(repo, *args, runner=subprocess.run):
 
 
 def run_agent(agent: dict, repo, out_dir, *, claude="claude", base=DEFAULT_BASE, key="",
-              timeout=900, max_turns=30, runner=subprocess.run) -> dict:
+              timeout=900, max_turns=30, runner=subprocess.run,
+              public_or_test_repo: bool = False) -> dict:
     """One fleet agent in its own worktree. Never raises; always writes <out_dir>/<id>.json
     (atomically), so a swarm that is killed keeps every agent that finished."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    res = resolve_tools(agent, public_or_test_repo)          # derived here; the plan's list is ignored
     rec = {"id": agent["id"], "model": agent["model"], "wire": agent["wire"],
-           "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "status": "failed", "diff": ""}
+           "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "status": "failed", "diff": "",
+           "tools": res["allowed"], "bash": res["bash"],
+           **({"bash_note": res["bash_note"]} if res["bash_note"] else {})}
     t0 = time.time()
     wt = tempfile.mkdtemp(prefix="orchestra-wt-")
     home = tempfile.mkdtemp(prefix="orchestra-home-")
@@ -161,10 +228,11 @@ def run_agent(agent: dict, repo, out_dir, *, claude="claude", base=DEFAULT_BASE,
             return rec
         added = True
         try:
-            p = runner(agent_command(claude, agent["wire"], agent["task"], max_turns), cwd=wt,
+            p = runner(agent_command(claude, agent["wire"], agent["task"], max_turns, res), cwd=wt,
                        capture_output=True, text=True, timeout=timeout,
                        stdin=subprocess.DEVNULL,
-                       env=agent_env(key, base, agent["wire"], home, agent.get("max_out")))
+                       env=agent_env(key, base, agent["wire"], home, agent.get("max_out"),
+                                     res["bash"]))
             rec.update(exit=p.returncode, stdout=redact(p.stdout, key)[:5000],
                        stderr=redact(p.stderr, key)[:1000])
         except subprocess.TimeoutExpired:
@@ -200,7 +268,8 @@ def run_swarm(plan_obj: dict, repo, out_dir, *, claude="claude", base=DEFAULT_BA
     def one(a):
         with sem:
             r = run_agent(a, repo, out_dir, claude=claude, base=base, key=key, timeout=timeout,
-                          max_turns=max_turns, runner=runner)
+                          max_turns=max_turns, runner=runner,
+                          public_or_test_repo=plan_obj.get("public_or_test_repo") is True)
         with lock:
             results.append(r)
     threads = [threading.Thread(target=one, args=(a,)) for a in fleet]

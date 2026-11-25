@@ -138,7 +138,7 @@ M0–M4 needed no key. M5 cannot be done without one; M6 needs the owner's machi
 
 1. Track whether each model's answers were right: **no** for now; the automatic call log is enough.
 2. Isolation for fleet agents: **a git worktree** with a scrubbed environment, public and test projects only. Docker later if needed.
-3. Bash for fleet agents: **off** until isolation is decided.
+3. Bash for fleet agents: **off** until isolation is decided. *Amended 2026-11-25 by decision 17: on for four named models, test runner only, public or test repos only.*
 4. Swarm launch: **a script** that Claude runs with Bash (`orchestra_swarm.py`), not the MCP server.
 5. Keep **workflows, adversarial mode and memory**.
 6. Ratio: **60–70%**, else **80–90%**.
@@ -397,3 +397,11 @@ Phase 2 note on decision 3 (measured 2026-11-24, Claude Code 2.1.331): a worker 
 15. Rebuild go-ahead (answered 2026-11-24): proceed with the bare-minimum rebuild on the recommendations above, keeping workflows, adversarial mode and memory, with the 60–70% / 80–90% ratio. Done offline as M0–M4 (commits after `7a95b10`). Jev is `~typesafe/jev-latest`; Kimi K3.1 is pinned to `wafer/us`.
 
 16. Requests stay structured (answered 2026-11-24): JSON brief + XML envelope + output contract is how Claude sends every request. The plain `ask` tool was removed; `ask_start` takes a brief.
+
+17. **Bash for fleet agents (answered 2026-11-25).** Bash is **on for four named models** (`meta/muse-spark-1.3`, `x-ai/grok-latest`, `openai/gpt-terra-latest`, `qwen/qwen4-max`; the list is `BASH_MODELS` in `orchestra_swarm.py`), **as the test-runner rule only** (`Bash(python -m pytest:*)`, never bare Bash), and **only when the caller passes `public_or_test_repo=true`**, which is the only guard on what the shell can reach. Off by default; per agent (`"bash": true` on a task); the launcher re-derives each agent's tools from its model, so a hand-edited plan cannot widen them; any other model gets file tools only. Bash agents also get `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`.
+
+    **What was checked offline** (Claude Code 2.1.332, stub model; `docs/diagnostics/bash_probe.py`, log in `docs/agent-compat-logs/2026-11-25/`): the rule syntax is accepted and enforced for the test runner (`env`, `curl`, `python -c` are refused in headless mode); Claude Code also runs its own read-only commands (`echo`, in-worktree `cat` and `ls`) outside the rule; a Python process reads the key from its environment unless the scrub is on, and with the scrub on (needs bubblewrap and socat, otherwise every shell command is refused) it does not; with the scrub on, a shell command **still wrote files into the real repository, the home directory and `/tmp`, and read a file outside the worktree**; a connection to a local port worked and one to an outside host failed.
+
+    **Therefore this is a permission rule, not isolation.** A Bash agent can alter the real checkout, and a test run executes arbitrary code. Full Bash stays **blocked until container isolation exists**: a throwaway container holding only a copy of the repo, with network limited to OpenRouter.
+
+    **Still open, and must pass before Bash is used on anything wider than a throwaway repo:** (a) container isolation; (b) the hostile-agent test: a canary file outside the task, a connection to another host, and an edit outside the worktree must all fail, and today the write and read cases succeed; (c) the live check that real models use the rule as the offline probe predicts; (d) Windows and macOS behaviour of the scrub (the probe ran on Linux only).

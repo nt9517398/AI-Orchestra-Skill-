@@ -3030,7 +3030,8 @@ def test_a_fleet_agent_works_in_a_worktree_with_a_scrubbed_environment_and_retur
             assert seen["env"]["ANTHROPIC_MODEL"] == "qwen/qwen4-max"
             assert seen["env"]["HOME"] != os.environ.get("HOME")
             tools = seen["cmd"][seen["cmd"].index("--tools") + 1].split(",")
-            assert "Bash" not in tools and sw.TOOLS.split(",") == tools, "file tools only"
+            assert "Bash" not in tools and list(sw.FILE_TOOLS) == tools, "file tools only"
+            assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" not in seen["env"], "file-only: nothing changed"
             assert "--max-turns" in seen["cmd"] and seen["kw"]["timeout"] == 900
             saved = (o.Path(out) / "a1.json").read_text(encoding="utf-8")
             assert key not in saved and "[REDACTED]" in saved, "the key never reaches a result file"
@@ -3097,6 +3098,117 @@ def test_the_harness_exports_the_models_that_pass_both_gates():
         assert ac.main(["report", "--logs", d, "--out", str(o.Path(d) / "r.md"),
                         "--eligible-json", str(outp)]) == 0
         assert json.loads(outp.read_text())["models"] == ["qwen/qwen4-max"]
+
+
+# ---------------------------------------------------------------------------
+# v21-min — Bash for four named models: test runner only, public or test repos only
+# ---------------------------------------------------------------------------
+
+def _opt(cmd, flag):
+    return cmd[cmd.index(flag) + 1].split(",")
+
+
+def test_bash_is_limited_to_four_named_models_in_one_place():
+    assert sw.BASH_MODELS == {"meta/muse-spark-1.3", "x-ai/grok-latest",
+                              "openai/gpt-terra-latest", "qwen/qwen4-max"}
+    assert sw.BASH_MODELS <= set(o._MODELS), "every name is a real registry id"
+    assert sw.BASH_RULE == "Bash(python -m pytest:*)" and sw.BASH_RULE != "Bash"
+    assert "Bash" not in sw.FILE_TOOLS and not any(t.startswith("Bash") for t in sw.FILE_TOOLS)
+
+
+def test_a_model_off_the_list_never_gets_bash_even_if_the_plan_asks():
+    import tempfile
+    tencent = {"id": "tencent/hy4", "wire": "tencent/hy4", "klass": "CN-OW", "max_out": 64000}
+    p = sw.plan(3, [{"task": "t", "bash": True}] * 3, [tencent], public_or_test_repo=True)
+    fleet = [a for a in p["agents"] if a["driver"] == "fleet"]
+    assert fleet and all(a["bash"] is False and "not in BASH_MODELS" in a["bash_note"]
+                         and a["tools"] == list(sw.FILE_TOOLS) for a in fleet)
+    assert "bash_guard" not in p, "no agent has Bash, so no Bash warning"
+    # a hand-edited plan file cannot add it either: the launcher decides from the model
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        repo, g = _git_repo(d)
+        run = _AgentRun()
+        forged = dict(_agent(), model="tencent/hy4", wire="tencent/hy4", bash=True,
+                      tools=[*sw.FILE_TOOLS, "Bash", "Bash(rm:*)"])
+        rec = sw.run_agent(forged, repo, out, key="k" * 12, runner=run, public_or_test_repo=True)
+        cmd = run.seen[0]["cmd"]
+        assert rec["bash"] is False and "Bash" not in _opt(cmd, "--tools")
+        assert not any(t.startswith("Bash") for t in _opt(cmd, "--allowedTools"))
+        assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" not in run.seen[0]["env"]
+        assert "not in BASH_MODELS" in rec["bash_note"]
+
+
+def test_a_bash_agent_gets_the_narrow_test_runner_rule_never_bare_bash():
+    import tempfile
+    models = [{"id": m, "wire": m, "klass": k, "max_out": 64000} for m, k in (
+        ("qwen/qwen4-max", "CN-OW"), ("tencent/hy4", "CN-OW"), ("x-ai/grok-latest", "XAI-CLOSED"))]
+    p = sw.plan(3, [{"task": "run tests", "bash": True}, "edit", "edit"], models,
+                public_or_test_repo=True)
+    bash_agent = [a for a in p["agents"] if a.get("bash")]
+    assert len(bash_agent) == 1 and bash_agent[0]["model"] in sw.BASH_MODELS, \
+        "the Bash task is given to a model that may have it, even when others are also offered"
+    assert bash_agent[0]["tools"] == [*sw.FILE_TOOLS, sw.BASH_RULE]
+    assert "ONLY guard" in p["bash_guard"] and "not isolation" in p["bash_guard"]
+    assert p["public_or_test_repo"] is True
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+        repo, g = _git_repo(d)
+        run = _AgentRun()
+        rec = sw.run_agent(bash_agent[0], repo, out, key="k" * 12, runner=run,
+                           public_or_test_repo=True)
+        cmd, env = run.seen[0]["cmd"], run.seen[0]["env"]
+        allowed = _opt(cmd, "--allowedTools")
+        assert "Bash" in _opt(cmd, "--tools"), "the tool exists..."
+        assert allowed == [*sw.FILE_TOOLS, "Bash(python -m pytest:*)"], "...but only as the rule"
+        assert "Bash" not in allowed, "never bare Bash"
+        assert env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+        assert rec["bash"] is True and rec["tools"] == allowed
+
+
+def test_bash_is_refused_without_the_public_or_test_repo_flag():
+    import tempfile
+    models = [{"id": "qwen/qwen4-max", "wire": "qwen/qwen4-max", "klass": "CN-OW", "max_out": 64000}]
+    err = sw.plan(3, [{"task": "t", "bash": True}, "b", "c"], models)
+    assert "error" in err and "public or a test project" in err["error"] and "a1" in err["error"]
+    assert "error" in sw.plan(3, [{"task": "t", "bash": True}, "b", "c"], models,
+                              public_or_test_repo="yes"), "only a real True counts"
+    out = json.loads(o.swarm_plan(3, [{"task": "t", "bash": True}, "b", "c"]))
+    assert "error" in out and "only guard" in out["error"]
+    ok = json.loads(o.swarm_plan(3, [{"task": "t", "bash": True}, "b", "c"], public_or_test_repo=True))
+    assert "error" not in ok and ok["public_or_test_repo"] is True
+    # the launcher repeats the check: a plan file that asks for Bash but lacks the flag is file-only
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out_dir:
+        repo, g = _git_repo(d)
+        run = _AgentRun()
+        a = dict(_agent(), model="qwen/qwen4-max", bash=True)
+        rec = sw.run_agent(a, repo, out_dir, key="k" * 12, runner=run)
+        assert rec["bash"] is False and "public or a test project" in rec["bash_note"]
+        assert "Bash" not in _opt(run.seen[0]["cmd"], "--tools")
+        recs = sw.run_swarm({"agents": [dict(a, id="x1")], "public_or_test_repo": True}, repo,
+                            out_dir, key="k" * 12, runner=run)
+        assert recs[0]["bash"] is True, "the plan's flag is what the launcher honours"
+
+
+def test_file_only_agents_are_unchanged_when_bash_is_not_asked_for():
+    models = [{"id": "qwen/qwen4-max", "wire": "qwen/qwen4-max", "klass": "CN-OW", "max_out": 64000}]
+    p = sw.plan(3, None, models, public_or_test_repo=True)
+    assert all(a["tools"] == list(sw.FILE_TOOLS) and a["bash"] is False
+               for a in p["agents"] if a["driver"] == "fleet"), "Bash is off by default, flag or not"
+    assert "bash_guard" not in p
+    claude_only = sw.plan(3, [{"task": "a", "bash": True, "claude_only": True}, "b", "c"], models)
+    assert "error" not in claude_only, "a Claude agent does not use the fleet shell"
+
+
+def test_the_docs_state_the_real_limit_of_the_shell_rule():
+    docs = _packaged_docs()
+    swarm, skill = docs["references/swarm.md"], docs["SKILL.md"]
+    for text in (swarm, skill):
+        low = text.lower()
+        assert "not isolation" in low and "container" in low, "the limit and the missing container"
+        assert "public_or_test_repo" in text
+    assert "only guard" in swarm.lower()
+    for m in sw.BASH_MODELS:
+        assert m in swarm, f"swarm.md does not name {m}"
+    assert "python -m pytest" in swarm and "bubblewrap" in swarm.lower()
 
 
 if __name__ == "__main__":

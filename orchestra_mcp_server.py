@@ -2435,7 +2435,8 @@ def _swarm_models() -> tuple:
 
 
 @mcp.tool()
-def swarm_plan(n_agents: int, tasks: Optional[list] = None, repo: str = ".") -> str:
+def swarm_plan(n_agents: int, tasks: Optional[list] = None, repo: str = ".",
+               public_or_test_repo: bool = False) -> str:
     """Plan a swarm of Claude Code agents where most agents are driven by fleet models.
 
     n_agents: how many agents in all. 60-70% are fleet agents; if no whole number fits that
@@ -2443,20 +2444,27 @@ def swarm_plan(n_agents: int, tasks: Optional[list] = None, repo: str = ".") -> 
       One agent is not a swarm: Claude decides.
     tasks: optional, one per agent. A string, or {"task": "...", "claude_only": true} for work
       that needs judgment, whole-repository context or sensitive data: those go to Claude
-      agents. Give fleet agents bounded tasks that a test or check can grade.
+      agents. Give fleet agents bounded tasks that a test or check can grade. Add
+      "bash": true to let a fleet agent run the test runner (`python -m pytest`) and nothing
+      else; see below.
     repo: the git repository the fleet agents work on (a worktree of HEAD each).
+    public_or_test_repo: pass true ONLY if the repo is public or a test project. Without it a
+      Bash request is refused. It is the ONLY guard on what the shell can reach: the shell rule
+      is a permission, not isolation. Bash goes only to meta/muse-spark-1.3, x-ai/grok-latest,
+      openai/gpt-terra-latest and qwen/qwen4-max; any other model stays on file tools.
 
     Returns the plan and a launch command. Claude agents are ordinary subagents started with
     the Agent tool; run the launch command with Bash for the fleet agents, then review and
-    apply each diff. Fleet agents have file tools only (no Bash) and never touch the real
-    checkout. Test and public projects only until isolation is decided.
+    apply each diff. Fleet agents have file tools only unless Bash was asked for and allowed.
+    A file-only agent never touches the real checkout; a Bash agent can (see swarm.md).
+    Test and public projects only until container isolation exists.
     """
     try:
         n = int(n_agents)
     except (TypeError, ValueError):
         return json.dumps({"error": "[ERROR] n_agents must be a whole number"})
     models, verified = _swarm_models()
-    p = orchestra_swarm.plan(n, tasks, models)
+    p = orchestra_swarm.plan(n, tasks, models, public_or_test_repo=public_or_test_repo is True)
     if "error" in p:
         return json.dumps(p)
     tid = _new_task_id()
